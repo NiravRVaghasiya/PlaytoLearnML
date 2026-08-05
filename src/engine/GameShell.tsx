@@ -214,6 +214,7 @@ export function GameShell({
         {failure ? (
           <div
             role="alert"
+            data-testid="named-failure"
             className="mt-4 flex flex-wrap items-center gap-3 rounded-md border border-wrong bg-wrong/10 p-4"
           >
             <div className="min-w-0 flex-1">

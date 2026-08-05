@@ -46,12 +46,22 @@ export default function RootLayout({
       <body
         className={`${spaceGrotesk.variable} ${inter.variable} ${jetbrainsMono.variable} font-body antialiased`}
       >
-        {/* DESIGN.md §9 — keyboard users get a way past the chrome. */}
+        {/* DESIGN.md §9 — keyboard users get a way past the chrome.
+            Two details that are easy to get wrong:
+
+            1. Uses Tailwind's `sr-only` / `focus:not-sr-only` pair, which are
+               built to undo each other. The project's own `.sr-only-live` helper
+               is NOT interchangeable: `not-sr-only` doesn't reset its
+               `clip-path`, so the link would stay clipped while focused.
+            2. Targets `#main-content`, which every route renders on the SERVER.
+               Pointing it at the game canvas looked right but was broken — games
+               load via `dynamic(ssr: false)`, so that element doesn't exist when
+               the page loads, and the link went nowhere. */}
         <a
-          href="#game-canvas"
-          className="sr-only-live focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:rounded-md focus:bg-primary focus:px-4 focus:py-2 focus:text-primary-ink"
+          href="#main-content"
+          className="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:rounded-md focus:bg-primary focus:px-4 focus:py-2 focus:text-primary-ink"
         >
-          Skip to game
+          Skip to content
         </a>
         {children}
       </body>

@@ -32,9 +32,15 @@ export function DatasetChip({
   onSelect,
   className,
 }: DatasetChipProps) {
+  // When unlocked, let the visible text name the button. Overriding it with just
+  // `name` while the chip also renders `detail` produces an accessible name that
+  // doesn't contain the visible label — a WCAG 2.5.3 failure that Lighthouse
+  // flags as label-content-name-mismatch. When locked we must add context, so the
+  // override starts with the full visible text and appends to it.
+  const visibleText = [name, detail].filter(Boolean).join(" ");
   const label = locked
-    ? `${name}, locked${lockedReason ? `: ${lockedReason}` : ""}`
-    : name;
+    ? `${visibleText}, locked${lockedReason ? `: ${lockedReason}` : ""}`
+    : undefined;
 
   return (
     <button

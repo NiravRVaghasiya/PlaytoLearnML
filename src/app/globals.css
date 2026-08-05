@@ -219,6 +219,14 @@
   .xp-gain-flash {
     animation: xp-gain-flash 1600ms var(--ease-spring) 1 forwards;
   }
+
+  /* Shared "this one is wrong" pulse. Used for misclassified points in Sort-It
+     Arcade and reusable by any game that needs to draw the eye to an error
+     (Data Detox's nulls, Confusion Chef's false positives). Decorative only —
+     the error is always also carried by a shape or label. */
+  .flash-wrong {
+    animation: flash-wrong 1400ms ease-in-out infinite;
+  }
 }
 
 @keyframes metric-sparkle {
@@ -244,6 +252,16 @@
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+@keyframes flash-wrong {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
   }
 }
 
