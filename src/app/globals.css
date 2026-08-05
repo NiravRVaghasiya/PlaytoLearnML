@@ -1,0 +1,213 @@
+@import "tailwindcss";
+
+/* ===========================================================================
+   GameML design tokens — the single source of truth is DESIGN.md.
+   Section numbers below map 1:1 to DESIGN.md sections.
+
+   Layering strategy:
+   1. `:root` holds the raw tokens exactly as written in DESIGN.md §2/§3/§4/§7.
+   2. `@theme inline` maps those raw tokens into Tailwind's theme namespaces so
+      utilities like `bg-surface`, `text-class-a`, `font-mono`, `rounded-md`
+      resolve to `var(--token)` (Tailwind v4's equivalent of `theme.extend`).
+   Never hardcode a hex value in a component — always go through a token.
+   =========================================================================== */
+
+/* --- DESIGN.md §2 Color tokens (Okabe–Ito derived, colorblind-safe) ------- */
+:root {
+  /* Surfaces */
+  --bg: #0e1116; /* app background (dark-first) */
+  --surface: #171b22; /* cards, panels */
+  --surface-2: #212734; /* raised elements */
+  --border: #2c3444;
+
+  /* Text */
+  --text: #e6eaf2;
+  --text-muted: #9aa4b2;
+
+  /* Brand */
+  --primary: #4fc3f7; /* electric blue — primary actions */
+  --primary-ink: #06263a;
+
+  /* Semantic (ML meaning — identical across ALL 14 games) */
+  --correct: #2ecc71; /* right / accuracy up / converged */
+  --wrong: #e74c3c; /* misclassified / divergence / loss spike */
+  --warn: #f1c40f; /* overfit warning / caution */
+  --class-a: #0072b2; /* dataset class A (Okabe-Ito blue) */
+  --class-b: #e69f00; /* dataset class B (Okabe-Ito orange) */
+  --class-c: #009e73; /* dataset class C (green) */
+  --class-d: #cc79a7; /* dataset class D (pink) */
+
+  /* Progression */
+  --xp: #ffd54f; /* XP / gold */
+  --star: #ffc107;
+
+  /* --- DESIGN.md §4 Radius ----------------------------------------------- */
+  --r-sm: 6px;
+  --r-md: 12px;
+  --r-lg: 20px;
+  --r-full: 999px;
+
+  /* --- DESIGN.md §7 Motion ----------------------------------------------- */
+  --dur-micro: 120ms;
+  --dur-standard: 240ms;
+  --dur-entrance: 360ms;
+  --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+
+  /* --- DESIGN.md §4 Shadow (soft, low-opacity, layered) ------------------- */
+  --shadow-soft:
+    0 1px 2px rgb(0 0 0 / 0.24), 0 4px 12px rgb(0 0 0 / 0.18);
+  --shadow-raised:
+    0 2px 4px rgb(0 0 0 / 0.28), 0 12px 32px rgb(0 0 0 / 0.22);
+}
+
+/* --- Map raw tokens into Tailwind's theme namespaces ---------------------- */
+@theme inline {
+  /* Surfaces + text */
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-border: var(--border);
+  --color-text: var(--text);
+  --color-text-muted: var(--text-muted);
+
+  /* Brand */
+  --color-primary: var(--primary);
+  --color-primary-ink: var(--primary-ink);
+
+  /* Semantic ML colors */
+  --color-correct: var(--correct);
+  --color-wrong: var(--wrong);
+  --color-warn: var(--warn);
+  --color-class-a: var(--class-a);
+  --color-class-b: var(--class-b);
+  --color-class-c: var(--class-c);
+  --color-class-d: var(--class-d);
+
+  /* Progression */
+  --color-xp: var(--xp);
+  --color-star: var(--star);
+
+  /* DESIGN.md §3 Typography — families are injected by next/font in layout.tsx */
+  --font-display: var(--font-space-grotesk), system-ui, sans-serif;
+  --font-body: var(--font-inter), system-ui, sans-serif;
+  --font-sans: var(--font-inter), system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, monospace;
+
+  /* DESIGN.md §3 Scale (rem): 0.75 / 0.875 / 1 / 1.25 / 1.5 / 2 / 3 */
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-lg: 1.25rem;
+  --text-xl: 1.5rem;
+  --text-2xl: 2rem;
+  --text-3xl: 3rem;
+
+  /* DESIGN.md §4 — 4px base grid. Tailwind's numeric scale then yields
+     1=4px 2=8px 3=12px 4=16px 6=24px 8=32px 12=48px 16=64px. */
+  --spacing: 0.25rem;
+
+  /* Radius */
+  --radius-sm: var(--r-sm);
+  --radius-md: var(--r-md);
+  --radius-lg: var(--r-lg);
+
+  /* Shadows */
+  --shadow-soft: var(--shadow-soft);
+  --shadow-raised: var(--shadow-raised);
+
+  /* Motion */
+  --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+
+  /* DESIGN.md §10 Breakpoints (explicit so the contract is visible) */
+  --breakpoint-sm: 40rem; /* 640 */
+  --breakpoint-md: 48rem; /* 768 */
+  --breakpoint-lg: 64rem; /* 1024 */
+  --breakpoint-xl: 80rem; /* 1280 */
+}
+
+/* --- Base -------------------------------------------------------------- */
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    background-color: var(--bg);
+    color: var(--text);
+    font-family: var(--font-inter), system-ui, sans-serif;
+    line-height: 1.5; /* DESIGN.md §3 */
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: var(--font-space-grotesk), system-ui, sans-serif;
+    line-height: 1.2; /* DESIGN.md §3 */
+  }
+
+  /* DESIGN.md §9 — visible focus rings, --primary outline, 2px.
+     :focus-visible only, so mouse users don't see rings but keyboard users do. */
+  :focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+    border-radius: var(--r-sm);
+  }
+
+  /* Numbers/metrics always mono so live values don't shift layout (§3). */
+  output,
+  code,
+  kbd,
+  samp,
+  pre {
+    font-family: var(--font-jetbrains-mono), ui-monospace, monospace;
+  }
+}
+
+/* --- Utilities ---------------------------------------------------------- */
+@layer utilities {
+  /* DESIGN.md §9 — minimum 44x44px interactive target. */
+  .target-44 {
+    min-inline-size: 44px;
+    min-block-size: 44px;
+  }
+
+  /* DESIGN.md §7 durations as utilities. */
+  .dur-micro {
+    transition-duration: var(--dur-micro);
+  }
+  .dur-standard {
+    transition-duration: var(--dur-standard);
+  }
+  .dur-entrance {
+    transition-duration: var(--dur-entrance);
+  }
+
+  /* Screen-reader-only, used by the metric ARIA live region. */
+  .sr-only-live {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border-width: 0;
+  }
+}
+
+/* --- DESIGN.md §7/§9 — respect prefers-reduced-motion --------------------
+   Decorative motion is disabled; functional feedback (colour + value changes)
+   still lands because those are not animations. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

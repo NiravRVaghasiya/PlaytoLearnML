@@ -1,0 +1,51 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# next.js
+/.next/
+/out/
+next-env.d.ts
+
+# production
+/build
+
+# testing
+/coverage
+/test-results/
+/playwright-report/
+/blob-report/
+/.lighthouseci/
+lighthouse-*.json
+lighthouse-*.html
+
+# secrets — NEVER commit. See .env.example for the required keys.
+.env
+.env.local
+.env.*.local
+.env.development.local
+.env.test.local
+.env.production.local
+**/secrets/**
+
+# misc
+.DS_Store
+*.pem
+Thumbs.db
+
+# logs
+*.log
+
+# editors
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# typescript / tooling caches
+*.tsbuildinfo
+.eslintcache
+.turbo/
+
+# temp scratch files
+.tmp-*

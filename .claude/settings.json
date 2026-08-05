@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Read",
+      "Edit",
+      "Write",
+      "Glob",
+      "Grep",
+      "Bash(npm run *)",
+      "Bash(npm test*)",
+      "Bash(npx vitest*)",
+      "Bash(npx playwright*)",
+      "Bash(git status)",
+      "Bash(git diff*)",
+      "Bash(git add*)",
+      "Bash(git commit*)",
+      "Bash(git log*)",
+      "mcp__filesystem__*",
+      "mcp__git__*",
+      "mcp__context7__*",
+      "mcp__playwright__*"
+    ],
+    "ask": [
+      "Bash(git push*)",
+      "mcp__github__*",
+      "mcp__supabase__*"
+    ],
+    "deny": [
+      "Read(./.env*)",
+      "Read(./**/secrets/**)",
+      "Bash(rm -rf*)",
+      "Bash(curl*)"
+    ]
+  },
+  "enableAllProjectMcpServers": false,
+  "enabledMcpjsonServers": ["filesystem", "git", "context7", "playwright"]
+}
