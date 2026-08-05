@@ -104,6 +104,8 @@ Every game renders inside `<GameShell>`. Fixed anatomy so players build muscle m
 | `<StarRating>` | 1–3 mastery stars | Empty → fill with pop |
 | `<Slider>` / `<Dial>` | Continuous controls | Show live value; large hit target (44px min) |
 | `<DatasetChip>` | Selectable dataset | Locked state for premium datasets |
+| `<Button>` | Actions: Retry, Next, Step, Train, ƒ Math | Variants `primary` / `secondary` / `ghost` / `danger`; 44px min target; never colour-only (always has a label) |
+| `<CodeEditor>` | The code lane's editable snippet | Mono, line numbers, labelled textarea; syntax colour is decorative only so the code stays readable without it. Tab is NOT trapped — keyboard users must be able to leave the field |
 
 ## 7. Motion
 

@@ -184,6 +184,13 @@
     transition-duration: var(--dur-entrance);
   }
 
+  /* DESIGN.md §8 — "brief celebratory micro-animation (sparkle on the metric,
+     not the whole screen)" when the metric improves. Purely decorative: the
+     global prefers-reduced-motion block above neutralises it. */
+  .metric-sparkle {
+    animation: metric-sparkle var(--dur-entrance) var(--ease-spring) 1;
+  }
+
   /* Screen-reader-only, used by the metric ARIA live region. */
   .sr-only-live {
     position: absolute;
@@ -195,6 +202,77 @@
     clip-path: inset(50%);
     white-space: nowrap;
     border-width: 0;
+  }
+
+  /* DESIGN.md §6 — WhyCard "fades in" when the last action changes. */
+  .why-card-in {
+    animation: why-card-in var(--dur-entrance) var(--ease-spring) 1;
+  }
+
+  /* DESIGN.md §6 — StarRating "empty → fill with pop". */
+  .star-pop {
+    animation: star-pop var(--dur-standard) var(--ease-spring) 1;
+  }
+
+  /* DESIGN.md §6 — XP gain flashes then fades. Declarative so the XP bar needs
+     no timer state; re-keying the element replays it. */
+  .xp-gain-flash {
+    animation: xp-gain-flash 1600ms var(--ease-spring) 1 forwards;
+  }
+}
+
+@keyframes metric-sparkle {
+  0% {
+    text-shadow: none;
+    transform: scale(1);
+  }
+  40% {
+    text-shadow: 0 0 12px color-mix(in srgb, var(--correct) 70%, transparent);
+    transform: scale(1.04);
+  }
+  100% {
+    text-shadow: none;
+    transform: scale(1);
+  }
+}
+
+@keyframes why-card-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes xp-gain-flash {
+  0% {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  15% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  75% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+@keyframes star-pop {
+  0% {
+    transform: scale(0.6);
+  }
+  60% {
+    transform: scale(1.18);
+  }
+  100% {
+    transform: scale(1);
   }
 }
 
