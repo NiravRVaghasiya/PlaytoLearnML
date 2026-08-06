@@ -19,7 +19,12 @@ const THRESHOLD = 95;
 const BASE = process.env.AUDIT_BASE ?? "http://localhost:3000";
 
 /** Every playable route, plus the home page. Keep in sync with the registry. */
-const DEFAULT_PATHS = ["/", "/play/sort-it-arcade", "/play/k-means-territory-wars"];
+const DEFAULT_PATHS = [
+  "/",
+  "/play/sort-it-arcade",
+  "/play/k-means-territory-wars",
+  "/play/data-detox",
+];
 
 const urls =
   process.argv.slice(2).length > 0

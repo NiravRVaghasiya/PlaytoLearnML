@@ -13,6 +13,7 @@
 export const PLAYABLE_SLUGS = [
   "sort-it-arcade",
   "k-means-territory-wars",
+  "data-detox",
 ] as const;
 
 export type PlayableSlug = (typeof PLAYABLE_SLUGS)[number];

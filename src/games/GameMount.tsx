@@ -24,6 +24,10 @@ const GAME_COMPONENTS: Record<string, ComponentType> = {
     () => import("./k-means-territory-wars"),
     { ssr: false, loading: () => <GameLoading /> },
   ),
+  "data-detox": dynamic(() => import("./data-detox"), {
+    ssr: false,
+    loading: () => <GameLoading />,
+  }),
 };
 
 /** Slugs this module can actually mount. Compared against the registry in tests. */

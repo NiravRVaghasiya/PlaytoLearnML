@@ -52,6 +52,18 @@ export function useAnimatedNumber(
     }
 
     const from = fromRef.current;
+
+    // A non-finite origin cannot be tweened: `from + (target - from) * eased` is
+    // NaN for every frame, and the displayed value stays NaN even though the real
+    // value is fine. This happens on the very first transition of any metric that
+    // starts as "not computed yet" — Data Detox's accuracy before its first
+    // retrain, or any held-out score before it's revealed. Snap instead.
+    if (!Number.isFinite(from)) {
+      fromRef.current = target;
+      setTweened(target);
+      return;
+    }
+
     const start = performance.now();
 
     // Always schedule at least one frame, even when `from === target`: that

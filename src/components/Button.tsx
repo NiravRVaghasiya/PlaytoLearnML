@@ -21,7 +21,10 @@ const VARIANTS: Record<ButtonVariant, string> = {
   secondary:
     "bg-surface-2 text-text border border-border hover:border-primary/60",
   ghost: "bg-transparent text-text-muted hover:text-text hover:bg-surface-2",
-  danger: "bg-wrong text-white hover:brightness-110",
+  // Dark ink on the red, not white. White on --wrong (#E74C3C) is 3.8:1, below
+  // the 4.5:1 AA minimum for normal text; --bg on the same red is 4.7:1. This
+  // mirrors how `primary` pairs --primary with --primary-ink rather than white.
+  danger: "bg-wrong text-bg hover:brightness-110",
 };
 
 const SIZES: Record<ButtonSize, string> = {

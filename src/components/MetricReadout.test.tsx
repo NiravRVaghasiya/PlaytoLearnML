@@ -27,6 +27,30 @@ describe("formatMetric", () => {
   });
 });
 
+describe("recovering from a not-yet-computed metric", () => {
+  it("shows the real value on the FIRST update after NaN", async () => {
+    // Regression: `useAnimatedNumber` used to tween from its previous value
+    // without checking it was finite, so `from + (target - from) * eased` stayed
+    // NaN for the whole tween and the readout kept showing "—" even though the
+    // value had arrived. It self-repaired on the SECOND update, which made it
+    // look intermittent. Any metric that starts as "not computed yet" hits this:
+    // a held-out score before it's revealed, or an accuracy before the first
+    // model has trained.
+    const { rerender } = render(
+      <MetricReadout label="Accuracy" value={Number.NaN} format="percent" />,
+    );
+    expect(screen.getByTestId("metric-value")).toHaveTextContent("—");
+
+    rerender(
+      <MetricReadout label="Accuracy" value={0.83} format="percent" />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("metric-value")).toHaveTextContent("83%"),
+    );
+  });
+});
+
 describe("metricAnnouncement", () => {
   it("speaks percent as a word so screen readers say it correctly", () => {
     expect(metricAnnouncement("Accuracy", 0.84, null, "percent")).toBe(
