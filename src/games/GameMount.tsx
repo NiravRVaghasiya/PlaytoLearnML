@@ -28,6 +28,10 @@ const GAME_COMPONENTS: Record<string, ComponentType> = {
     ssr: false,
     loading: () => <GameLoading />,
   }),
+  "gradient-descent-skier": dynamic(
+    () => import("./gradient-descent-skier"),
+    { ssr: false, loading: () => <GameLoading /> },
+  ),
 };
 
 /** Slugs this module can actually mount. Compared against the registry in tests. */

@@ -155,9 +155,10 @@ export function CodeLane({ retrain }: CodeLaneProps) {
       />
 
       <section aria-label="Script output" className="min-h-24">
-        <h3 className="mb-1 text-xs font-semibold tracking-wide text-text-muted uppercase">
+        {/* h2: directly inside the lane, so it must not skip a level. */}
+        <h2 className="mb-1 text-xs font-semibold tracking-wide text-text-muted uppercase">
           Output
-        </h3>
+        </h2>
         {lane.logs.length === 0 ? (
           <p className="font-mono text-xs text-text-muted">
             Run the script to see output here.

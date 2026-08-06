@@ -24,6 +24,7 @@ const DEFAULT_PATHS = [
   "/play/sort-it-arcade",
   "/play/k-means-territory-wars",
   "/play/data-detox",
+  "/play/gradient-descent-skier",
 ];
 
 const urls =
