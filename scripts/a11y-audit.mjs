@@ -18,10 +18,13 @@ import lighthouse from "lighthouse";
 const THRESHOLD = 95;
 const BASE = process.env.AUDIT_BASE ?? "http://localhost:3000";
 
+/** Every playable route, plus the home page. Keep in sync with the registry. */
+const DEFAULT_PATHS = ["/", "/play/sort-it-arcade", "/play/k-means-territory-wars"];
+
 const urls =
   process.argv.slice(2).length > 0
     ? process.argv.slice(2)
-    : [`${BASE}/`, `${BASE}/play/sort-it-arcade`];
+    : DEFAULT_PATHS.map((path) => `${BASE}${path}`);
 
 const browser = await chromium.launch({
   args: ["--remote-debugging-port=9222"],

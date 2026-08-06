@@ -10,7 +10,10 @@
  * built. `registry.test.ts` checks both directions so an unbuilt game can never
  * present a dead link, and a built game can never be missing its metadata.
  */
-export const PLAYABLE_SLUGS = ["sort-it-arcade"] as const;
+export const PLAYABLE_SLUGS = [
+  "sort-it-arcade",
+  "k-means-territory-wars",
+] as const;
 
 export type PlayableSlug = (typeof PLAYABLE_SLUGS)[number];
 
