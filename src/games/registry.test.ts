@@ -18,10 +18,26 @@ describe("game registry", () => {
     expect(isPlayable("not-a-game")).toBe(false);
   });
 
-  it("respects the phase roadmap — nothing later than Phase 1 yet", () => {
+  it("respects the phase roadmap — no phase started before the previous one finished", () => {
     // CLAUDE.md: "Don't start a Phase 3 game while Phase 1 is incomplete."
-    for (const slug of playableSlugs()) {
-      expect(getGameMeta(slug)!.phase, `${slug} is out of phase order`).toBe(1);
+    //
+    // Stated as a rule rather than a hardcoded phase number, so it keeps holding
+    // as later phases land: for every phase that has any game built, every
+    // earlier phase must be built in full.
+    const built = new Set(playableSlugs());
+    const startedPhases = new Set(
+      playableSlugs().map((slug) => getGameMeta(slug)!.phase),
+    );
+
+    for (const phase of startedPhases) {
+      for (const game of GAME_CATALOG) {
+        if (game.phase < phase) {
+          expect(
+            built.has(game.slug),
+            `phase ${phase} is underway but ${game.slug} (phase ${game.phase}) is not built`,
+          ).toBe(true);
+        }
+      }
     }
   });
 

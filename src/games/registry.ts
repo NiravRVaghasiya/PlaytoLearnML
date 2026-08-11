@@ -15,6 +15,7 @@ export const PLAYABLE_SLUGS = [
   "k-means-territory-wars",
   "data-detox",
   "gradient-descent-skier",
+  "neuron-forge",
 ] as const;
 
 export type PlayableSlug = (typeof PLAYABLE_SLUGS)[number];

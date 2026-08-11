@@ -32,6 +32,10 @@ const GAME_COMPONENTS: Record<string, ComponentType> = {
     () => import("./gradient-descent-skier"),
     { ssr: false, loading: () => <GameLoading /> },
   ),
+  "neuron-forge": dynamic(() => import("./neuron-forge"), {
+    ssr: false,
+    loading: () => <GameLoading />,
+  }),
 };
 
 /** Slugs this module can actually mount. Compared against the registry in tests. */

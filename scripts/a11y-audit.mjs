@@ -25,6 +25,7 @@ const DEFAULT_PATHS = [
   "/play/k-means-territory-wars",
   "/play/data-detox",
   "/play/gradient-descent-skier",
+  "/play/neuron-forge",
 ];
 
 const urls =
