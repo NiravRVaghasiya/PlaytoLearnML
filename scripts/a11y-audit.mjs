@@ -26,6 +26,7 @@ const DEFAULT_PATHS = [
   "/play/data-detox",
   "/play/gradient-descent-skier",
   "/play/neuron-forge",
+  "/play/overfit-tower-defense",
 ];
 
 const urls =

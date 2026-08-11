@@ -36,6 +36,10 @@ const GAME_COMPONENTS: Record<string, ComponentType> = {
     ssr: false,
     loading: () => <GameLoading />,
   }),
+  "overfit-tower-defense": dynamic(
+    () => import("./overfit-tower-defense"),
+    { ssr: false, loading: () => <GameLoading /> },
+  ),
 };
 
 /** Slugs this module can actually mount. Compared against the registry in tests. */
