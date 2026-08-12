@@ -28,6 +28,7 @@ const DEFAULT_PATHS = [
   "/play/neuron-forge",
   "/play/overfit-tower-defense",
   "/play/confusion-matrix-chef",
+  "/play/decision-tree-architect",
 ];
 
 const urls =

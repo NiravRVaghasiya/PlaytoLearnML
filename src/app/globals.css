@@ -307,3 +307,39 @@
     scroll-behavior: auto !important;
   }
 }
+
+/*
+ * React Flow's attribution link.
+ *
+ * Its default styling is a mid-grey on a translucent white panel, which is built
+ * for a light canvas and fails WCAG AA contrast on our dark surfaces — Lighthouse
+ * caught it at 4.0:1 on the tree canvas. The link itself stays: the library is MIT
+ * but asks that attribution be kept, and hiding it needs a paid plan. So it is
+ * restyled rather than removed, which is both compliant with their terms and
+ * readable.
+ *
+ * --text-muted on --surface-2 measures 5.9:1, comfortably past the 4.5:1 AA
+ * threshold for small text.
+ */
+/*
+ * Scoped through `.react-flow` on purpose. A bare `.react-flow__attribution`
+ * selector ties with the library's own rule on specificity, and its stylesheet is
+ * imported from a component so it can land later in the cascade and win. Two
+ * classes beat one regardless of order.
+ */
+.react-flow .react-flow__attribution {
+  background: var(--surface-2);
+  border-radius: var(--r-sm) 0 0 0;
+  padding: 1px 4px;
+}
+
+.react-flow .react-flow__attribution a {
+  color: var(--text-muted);
+  text-decoration: none;
+}
+
+.react-flow .react-flow__attribution a:hover,
+.react-flow .react-flow__attribution a:focus-visible {
+  color: var(--text);
+  text-decoration: underline;
+}

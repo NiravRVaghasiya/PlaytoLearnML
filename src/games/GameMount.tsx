@@ -44,6 +44,10 @@ const GAME_COMPONENTS: Record<string, ComponentType> = {
     ssr: false,
     loading: () => <GameLoading />,
   }),
+  "decision-tree-architect": dynamic(
+    () => import("./decision-tree-architect"),
+    { ssr: false, loading: () => <GameLoading /> },
+  ),
 };
 
 /** Slugs this module can actually mount. Compared against the registry in tests. */
