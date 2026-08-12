@@ -27,6 +27,7 @@ const DEFAULT_PATHS = [
   "/play/gradient-descent-skier",
   "/play/neuron-forge",
   "/play/overfit-tower-defense",
+  "/play/confusion-matrix-chef",
 ];
 
 const urls =

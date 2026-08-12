@@ -40,6 +40,10 @@ const GAME_COMPONENTS: Record<string, ComponentType> = {
     () => import("./overfit-tower-defense"),
     { ssr: false, loading: () => <GameLoading /> },
   ),
+  "confusion-matrix-chef": dynamic(() => import("./confusion-matrix-chef"), {
+    ssr: false,
+    loading: () => <GameLoading />,
+  }),
 };
 
 /** Slugs this module can actually mount. Compared against the registry in tests. */
