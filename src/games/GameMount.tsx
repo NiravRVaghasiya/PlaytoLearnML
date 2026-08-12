@@ -48,6 +48,10 @@ const GAME_COMPONENTS: Record<string, ComponentType> = {
     () => import("./decision-tree-architect"),
     { ssr: false, loading: () => <GameLoading /> },
   ),
+  "hyperparameter-heist": dynamic(() => import("./hyperparameter-heist"), {
+    ssr: false,
+    loading: () => <GameLoading />,
+  }),
 };
 
 /** Slugs this module can actually mount. Compared against the registry in tests. */

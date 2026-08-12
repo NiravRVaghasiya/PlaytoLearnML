@@ -19,6 +19,7 @@ export const PLAYABLE_SLUGS = [
   "overfit-tower-defense",
   "confusion-matrix-chef",
   "decision-tree-architect",
+  "hyperparameter-heist",
 ] as const;
 
 export type PlayableSlug = (typeof PLAYABLE_SLUGS)[number];

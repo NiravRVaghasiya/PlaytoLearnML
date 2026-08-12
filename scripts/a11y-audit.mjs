@@ -29,6 +29,7 @@ const DEFAULT_PATHS = [
   "/play/overfit-tower-defense",
   "/play/confusion-matrix-chef",
   "/play/decision-tree-architect",
+  "/play/hyperparameter-heist",
 ];
 
 const urls =
