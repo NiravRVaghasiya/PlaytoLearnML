@@ -31,6 +31,7 @@ const DEFAULT_PATHS = [
   "/play/decision-tree-architect",
   "/play/hyperparameter-heist",
   "/play/feature-forge",
+  "/play/agent-academy",
 ];
 
 const urls =

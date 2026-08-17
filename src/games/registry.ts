@@ -21,6 +21,7 @@ export const PLAYABLE_SLUGS = [
   "decision-tree-architect",
   "hyperparameter-heist",
   "feature-forge",
+  "agent-academy",
 ] as const;
 
 export type PlayableSlug = (typeof PLAYABLE_SLUGS)[number];
