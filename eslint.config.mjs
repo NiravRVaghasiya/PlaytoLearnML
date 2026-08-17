@@ -21,6 +21,10 @@ const config = [
       "build/**",
       "node_modules/**",
       "coverage/**",
+      // Vendored Pyodide runtime, copied in by scripts/setup-pyodide.mjs. It is
+      // 20 MB of emscripten glue that we neither wrote nor can fix, and linting it
+      // buries our own diagnostics under hundreds of upstream warnings.
+      "public/pyodide/**",
       "next-env.d.ts",
     ],
   },

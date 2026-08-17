@@ -30,6 +30,7 @@ const DEFAULT_PATHS = [
   "/play/confusion-matrix-chef",
   "/play/decision-tree-architect",
   "/play/hyperparameter-heist",
+  "/play/feature-forge",
 ];
 
 const urls =

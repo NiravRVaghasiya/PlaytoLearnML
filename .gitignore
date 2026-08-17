@@ -49,3 +49,8 @@ Thumbs.db
 
 # temp scratch files
 .tmp-*
+
+# Pyodide runtime — ~20 MB of wasm, stdlib and wheels, copied out of
+# node_modules by scripts/setup-pyodide.mjs. Pinned by the lockfile, so there is
+# nothing to gain by committing it and 20 MB to lose.
+/public/pyodide/

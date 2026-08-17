@@ -174,20 +174,17 @@ describe("useCodeLane", () => {
     expect(result.current.error).toContain("longer than 40ms");
   });
 
-  it("reports the Python lane as unavailable with a useful message", async () => {
+  it("reports the Python lane as available now that Pyodide is real", () => {
+    // This test previously asserted the opposite: that Python was a stub and said
+    // so. It landed with Feature Forge in Phase 3, so the assertion flipped rather
+    // than being deleted — the change in behaviour is the thing worth pinning.
     const { api } = makeFakeStore();
     const { result } = renderHook(() =>
       useCodeLane({ initialCode: "print('hi')", api, language: "python" }),
     );
 
-    expect(result.current.available).toBe(false);
-
-    await act(async () => {
-      await result.current.run();
-    });
-
-    expect(result.current.error).toContain("Pyodide");
-    expect(result.current.error).toContain("Phase 3");
+    expect(result.current.available).toBe(true);
+    expect(result.current.language).toBe("python");
   });
 
   it("accepts a custom executor", async () => {
@@ -245,15 +242,35 @@ describe("executors", () => {
     expect(messages).toEqual(["pong"]);
   });
 
-  it("createPyodideExecutor rejects with an explanation", async () => {
-    const executor = createPyodideExecutor<object>();
+  it("createPyodideExecutor loads the runtime from the configured indexURL", async () => {
+    // Under vitest there is no server serving /public, so the load fails — and the
+    // failure is the evidence: it names the path it tried, which proves it is
+    // actually fetching a runtime rather than throwing a canned stub message.
+    // Browser-side behaviour is covered by the Feature Forge playthrough.
+    const executor = createPyodideExecutor<object>({
+      indexURL: "/pyodide-test-path/",
+    });
+
     await expect(
       executor("print(1)", {
         api: {},
         log: () => {},
         checkBudget: () => {},
       }),
-    ).rejects.toThrow(/Pyodide/);
+    ).rejects.toThrow(/pyodide-test-path/);
+  });
+
+  it("does not cache a failed runtime load, so a retry can succeed", async () => {
+    const executor = createPyodideExecutor<object>({
+      indexURL: "/pyodide-retry-path/",
+    });
+    const attempt = () =>
+      executor("print(1)", { api: {}, log: () => {}, checkBudget: () => {} });
+
+    await expect(attempt()).rejects.toThrow();
+    // A cached rejected promise would make every later attempt fail with the same
+    // stale error even after the cause was fixed.
+    await expect(attempt()).rejects.toThrow(/pyodide-retry-path/);
   });
 });
 

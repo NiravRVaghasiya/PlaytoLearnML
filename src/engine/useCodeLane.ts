@@ -76,21 +76,175 @@ export function createJsExecutor<TApi extends object>(): CodeExecutor<TApi> {
   };
 }
 
+/** Minimal shape of the bits of Pyodide this engine touches. */
+interface PyodideRuntime {
+  runPythonAsync: (code: string) => Promise<unknown>;
+  loadPackage: (names: string | string[]) => Promise<unknown>;
+  setStdout: (options: { batched: (text: string) => void }) => void;
+  setStderr: (options: { batched: (text: string) => void }) => void;
+  globals: { set: (name: string, value: unknown) => void };
+  version: string;
+}
+
+export interface PyodideExecutorOptions {
+  /**
+   * Python packages to load before the first run, e.g. `["pandas"]`.
+   *
+   * Each one is a real wheel fetched from `indexURL`. pandas pulls numpy with it
+   * and costs about 7 MB, so ask for what the lane actually imports and nothing
+   * more.
+   */
+  packages?: readonly string[];
+  /**
+   * Python run once per execution, before the player's code.
+   *
+   * This is where a game puts its own helpers — turning the injected `api` into
+   * something idiomatic to use from Python. Kept as a game-supplied string rather
+   * than baked in here, because the engine has no business knowing what any
+   * particular game's api looks like.
+   */
+  prelude?: string;
+  /** Where the self-hosted runtime lives. See scripts/setup-pyodide.mjs. */
+  indexURL?: string;
+  /**
+   * Progress while the runtime downloads.
+   *
+   * The hook batches logs and only commits them when a run finishes, which is
+   * fine for a 5 ms JavaScript snippet and useless for a 20 MB download. Games
+   * wire this to their own state so the lane can say what it is doing.
+   */
+  onStatus?: (status: string) => void;
+}
+
 /**
- * Pyodide executor — the seam for Python code lanes (spec: Feature Forge, Phase
- * 3, runs real pandas). Deliberately not implemented yet: Phase 1 ships
- * JavaScript lanes, and loading a ~10 MB Python runtime for games that don't
- * need it would break the "fetches fast on a slow connection" constraint.
+ * One runtime per page, shared across runs and across games.
  *
- * Throws a clear, player-facing message rather than failing silently, so a game
- * that wires this up before it exists is obvious immediately.
+ * Keyed by index URL and package set: loading Python twice would cost the
+ * download twice. The promise is cached rather than the instance so that two
+ * lanes mounting at once await the same load instead of racing two of them.
  */
-export function createPyodideExecutor<TApi extends object>(): CodeExecutor<TApi> {
-  return async () => {
-    throw new Error(
-      "The Python (Pyodide) code lane isn't wired up yet — it lands with Feature Forge in Phase 3. Switch to the JavaScript lane for now.",
-    );
+const runtimeCache = new Map<string, Promise<PyodideRuntime>>();
+
+async function getRuntime(
+  indexURL: string,
+  packages: readonly string[],
+  onStatus?: (status: string) => void,
+): Promise<PyodideRuntime> {
+  const key = `${indexURL}|${[...packages].sort().join(",")}`;
+  const cached = runtimeCache.get(key);
+  if (cached) return cached;
+
+  const loading = (async () => {
+    onStatus?.("Downloading the Python runtime (about 13 MB, once per visit)…");
+
+    /*
+     * Loaded from the self-hosted copy at runtime, NOT bundled.
+     *
+     * `import("pyodide")` compiles but throws "Cannot find module as expression is
+     * too dynamic" in the browser: Pyodide's loader contains conditional
+     * `import("node:fs")` calls for its Node build, which no bundler can resolve.
+     * The ignore comments keep the bundler out of it entirely, so the browser
+     * fetches the module from /public and never evaluates the Node branches.
+     *
+     * This also keeps ~1 MB of loader JavaScript out of the client bundle, and
+     * makes the `pyodide` npm package a build-time asset source rather than a
+     * runtime dependency.
+     */
+    // Not named `module`: Next forbids assigning that identifier.
+    const runtimeModule = (await import(
+      /* webpackIgnore: true */ /* turbopackIgnore: true */
+      `${indexURL}pyodide.mjs`
+    )) as { loadPyodide: (options: { indexURL: string }) => Promise<unknown> };
+
+    const runtime = (await runtimeModule.loadPyodide({
+      indexURL,
+    })) as PyodideRuntime;
+
+    if (packages.length > 0) {
+      onStatus?.(`Loading ${packages.join(", ")}…`);
+      await runtime.loadPackage([...packages]);
+    }
+
+    onStatus?.(`Python ${runtime.version} ready.`);
+    return runtime;
+  })();
+
+  runtimeCache.set(key, loading);
+
+  try {
+    return await loading;
+  } catch (cause) {
+    // Don't cache a failed load — a retry should be allowed to work.
+    runtimeCache.delete(key);
+    throw cause;
+  }
+}
+
+/**
+ * Pyodide executor: real CPython in the tab (spec: Feature Forge runs real pandas).
+ *
+ * The runtime is served from `public/pyodide` rather than a CDN, and it is loaded
+ * lazily on the first Python run — never on page load. That is what keeps the
+ * default JavaScript lanes fast: a player who never opens a Python lane never
+ * downloads any of it.
+ *
+ * ── Two honest limitations ──────────────────────────────────────────────────
+ * 1. A Python run is NOT interruptible. `checkBudget()` works for JavaScript
+ *    because the snippet keeps calling back into the api; Python executes inside
+ *    wasm and does not yield. Interrupting it properly needs
+ *    `setInterruptBuffer` with a SharedArrayBuffer, which needs COOP/COEP headers
+ *    on every response. Until that is in place, a `while True:` in the Python lane
+ *    hangs the tab exactly as it would in a JavaScript one.
+ * 2. It is not a security sandbox, for the same reason the JavaScript executor
+ *    is not. See the note at the top of this file — the rule about never running
+ *    code that came from another user applies here identically.
+ */
+export function createPyodideExecutor<TApi extends object>({
+  packages = [],
+  prelude,
+  indexURL = "/pyodide/",
+  onStatus,
+}: PyodideExecutorOptions = {}): CodeExecutor<TApi> {
+  return async (code, { api, log }) => {
+    const runtime = await getRuntime(indexURL, packages, onStatus);
+
+    // print() and stderr land in the lane's output panel, so Python players use
+    // the language's own idiom rather than learning a bespoke log function.
+    runtime.setStdout({
+      batched: (text) => {
+        if (text.length > 0) log(text);
+      },
+    });
+    runtime.setStderr({
+      batched: (text) => {
+        if (text.length > 0) log(text);
+      },
+    });
+
+    runtime.globals.set("api", api);
+
+    if (prelude) await runtime.runPythonAsync(prelude);
+    return runtime.runPythonAsync(code);
   };
+}
+
+/**
+ * Pull the useful line out of a Pyodide traceback.
+ *
+ * A `PythonError` message is the whole traceback, which is many lines of wasm
+ * frames ending in the one line that matters. Showing the lot buries the error.
+ */
+export function formatPythonError(message: string): string {
+  const lines = message
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+  const lastMeaningful = [...lines]
+    .reverse()
+    .find((line) => /^[A-Za-z_][\w.]*(Error|Exception|Warning)\b/.test(line));
+
+  return lastMeaningful ?? lines[lines.length - 1] ?? message;
 }
 
 export interface UseCodeLaneOptions<TApi extends object> {
@@ -102,7 +256,11 @@ export interface UseCodeLaneOptions<TApi extends object> {
    */
   api: TApi;
   language?: CodeLanguage;
-  /** Defaults to the JS executor, or the Pyodide stub when language is python. */
+  /**
+   * Defaults to the JavaScript executor, or a bare Pyodide one when the language
+   * is python. Games that need packages or a prelude build their own with
+   * `createPyodideExecutor({ packages, prelude, onStatus })`.
+   */
   executor?: CodeExecutor<TApi>;
   /** Cooperative wall-clock budget per run. */
   maxRunMs?: number;
@@ -185,7 +343,16 @@ export function useCodeLane<TApi extends object>({
     };
   }, []);
 
-  const available = language === "javascript" || executor !== undefined;
+  /**
+   * Both languages now have real executors, so this is always true.
+   *
+   * Kept rather than removed: it existed to let a lane say "Python isn't wired up
+   * yet", and the honest thing when that stops being the case is to report it
+   * rather than to leave a flag that is quietly always false. If a third language
+   * is ever added as a stub, this is where it says so.
+   */
+  const available =
+    language === "javascript" || language === "python" || executor !== undefined;
 
   const run = useCallback(async () => {
     const activeExecutor =

@@ -52,6 +52,10 @@ const GAME_COMPONENTS: Record<string, ComponentType> = {
     ssr: false,
     loading: () => <GameLoading />,
   }),
+  "feature-forge": dynamic(() => import("./feature-forge"), {
+    ssr: false,
+    loading: () => <GameLoading />,
+  }),
 };
 
 /** Slugs this module can actually mount. Compared against the registry in tests. */
