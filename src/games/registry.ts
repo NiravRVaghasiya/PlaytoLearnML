@@ -23,6 +23,7 @@ export const PLAYABLE_SLUGS = [
   "feature-forge",
   "agent-academy",
   "convolution-kitchen",
+  "backprop-blitz",
 ] as const;
 
 export type PlayableSlug = (typeof PLAYABLE_SLUGS)[number];

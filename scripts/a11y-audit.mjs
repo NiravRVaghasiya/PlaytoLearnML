@@ -33,6 +33,7 @@ const DEFAULT_PATHS = [
   "/play/feature-forge",
   "/play/agent-academy",
   "/play/convolution-kitchen",
+  "/play/backprop-blitz",
 ];
 
 const urls =
