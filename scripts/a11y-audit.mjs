@@ -32,6 +32,7 @@ const DEFAULT_PATHS = [
   "/play/hyperparameter-heist",
   "/play/feature-forge",
   "/play/agent-academy",
+  "/play/convolution-kitchen",
 ];
 
 const urls =

@@ -60,6 +60,10 @@ const GAME_COMPONENTS: Record<string, ComponentType> = {
     ssr: false,
     loading: () => <GameLoading />,
   }),
+  "convolution-kitchen": dynamic(() => import("./convolution-kitchen"), {
+    ssr: false,
+    loading: () => <GameLoading />,
+  }),
 };
 
 /** Slugs this module can actually mount. Compared against the registry in tests. */
