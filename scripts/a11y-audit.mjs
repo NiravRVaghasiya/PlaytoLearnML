@@ -34,6 +34,7 @@ const DEFAULT_PATHS = [
   "/play/agent-academy",
   "/play/convolution-kitchen",
   "/play/backprop-blitz",
+  "/play/dimension-diver",
 ];
 
 const urls =

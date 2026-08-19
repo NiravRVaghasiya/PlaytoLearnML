@@ -24,6 +24,7 @@ export const PLAYABLE_SLUGS = [
   "agent-academy",
   "convolution-kitchen",
   "backprop-blitz",
+  "dimension-diver",
 ] as const;
 
 export type PlayableSlug = (typeof PLAYABLE_SLUGS)[number];

@@ -13,8 +13,13 @@ describe("game registry", () => {
   });
 
   it("reports playability honestly", () => {
-    expect(isPlayable("sort-it-arcade")).toBe(true);
-    expect(isPlayable("dimension-diver")).toBe(false);
+    // All 14 catalog games are built, so the registry should say yes to every
+    // one of them — and still say no to a slug that isn't a game at all.
+    for (const game of GAME_CATALOG) {
+      expect(isPlayable(game.slug), `${game.slug} should be playable`).toBe(
+        true,
+      );
+    }
     expect(isPlayable("not-a-game")).toBe(false);
   });
 
@@ -48,12 +53,15 @@ describe("game registry", () => {
     expect([...MOUNTED_SLUGS].sort()).toEqual(playableSlugs().sort());
   });
 
-  it("leaves the unbuilt games unregistered rather than broken", () => {
+  it("registers the whole catalog, and never mounts what it hasn't registered", () => {
     const registered = new Set(playableSlugs());
     const unbuilt = GAME_CATALOG.filter((g) => !registered.has(g.slug));
-    // Sanity: this is a work in progress, so most of the catalog is unbuilt.
-    expect(unbuilt.length).toBe(GAME_CATALOG.length - registered.size);
-    expect(unbuilt.length).toBeGreaterThan(0);
+    // The catalog is now complete, so nothing should be left behind. Named
+    // rather than counted so a regression says *which* game went missing.
+    expect(unbuilt.map((g) => g.slug)).toEqual([]);
+    // Kept for the next game added to the catalog ahead of its implementation:
+    // an unregistered game must be absent from the mount map too, so the route
+    // refuses it cleanly instead of rendering a shell around nothing.
     for (const game of unbuilt) {
       expect(MOUNTED_SLUGS).not.toContain(game.slug);
     }
