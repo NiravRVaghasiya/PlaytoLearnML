@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { Lock } from "lucide-react";
+import { BookOpen, Lock } from "lucide-react";
 import { GAME_CATALOG, PHASES } from "@/lib/catalog";
 import { isPlayable } from "@/games/registry";
 
@@ -17,6 +17,18 @@ export default function Home() {
         <p className="mt-3 max-w-2xl text-lg text-text-muted">
           Fourteen games that teach real Machine Learning. Every model trains in
           your browser — no server, no GPU.
+        </p>
+        {/* The games link *into* the library from their WhyCards, so it needs a
+            way in from the top level too — otherwise the only route to it is
+            mid-game, and it never gets crawled. */}
+        <p className="mt-4">
+          <Link
+            href="/concepts"
+            className="inline-flex items-center gap-2 text-sm font-medium text-primary underline decoration-dotted underline-offset-4"
+          >
+            <BookOpen aria-hidden="true" className="size-4" />
+            Read the Concept Library
+          </Link>
         </p>
       </header>
 

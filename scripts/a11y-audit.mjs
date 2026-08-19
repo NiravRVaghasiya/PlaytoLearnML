@@ -35,6 +35,18 @@ const DEFAULT_PATHS = [
   "/play/convolution-kitchen",
   "/play/backprop-blitz",
   "/play/dimension-diver",
+  // Concept Library. Content pages rather than games, but they are linked from
+  // every game's WhyCard, so a contrast or heading-order regression here is just
+  // as reachable. Keep in sync with CONCEPT_LIBRARY.
+  "/concepts",
+  "/concepts/decision-boundaries",
+  "/concepts/overfitting",
+  "/concepts/k-means",
+  "/concepts/choosing-k",
+  "/concepts/data-cleaning",
+  "/concepts/missing-data",
+  "/concepts/gradient-descent",
+  "/concepts/learning-rate",
 ];
 
 const urls =

@@ -1,3 +1,4 @@
+import { availableParallelism } from "node:os";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
@@ -16,5 +17,18 @@ export default defineConfig({
     // TF.js training in tests is slow on the CPU backend; give it room.
     testTimeout: 30_000,
     hookTimeout: 30_000,
+    // Vitest defaults to one worker per logical core, which is the wrong shape
+    // for this suite: TF.js's CPU backend is itself multi-threaded, so a dozen
+    // forks each training a model oversubscribe the machine several times over
+    // and every heavy test slows down together.
+    //
+    // Measured on a 12-thread laptop, whole suite: the default took 954s and
+    // pushed convolution-kitchen's slowest case past its 300s timeout, while
+    // capping workers at 4 took 621s with all 1002 tests passing. Fewer workers
+    // is both faster and stable here.
+    //
+    // Expressed as a ratio rather than a constant so a larger CI box still gets
+    // more workers, at the same one-third-of-cores oversubscription budget.
+    maxWorkers: Math.max(2, Math.floor(availableParallelism() / 3)),
   },
 });
