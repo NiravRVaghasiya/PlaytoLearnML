@@ -1,5 +1,5 @@
 import type { NamedFailure } from "@/engine/types";
-import { clamp, seededRandom } from "@/lib/utils";
+import { clamp, gaussian, seededRandom } from "@/lib/utils";
 
 /**
  * Confusion Matrix Chef — the real evaluation maths.
@@ -66,11 +66,6 @@ export const SAMPLE_COUNT = 800;
 /** Threshold granularity of the slider. */
 export const THRESHOLD_STEP = 0.01;
 export const DEFAULT_THRESHOLD = 0.5;
-
-function gaussian(random: () => number): number {
-  const u = Math.max(random(), Number.EPSILON);
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * random());
-}
 
 const sigmoid = (z: number) => 1 / (1 + Math.exp(-z));
 

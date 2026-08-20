@@ -4,7 +4,6 @@ import { notFound } from "next/navigation";
 import { ArrowLeft, Gamepad2 } from "lucide-react";
 import { CONCEPT_LIBRARY, conceptSlugs, getConcept } from "@/lib/concepts";
 import { getGameMeta } from "@/lib/catalog";
-import { isPlayable } from "@/games/registry";
 
 interface PageProps {
   params: Promise<{ slug: string }>;
@@ -143,9 +142,7 @@ export default async function ConceptPage({ params }: PageProps) {
                       {game.coreIntuition}
                     </p>
                     <p className="mt-3 font-mono text-xs text-text-muted">
-                      {isPlayable(game.slug)
-                        ? `Play · ${game.metricLabel}`
-                        : "Not built yet"}
+                      Play · {game.metricLabel}
                     </p>
                   </Link>
                 </li>

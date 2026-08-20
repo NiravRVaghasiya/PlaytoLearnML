@@ -1,5 +1,5 @@
 import type { NamedFailure } from "@/engine/types";
-import { clamp, seededRandom } from "@/lib/utils";
+import { clamp, gaussian, seededRandom } from "@/lib/utils";
 
 /**
  * Decision Tree Architect — the real tree learner.
@@ -169,11 +169,6 @@ export const ROUNDS: readonly Round[] = [
 
 export function roundAt(index: number): Round {
   return ROUNDS[clamp(index - 1, 0, ROUNDS.length - 1)] ?? ROUNDS[0]!;
-}
-
-function gaussian(random: () => number): number {
-  const u = Math.max(random(), Number.EPSILON);
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * random());
 }
 
 function cleanLabel(boundary: BoundaryKind, slope: number, bedrock: number): 0 | 1 {

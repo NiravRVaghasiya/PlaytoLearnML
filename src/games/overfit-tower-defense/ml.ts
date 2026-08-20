@@ -1,6 +1,6 @@
 import * as tf from "@tensorflow/tfjs";
 import type { NamedFailure } from "@/engine/types";
-import { clamp, seededRandom } from "@/lib/utils";
+import { clamp, gaussian, seededRandom } from "@/lib/utils";
 
 /**
  * Overfit Tower Defense — the real machine learning.
@@ -70,11 +70,6 @@ export interface Dataset {
    * underfitting.
    */
   achievable: number;
-}
-
-function gaussian(random: () => number): number {
-  const u = Math.max(random(), Number.EPSILON);
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * random());
 }
 
 function sample(random: () => number, noiseRate: number): Sample {

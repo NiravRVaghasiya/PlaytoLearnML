@@ -32,8 +32,20 @@ export function seededRandom(seed: number): () => number {
   };
 }
 
-/** True when the user has asked the OS to reduce motion (DESIGN.md §7). */
-export function prefersReducedMotion(): boolean {
-  if (typeof window === "undefined" || !window.matchMedia) return false;
-  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+/**
+ * One standard-normal draw from a uniform source, by the Box–Muller transform.
+ * Consumes exactly two values from `random`, so a seeded generator still
+ * reproduces a dataset exactly.
+ *
+ * Lives here because seven games needed it and each had its own copy — and the
+ * copies had already drifted apart on the one line that matters. `log(0)` is
+ * `-Infinity`, so the first draw has to be floored above zero; the game-local
+ * versions disagreed about the floor (`Number.EPSILON` in six of them, `1e-12`
+ * in the seventh), which quietly made one game's clouds a different shape from
+ * everyone else's in the degenerate case.
+ */
+export function gaussian(random: () => number): number {
+  const u = Math.max(random(), Number.EPSILON);
+  const v = random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 }

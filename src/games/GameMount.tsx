@@ -91,17 +91,15 @@ function GameLoading() {
 export function GameMount({ slug }: { slug: string }) {
   const Game = GAME_COMPONENTS[slug];
 
+  // Unreachable by design, and kept only because the index signature is
+  // optional: `/play/[slug]` calls notFound() for anything outside the registry,
+  // and registry.test.ts asserts MOUNTED_SLUGS and playableSlugs() are the same
+  // set. Reaching here means those two drifted apart, which is a bug in the
+  // wiring rather than a state to render an apology for — so it throws instead
+  // of shipping a "not built yet" screen no test can exercise.
   if (!Game) {
-    return (
-      <div className="mx-auto max-w-2xl px-6 py-16">
-        <h1 className="font-display text-xl font-semibold">
-          This game isn&apos;t built yet
-        </h1>
-        <p className="mt-2 text-text-muted">
-          <code className="font-mono">{slug}</code> is on the roadmap but has no
-          module yet.
-        </p>
-      </div>
+    throw new Error(
+      `GameMount: no module registered for "${slug}". MOUNTED_SLUGS and the registry have drifted.`,
     );
   }
 

@@ -1,5 +1,5 @@
 import type { NamedFailure } from "@/engine/types";
-import { clamp, seededRandom } from "@/lib/utils";
+import { clamp, gaussian, seededRandom } from "@/lib/utils";
 
 /**
  * Dimension Diver — finding a projection by eye, and being scored against PCA.
@@ -68,13 +68,6 @@ export interface CloudSpec {
   /** What this arrangement is here to teach. */
   lesson: string;
   build: (random: () => number) => Point3D[];
-}
-
-/** Box–Muller, so the clouds are Gaussian rather than uniform blobs. */
-function gaussian(random: () => number): number {
-  const u = Math.max(random(), 1e-12);
-  const v = random();
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 }
 
 /** Rotate a point by yaw, pitch, roll, in that order. Used to tilt the clouds. */

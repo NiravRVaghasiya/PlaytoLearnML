@@ -68,6 +68,13 @@ export function metricAnnouncement(
   format: MetricFormat = "decimal",
   precision?: number,
 ): string {
+  // Games use a non-finite value to mean "nothing measured yet" — Overfit Tower
+  // Defense starts with gap = NaN and captions it "deploy to measure" — and
+  // `formatMetric` renders that as an em dash. The percent branch below formats
+  // the number itself rather than going through `formatMetric`, so without this
+  // guard the screen shows "—" while a screen reader hears "NaN percent".
+  if (!Number.isFinite(value)) return `${label} not measured yet`;
+
   const spoken =
     format === "percent"
       ? `${(value * 100).toFixed(precision ?? 0)} percent`

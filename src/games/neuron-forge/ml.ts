@@ -1,6 +1,6 @@
 import * as tf from "@tensorflow/tfjs";
 import type { NamedFailure } from "@/engine/types";
-import { clamp, seededRandom } from "@/lib/utils";
+import { clamp, gaussian, seededRandom } from "@/lib/utils";
 
 /**
  * Neuron Forge — the real machine learning.
@@ -159,11 +159,6 @@ export function patternById(id: PatternId): PatternSpec {
 }
 
 // ── The datasets ───────────────────────────────────────────────────────────
-
-function gaussian(random: () => number): number {
-  const u = Math.max(random(), Number.EPSILON);
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * random());
-}
 
 /** Radius² that splits [-1,1]² into equal halves, so the circle is balanced. */
 const CIRCLE_R2 = 2 / Math.PI;

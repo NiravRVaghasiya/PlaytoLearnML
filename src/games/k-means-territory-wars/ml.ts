@@ -1,5 +1,5 @@
 import type { NamedFailure } from "@/engine/types";
-import { clamp, seededRandom } from "@/lib/utils";
+import { clamp, gaussian, seededRandom } from "@/lib/utils";
 
 /**
  * K-Means Territory Wars — the real machine learning.
@@ -81,13 +81,6 @@ export const LOCAL_MINIMUM_RATIO = 1.15;
 export const WIN_SCORE = 0.8;
 
 // ── The generative process ─────────────────────────────────────────────────
-
-/** Standard normal via Box–Muller, driven by a seeded uniform source. */
-function gaussian(random: () => number): number {
-  const u = Math.max(random(), Number.EPSILON);
-  const v = random();
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
-}
 
 /**
  * Scatter villages in `trueK` compact blobs on a ring.

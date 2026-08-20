@@ -72,6 +72,25 @@ describe("metricAnnouncement", () => {
       "Inertia 5.000",
     );
   });
+
+  it("never speaks NaN, in any format", () => {
+    // The visible readout renders a non-finite value as "—", but the percent
+    // branch used to format the number directly and skip that guard, so a
+    // screen reader heard "Train/val gap NaN percent" on a metric that had not
+    // been measured yet. Caught in an Overfit Tower Defense playthrough.
+    expect(metricAnnouncement("Train/val gap", Number.NaN, null, "percent", 1))
+      .toBe("Train/val gap not measured yet");
+    expect(metricAnnouncement("Loss", Number.NaN, 0.5, "decimal")).toBe(
+      "Loss not measured yet",
+    );
+    expect(
+      metricAnnouncement("Accuracy", Number.POSITIVE_INFINITY, null, "percent"),
+    ).toBe("Accuracy not measured yet");
+    // A real zero is a measurement, not a missing value.
+    expect(metricAnnouncement("Episode reward", 0, null, "decimal", 1)).toBe(
+      "Episode reward 0.0",
+    );
+  });
 });
 
 describe("<MetricReadout>", () => {

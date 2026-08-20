@@ -1,6 +1,6 @@
 import * as tf from "@tensorflow/tfjs";
 import type { NamedFailure } from "@/engine/types";
-import { clamp, seededRandom } from "@/lib/utils";
+import { clamp, gaussian, seededRandom } from "@/lib/utils";
 
 /**
  * Data Detox — the real machine learning.
@@ -149,11 +149,6 @@ export const CAP_HIGH = 0.95;
 export const NAIVE_FILL = 0;
 
 // ── The generative process ─────────────────────────────────────────────────
-
-function gaussian(random: () => number): number {
-  const u = Math.max(random(), Number.EPSILON);
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * random());
-}
 
 /**
  * True weights. The signal the player is trying to preserve.

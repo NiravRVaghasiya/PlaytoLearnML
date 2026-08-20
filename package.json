@@ -16,7 +16,8 @@
     "test:run": "vitest run",
     "verify": "tsc --noEmit && eslint . && vitest run",
     "audit:a11y": "node scripts/a11y-audit.mjs",
-    "verify:play": "node scripts/verify-playthrough.mjs"
+    "verify:play": "node scripts/verify-playthrough.mjs",
+    "verify:pyodide": "node scripts/pyodide-smoke.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "2.112.0",

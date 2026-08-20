@@ -43,6 +43,15 @@ if (playthroughs.length === 0) {
   process.exit(1);
 }
 
+/**
+ * Everything currently sitting in an ARIA live region, read via textContent so
+ * the screen-reader-only clipping used by `.sr-only-live` cannot hide it.
+ */
+const liveRegionText = (page) =>
+  page.$$eval("[aria-live]", (nodes) =>
+    nodes.map((node) => node.textContent ?? "").join(" | "),
+  );
+
 const browser = await chromium.launch();
 let totalFailed = 0;
 let totalChecks = 0;
@@ -80,7 +89,29 @@ for (const playthrough of playthroughs) {
       .getByRole("heading", { name: playthrough.title })
       .waitFor({ timeout: 25000 });
 
+    // The metric announcement is debounced by 600ms, so give the opening one
+    // time to land before reading it. Sampling here matters: a metric that has
+    // not been measured yet is exactly where a NaN leaks into speech, and by the
+    // end of a playthrough it has been overwritten by a real value.
+    await page.waitForTimeout(900);
+    const openingSpeech = await liveRegionText(page);
+
     await playthrough.run({ page, check, metricText });
+
+    console.log("\nAnnouncement hygiene");
+    const closingSpeech = await liveRegionText(page);
+    const spoken = `${openingSpeech} | ${closingSpeech}`;
+    // Screen-reader-only text is easy to get wrong precisely because nobody
+    // looks at it. The visible readout renders an unmeasured metric as "—";
+    // this catches the case where the spoken version says "NaN percent" instead.
+    const junk = ["NaN", "undefined", "Infinity", "null"].filter((token) =>
+      spoken.includes(token),
+    );
+    check(
+      "no NaN or undefined reaches a screen reader",
+      junk.length === 0,
+      junk.length > 0 ? `found ${junk.join(", ")} in: ${spoken.slice(0, 200)}` : "",
+    );
 
     console.log("\nConsole hygiene");
     check(
