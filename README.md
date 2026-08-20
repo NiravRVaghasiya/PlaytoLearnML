@@ -1,77 +1,116 @@
-# 🎮 GameML — Vibe Coding Kit
+# 🎮 GameML
 
-Everything an AI coding agent (Claude Code, Cursor, Windsurf) needs to build **GameML** — an interactive site that teaches Machine Learning through games — with minimal hand-holding. Drop this at the root of your repo and start vibe coding.
+An interactive site that teaches Machine Learning by playing it. Fourteen games
+across six ML categories, and **every model trains in the browser** — no ML
+server, no GPU, nothing to install to play.
 
-## What's inside
+All 14 games are built. There is also a Concept Library of short explainers that
+the games link into from their feedback cards.
 
+## Running it
+
+The lockfile is `bun.lock`, so `bun` is the expected package manager.
+
+```bash
+bun install
+bun run dev          # http://localhost:3000 — also primes the Pyodide runtime
+bun run build        # production build
+bun run start        # serve the production build
 ```
-vibecodingkit/
-├── CLAUDE.md                       ← agent operating manual (rules, guardrails, DoD)
-├── DESIGN.md                       ← design system (tokens, GameShell anatomy, a11y)
-├── README.md                       ← you are here
-├── .mcp.json                       ← MCP servers (filesystem, git, github, playwright, supabase, context7)
-├── docs/
-│   └── GameML_Build_Spec.md        ← full product spec: 14 games, data models, roadmap
-└── .claude/
-    ├── settings.json               ← permissions + MCP allowlist (safe defaults)
-    ├── agents/                     ← subagents
-    │   ├── engine-architect.md     ← builds the shared engine (do this first)
-    │   ├── game-builder.md         ← implements one game end-to-end
-    │   ├── ml-verifier.md          ← checks the ML is real + honest
-    │   └── design-reviewer.md      ← checks DESIGN.md + accessibility
-    ├── skills/
-    │   ├── new-game-module/        ← scaffold a game from its spec entry (+ template)
-    │   └── tfjs-model-lifecycle/   ← memory-safe TF.js patterns
-    └── commands/                   ← slash commands
-        ├── scaffold-engine.md      ← /scaffold-engine
-        ├── new-game.md             ← /new-game <name>
-        └── verify-game.md          ← /verify-game <slug>
 
+`predev` and `prebuild` copy the Pyodide runtime into `public/pyodide`, which is
+what makes the Python code lane work offline. If `import pandas` ever fails,
+`bun run verify:pyodide` re-primes the wheels.
+
+## Verifying it
+
+Three layers, because they catch different things. Unit tests prove the ML is
+correct; the playthroughs prove it is wired to the screen; Lighthouse proves it
+is reachable.
+
+```bash
+bun run verify       # tsc --noEmit && eslint . && vitest run
+bun run build && bun run start   # the two below need a running server
+
+bun run verify:play  # drives all 14 games in a real browser
+bun run audit:a11y   # Lighthouse accessibility on every route
 ```
+
+Both browser harnesses read `AUDIT_BASE` (default `http://localhost:3000`), so
+point them at whichever port you started:
+
+```bash
+AUDIT_BASE=http://localhost:3001 bun run verify:play sort-it-arcade
+```
+
+`verify:play` exists because Sort-It Arcade once shipped two silent pedagogical
+bugs that every unit test passed. It asserts the metric actually moves, that a
+loss names a real ML failure mode, that both lanes share one store, and that
+nothing like `NaN` reaches a screen reader.
 
 ## The four load-bearing ideas
 
-1. **Pedagogy contract** — every game must have: a core intuition, player-action = algorithm, always-visible live feedback, and a *named* failure mode. Enforced by `CLAUDE.md` + `ml-verifier`.
-2. **Two-lane rule** — every game ships a visual (no-code) lane AND a code lane sharing one state store.
-3. **Client-side ML only** — TensorFlow.js + Pyodide in-browser. No ML server → cheap to host.
-4. **Shared engine first** — `GameShell`, `useModel`, `useCodeLane`, `progression` built once, reused by all 14 games.
+1. **Pedagogy contract** — every game has a core intuition, player-action =
+   algorithm, always-visible live feedback, and a *named* failure mode.
+2. **Two-lane rule** — every game ships a visual (no-code) lane and a code lane
+   sharing one state store.
+3. **Client-side ML only** — TensorFlow.js and Pyodide in-browser. No inference
+   endpoint, which is what makes hosting cheap.
+4. **Shared engine** — `GameShell`, `useModel`, `useCodeLane` and `progression`
+   are built once and reused, never forked per game.
 
-## Quick start
-
-```bash
-# 1. Copy this kit to your repo root, then open Claude Code there.
-# 2. Trust the project MCP servers when prompted (see .claude/settings.json).
-
-# 3. Build the foundation:
-/scaffold-engine
-
-# 4. Build Phase-1 games (per the spec roadmap):
-/new-game Sort-It Arcade
-/new-game K-Means Territory Wars
-/new-game Data Detox
-/new-game Gradient Descent Skier
-
-# 5. Verify each:
-/verify-game gradient-descent-skier
+## Layout
 
 ```
+├── CLAUDE.md                     ← how we build: rules, guardrails, DoD
+├── DESIGN.md                     ← how it looks: tokens, shell anatomy, a11y
+├── docs/
+│   ├── GameML_Build_Spec.md      ← what we build: the 14 games and their models
+│   └── ENGINE_API.md             ← shared engine API reference
+├── src/
+│   ├── app/                      ← routes: /, /play/[slug], /concepts/[slug]
+│   ├── engine/                   ← SHARED: GameShell, useModel, useCodeLane, progression
+│   ├── components/               ← shared primitives (MetricReadout, WhyCard, …)
+│   ├── games/<slug>/             ← one self-contained folder per game
+│   │                               store · ml · VisualLane · CodeLane · why-cards · tests
+│   └── lib/                      ← catalog, concepts, utils, supabase client
+├── scripts/                      ← a11y audit, playthrough runner, pyodide setup
+└── .claude/                      ← agents, skills and slash commands for adding a game
+```
 
-## Build order (from the spec roadmap)
+## Docs, in reading order
 
-- **Phase 1 (MVP):** Sort-It Arcade · K-Means Territory Wars · Data Detox · Gradient Descent Skier
-- **Phase 2:** Neuron Forge · Overfit Tower Defense · Confusion Matrix Chef · Decision Tree Architect
-- **Phase 3:** Hyperparameter Heist · Feature Forge · Agent Academy · Convolution Kitchen
-- **Phase 4:** Backprop Blitz · Dimension Diver · (bonus) GAN Duel
+1. **`CLAUDE.md`** — how we build. The pedagogy contract, the golden rules and
+   the Definition of Done. Cited throughout the code.
+2. **`DESIGN.md`** — how it looks. Colour and type tokens, `GameShell` anatomy,
+   and the accessibility requirements. The most-cited document in the codebase;
+   code comments reference its sections by number.
+3. **`docs/GameML_Build_Spec.md`** — what each game teaches. `src/lib/catalog.ts`
+   is a transcription of it, and the spec wins if they disagree.
+4. **`docs/ENGINE_API.md`** — the shared engine's API, for extending it.
 
-Always build the shared engine (`/scaffold-engine`) before any game.
+If they conflict: CLAUDE = how, DESIGN = look, SPEC = what. Ask rather than guess.
+
+## Adding a game
+
+The spec carries one unbuilt stretch entry, GAN Duel, and `.claude/` still holds
+the tooling for it: the `new-game-module` skill, the `game-builder`, `ml-verifier`
+and `design-reviewer` subagents, and `/new-game` + `/verify-game`. A game is not
+done until all four pedagogy-contract points are demonstrable in code and the
+Definition of Done in `CLAUDE.md` passes.
 
 ## Setup notes
 
-- **Env vars** (never commit): `GITHUB_TOKEN`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`. Put them in `.env.local` (gitignored). `settings.json` denies reading `.env*`.
-- **MCP servers** run via `npx` — Node 18+ required. `github` and `supabase` are gated behind "ask" permissions by default.
-- **Playwright MCP** powers `/verify-game`'s accessibility + "does the metric actually move" checks.
+- Secrets never get committed. `SUPABASE_*` and `GITHUB_TOKEN` go in `.env.local`,
+  which is gitignored; see `.env.example`. Progression falls back to
+  `localStorage`, so the app runs with no Supabase project at all.
+- MCP servers are configured in `.mcp.json`; `github` and `supabase` are gated
+  behind "ask" in `.claude/settings.json`.
 
-## Read order for a new agent
+## Provenance
 
-1. `CLAUDE.md` (how we build) → 2. `DESIGN.md` (how it looks) → 3. `docs/GameML_Build_Spec.md` (what each game teaches). If they ever conflict: CLAUDE = how, DESIGN = look, SPEC = what. Ask rather than guess.
-
+The 14-game catalog came out of an ideation prompt, which produced
+`docs/GameML_Build_Spec.md`, which in turn produced this kit's `CLAUDE.md`,
+`DESIGN.md` and `.claude/` tooling. The original ideation and kickoff prompts
+were removed once the build was complete — they described work that is now done,
+and are recoverable from git history if the provenance is ever needed.

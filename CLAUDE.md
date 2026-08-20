@@ -45,6 +45,17 @@ If you're implementing a game and can't point to all four in code, stop and flag
 | Styling | Tailwind CSS + tokens from DESIGN.md |
 | Test | Vitest + React Testing Library; Playwright for e2e |
 
+**What actually shipped, against that table.** Three entries went unused and are
+still declared in `package.json`: **Highcharts**, **p5.js** and **Phaser.js**.
+Every chart, grid and battlefield ended up as SVG or D3 instead, on a rule worth
+keeping — *when the numbers are the content, use SVG*, because an SVG chart is
+inspectable by a screen reader and a canvas is an opaque bitmap. That rule is
+also why the a11y score holds at 100. Three.js is used, and earns it, in the two
+places where 3D rotation is the actual interaction (Gradient Descent Skier's loss
+terrain, Dimension Diver's point cloud); both degrade to an SVG view when WebGL is
+unavailable. Removing the three unused dependencies is an open decision — they
+cost install weight, and Highcharts is commercially licensed.
+
 ## Repo layout
 
 ```
@@ -52,7 +63,8 @@ gameml/
 ├── CLAUDE.md                 ← you are here
 ├── DESIGN.md                 ← design system + tokens
 ├── docs/
-│   └── GameML_Build_Spec.md  ← full product spec (source of truth for games)
+│   ├── GameML_Build_Spec.md  ← full product spec (source of truth for games)
+│   └── ENGINE_API.md         ← shared engine API reference
 ├── .claude/
 │   ├── agents/               ← subagent definitions
 │   ├── skills/               ← reusable skills (new-game-module, tfjs-model-lifecycle)
@@ -61,9 +73,14 @@ gameml/
 ├── .mcp.json                 ← MCP server config
 ├── src/
 │   ├── app/                  ← Next.js routes
+│   │   ├── page.tsx              ← the roster
+│   │   ├── play/[slug]/          ← a game
+│   │   └── concepts/[slug]/      ← the Concept Library, linked from every WhyCard
 │   ├── engine/               ← SHARED: GameShell, useModel, useCodeLane, progression
 │   ├── components/           ← shared UI primitives (MetricReadout, WhyCard, ...)
 │   ├── games/                ← one folder per game (self-contained)
+│   │   ├── registry.ts           ← which slugs are playable (server-safe)
+│   │   ├── GameMount.tsx         ← slug → component map (client, ssr:false)
 │   │   └── <game-slug>/
 │   │       ├── index.tsx         ← entry, mounts in GameShell
 │   │       ├── store.ts          ← Zustand state (the data model)
@@ -72,9 +89,19 @@ gameml/
 │   │       ├── ml.ts             ← the ML logic (TF.js)
 │   │       ├── why-cards.ts      ← feedback copy tied to actions
 │   │       └── <game>.test.ts
-│   └── lib/                  ← utils, supabase client, datasets
+│   └── lib/                  ← catalog, concepts, utils, supabase client
+├── scripts/
+│   ├── a11y-audit.mjs        ← Lighthouse over every route
+│   ├── verify-playthrough.mjs    ← drives each game in a real browser
+│   ├── playthroughs/<slug>.mjs   ← one per game
+│   └── setup-pyodide.mjs     ← vendors the Python runtime into public/
 └── public/datasets/          ← Titanic, Iris, MNIST subsets
 ```
+
+A new game has to be registered in **four** places or it is invisible:
+`registry.ts`, `GameMount.tsx`, `DEFAULT_PATHS` in `scripts/a11y-audit.mjs`, and a
+`scripts/playthroughs/<slug>.mjs`. Tests enforce the first two and the concept
+routes; the playthrough is what proves the game is wired to the screen.
 
 ## Workflow for adding a game
 
