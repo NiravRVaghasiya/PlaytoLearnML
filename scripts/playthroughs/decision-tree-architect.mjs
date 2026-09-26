@@ -11,9 +11,55 @@
 export const slug = "decision-tree-architect";
 export const title = "Decision Tree Architect";
 
+/**
+ * Wait until the tree diagram shows at least `minNodes` nodes, every one of
+ * them wholly inside the canvas frame.
+ *
+ * The canvas is read-only — no pan, no zoom — so a node outside the frame is a
+ * node the player can never see. React Flow's `fitView` prop only fits the
+ * first render, and for a while every gate past the first grew off the bottom
+ * of the frame while the figcaption still read "1 gate and 2 leaves".
+ */
+async function treeFitsCanvas(page, minNodes) {
+  const fitted = await page
+    .waitForFunction(
+      (min) => {
+        const pane = document.querySelector(".react-flow");
+        if (!pane) {
+          window.__treeFit = "no canvas";
+          return false;
+        }
+        const frame = pane.getBoundingClientRect();
+        const nodes = [...pane.querySelectorAll(".react-flow__node")];
+        const outside = nodes.filter((node) => {
+          const box = node.getBoundingClientRect();
+          return (
+            box.left < frame.left - 1 ||
+            box.right > frame.right + 1 ||
+            box.top < frame.top - 1 ||
+            box.bottom > frame.bottom + 1
+          );
+        }).length;
+        // Kept on the page so the last measurement can be reported on failure.
+        window.__treeFit = `${nodes.length} nodes, ${outside} outside the frame`;
+        return nodes.length >= min && outside === 0;
+      },
+      minNodes,
+      { timeout: 5000 },
+    )
+    .then(() => true)
+    .catch(() => false);
+  const detail = await page.evaluate(() => window.__treeFit ?? "not measured");
+  return { fitted, detail };
+}
+
 export async function run({ page, check, metricText }) {
   const whyRegion = page.getByRole("region", { name: /why did that happen/i });
   const failure = page.locator('[data-testid="named-failure"]');
+  // The alert's text, not its element count: holds whether the shell unmounts
+  // the alert between failures or keeps an emptied live region mounted.
+  const failureText = async () =>
+    (await failure.allInnerTexts()).join(" ").trim();
   const ghost = page.locator('[data-testid="overfit-ghost"]');
   const signOff = page.getByRole("button", { name: /Sign off this tree/ });
   const outputRegion = page.getByRole("region", { name: "Script output" });
@@ -79,6 +125,18 @@ export async function run({ page, check, metricText }) {
     "the tree diagram now shows a gate",
     /1 gate and 2 leaves/.test(await page.locator("main").innerText()),
   );
+  {
+    const { fitted, detail } = await treeFitsCanvas(page, 3);
+    check("the diagram re-fits so the new leaves are in view", fitted, detail);
+  }
+  check(
+    "the tree is stated in words for screen readers",
+    /gate n0, \S+( \S+)? < 0\.\d\d/.test(
+      (await page
+        .getByRole("list", { name: "The tree, gate by gate" })
+        .textContent()) ?? "",
+    ),
+  );
 
   const announced = await page
     .waitForFunction(
@@ -112,8 +170,8 @@ export async function run({ page, check, metricText }) {
   await page.waitForTimeout(400);
   check(
     "a two-gate tree signs the plot off",
-    (await failure.count()) === 0,
-    (await failure.count()) === 0 ? "no failure" : await failure.innerText(),
+    (await failureText()) === "",
+    (await failureText()) === "" ? "no failure" : await failureText(),
   );
   check(
     "the next plot is offered",
@@ -129,13 +187,13 @@ export async function run({ page, check, metricText }) {
   await editor.fill(
     [
       "api.restart();",
-      "// Reach the peak first, so there is something to give away.",
+      "// Reach the peak first, so there is something to give away. Not signed",
+      "// off: the peak is tracked as the tree grows, and a signed-off plot is closed.",
       "api.growGreedy(3);",
       "log('peak depth', api.depth(), 'val', pct(api.validationAccuracy()));",
-      "const good = api.signOff();",
-      "log('at peak:', good.outcome);",
+      "log('ghost at the peak?', api.peak().validation > api.validationAccuracy());",
       "// Now keep going. Training can only rise; validation need not.",
-      "api.growGreedy(8);",
+      "api.growGreedy(api.round().maxDepth);",
       "log('deep depth', api.depth(), 'train', pct(api.trainAccuracy()),",
       "    'val', pct(api.validationAccuracy()), 'starved', api.starved());",
       "const deep = api.signOff();",
@@ -148,8 +206,8 @@ export async function run({ page, check, metricText }) {
 
   const deepOut = await outputRegion.innerText();
   check(
-    "the shallow tree at the peak signs off",
-    /at peak: win/.test(deepOut),
+    "growing straight to the peak is not reported as overfitting",
+    /ghost at the peak\? false/.test(deepOut),
     deepOut.replace(/\n/g, " | "),
   );
   check(
@@ -171,8 +229,8 @@ export async function run({ page, check, metricText }) {
     deepOut.split("\n").filter((l) => /depth/.test(l)).join(" | "),
   );
 
-  if ((await failure.count()) > 0) {
-    const text = await failure.innerText();
+  if ((await failureText()) !== "") {
+    const text = await failureText();
     check(
       "failure is NAMED 'Overfit depth', not generic",
       /overfit depth/i.test(text) && !/game over/i.test(text),
@@ -205,10 +263,44 @@ export async function run({ page, check, metricText }) {
     /at depth \d+/i.test(ghostText),
     ghostText.replace(/\n/g, " ").slice(0, 120),
   );
+  {
+    // A full-depth greedy tree is the widest this plot grows.
+    const { fitted, detail } = await treeFitsCanvas(page, 9);
+    check("every node of the deep tree is inside the canvas", fitted, detail);
+  }
+  {
+    // Same tree, narrower pane: a phone turned upright, a window made
+    // smaller. React Flow keeps the old transform on a resize, so without a
+    // re-fit keyed on the pane's size the right-hand leaves stayed clipped.
+    const viewport = page.viewportSize();
+    if (viewport) {
+      await page.setViewportSize({ width: 390, height: viewport.height });
+      const { fitted, detail } = await treeFitsCanvas(page, 9);
+      check("the deep tree re-fits when the window narrows", fitted, detail);
+      await page.setViewportSize(viewport);
+    }
+  }
+
+  // ── following the advice works: prune back to the peak and sign off ──
+  console.log("\nPruning back to the peak signs the plot off");
+  await page.getByRole("radio", { name: /code/i }).click();
+  await editor.fill(
+    [
+      "api.growGreedy(3);",
+      "const back = api.signOff();",
+      "log('PEAKDONE', back.outcome, 'depth', api.depth());",
+    ].join("\n"),
+  );
+  await runButton.click();
+  await outputRegion.getByText(/PEAKDONE/).waitFor({ timeout: 60000 });
+  check(
+    "the shallow tree at the peak signs off",
+    /PEAKDONE win depth 3/.test(await outputRegion.innerText()),
+    (await outputRegion.innerText()).replace(/\n/g, " | "),
+  );
 
   // ── pruning recovers it: the experiment, not the claim ──
   console.log("\nPruning raises accuracy on unseen plots");
-  await page.getByRole("radio", { name: /code/i }).click();
   await editor.fill(
     [
       "api.restart();",
@@ -257,8 +349,8 @@ export async function run({ page, check, metricText }) {
     stumpOut.replace(/\n/g, " | "),
   );
 
-  if ((await failure.count()) > 0) {
-    const text = await failure.innerText();
+  if ((await failureText()) !== "") {
+    const text = await failureText();
     check(
       "this failure is NAMED 'Underfit stump' — a different diagnosis",
       /underfit stump/i.test(text),
@@ -383,6 +475,50 @@ export async function run({ page, check, metricText }) {
     })(),
     ridgeOut.split("\n").find((l) => l.startsWith("RIDGEDONE")) ?? "",
   );
+  // ── Retry means this plot again, not the whole survey ──
+  console.log("\nRetry keeps the plots already signed off");
+  await editor.fill(
+    [
+      "api.restart();",
+      "api.growGreedy(2); api.signOff(); api.nextRound();",
+      "// No gates on plot 2: a named failure to retry from.",
+      "const r = api.signOff();",
+      "log('RETRYSETUP', api.round().index, r.outcome);",
+    ].join("\n"),
+  );
+  await runButton.click();
+  await outputRegion.getByText(/RETRYSETUP/).waitFor({ timeout: 60000 });
+  check(
+    "a gateless plot two fails with a named diagnosis",
+    /RETRYSETUP 2 underfit-stump/.test(await outputRegion.innerText()),
+    (await outputRegion.innerText()).replace(/\n/g, " | "),
+  );
+  const retryButton = failure.getByRole("button", { name: /retry/i });
+  if ((await retryButton.count()) > 0) {
+    await retryButton.click();
+    await page.waitForTimeout(300);
+    // Text, not element count: holds whether the shell removes the alert or
+    // keeps an emptied live region mounted.
+    check(
+      "retry clears the named failure",
+      !/underfit stump/i.test((await failure.allInnerTexts()).join(" ")),
+    );
+    check(
+      "retry keeps the player on plot two",
+      await page.getByText(/Plot 2 of 3/).first().isVisible(),
+    );
+    await editor.fill("log('RETRYDONE', api.round().index, api.cleared());");
+    await runButton.click();
+    await outputRegion.getByText(/RETRYDONE/).waitFor({ timeout: 60000 });
+    check(
+      "retry does not wipe the plot already signed off",
+      /RETRYDONE 2 1/.test(await outputRegion.innerText()),
+      (await outputRegion.innerText()).replace(/\n/g, " | "),
+    );
+  } else {
+    check("retry is offered inside the failure alert", false);
+  }
+
   check(
     "XP bar present",
     await page

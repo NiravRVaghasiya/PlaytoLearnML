@@ -4,28 +4,15 @@ import { useMemo } from "react";
 import { Play, RotateCcw } from "lucide-react";
 import { Button, CodeEditor } from "@/components";
 import { useCodeLane } from "@/engine/useCodeLane";
-import {
-  FEATURES,
-  accuracyOf,
-  bestSplit,
-  buildGreedyTree,
-  candidateSplitsWithLookahead,
-  countsOf,
-  depthCurve,
-  describeSplit,
-  gainOf,
-  giniOf,
-  leavesOf,
-  nodeStats,
-  roundAt,
-} from "./ml";
-import { samplesAt, useArchitectStore } from "./store";
+import { createCodeApi } from "./store";
 
 /**
  * Decision Tree Architect — the code lane.
  *
  * `api.split` and `api.prune` are the same store actions the picker calls, and
  * `api.signOff` is the same judgement the button calls (CLAUDE.md two-lane rule).
+ * The api lives in `store.ts` as `createCodeApi`, so its argument checks and its
+ * code-lane attribution are unit-tested without rendering this component.
  *
  * The starter snippet is the experiment the visual lane can only gesture at:
  * build greedy CART at every depth and print both accuracies, so the crossover is
@@ -33,7 +20,7 @@ import { samplesAt, useArchitectStore } from "./store";
  * which is the actual professional move — grow, measure, prune.
  */
 
-const STARTER_CODE = `// Where does depth stop paying? Build the tree at every depth
+export const STARTER_CODE = `// Where does depth stop paying? Build the tree at every depth
 // and read both columns.
 
 log('plot', api.round().name, '|', api.trainPoints(), 'plots | ceiling',
@@ -43,7 +30,8 @@ log('depth  gates   train      val     gap   starved');
 
 let peak = { depth: 0, val: -1 };
 
-for (const point of api.depthCurve(9)) {
+// Only as deep as this plot allows: a peak past the limit cannot be signed off.
+for (const point of api.depthCurve(api.round().maxDepth)) {
   const gap = point.trainAccuracy - point.validationAccuracy;
   log(String(point.depth).padStart(4), String(point.splits).padStart(6),
       pct(point.trainAccuracy), pct(point.validationAccuracy),
@@ -55,10 +43,18 @@ for (const point of api.depthCurve(9)) {
 
 log('');
 log('validation peaks at depth ' + peak.depth, '->', pct(peak.val));
-log('deeper than that, training keeps rising and validation does not.');
+if (peak.depth < api.round().maxDepth) {
+  log('deeper than that, training keeps rising and validation does not.');
+} else {
+  // The sweep stops at the limit, so it cannot see where validation turns.
+  log('that is the depth limit: validation was still at its best there.');
+}
+if (peak.val < api.round().target) {
+  log('no depth up to the limit reaches', pct(api.round().target).trim(),
+      '- greedy CART alone cannot sign this plot off.');
+}
 
-// Grow to the peak, then sign it off.
-api.clear();
+// Grow to the peak in one step, then sign it off.
 api.growGreedy(peak.depth);
 log('built depth', api.depth(), 'with', api.splits(), 'gates ->',
     'train', pct(api.trainAccuracy()), 'val', pct(api.validationAccuracy()));
@@ -67,141 +63,19 @@ log('verdict:', result.outcome);
 
 function pct(x) { return (x * 100).toFixed(1).padStart(6) + '%'; }
 
-// Try api.growGreedy(9) instead and sign that off. Same data, same
-// learner, more gates - and the verdict changes.
+// Then try the full depth instead. A signed-off plot stays signed off, so
+// start it over first - api.retryRound() - then api.growGreedy(api.round().maxDepth)
+// and sign that off. Same data, same learner, more gates - and on the first two
+// plots the verdict changes.
 //
 // On the ridge plot, try api.gainTable() at the root: every reading looks
-// worthless. Then compare the lookahead column.`;
+// worthless. Then compare api.lookaheadOf('n0', 0, 0.5) - the threshold the
+// table never tries.`;
 
 export function CodeLane() {
-  const store = useArchitectStore;
-
-  const api = useMemo(
-    () => ({
-      /** Build a gate at a node. Same action as the picker. */
-      split: (nodeId: string, feature: number, threshold: number) => {
-        if (typeof nodeId !== "string" || !store.getState().tree[nodeId]) {
-          throw new Error(`no node "${nodeId}" in the tree`);
-        }
-        if (!Number.isInteger(feature) || feature < 0 || feature >= FEATURES.length) {
-          throw new Error(`feature must be 0..${FEATURES.length - 1}`);
-        }
-        if (!Number.isFinite(threshold)) {
-          throw new Error("threshold must be a finite number");
-        }
-        store.getState().splitAt(nodeId, { feature, threshold });
-      },
-      /** Take whatever greedy CART would take at a node. */
-      greedyAt: (nodeId: string) => store.getState().takeGreedySplit(nodeId),
-      prune: (nodeId: string) => store.getState().prune(nodeId),
-      clear: () => store.getState().clearTree(),
-
-      /** Grow the whole tree greedily to a depth, replacing what is there. */
-      growGreedy: (maxDepth: number) => {
-        const state = store.getState();
-        state.clearTree();
-        // Walk breadth-first, taking the best gain at every leaf, exactly as
-        // buildGreedyTree does — but through the store so both lanes see it.
-        for (let depth = 0; depth < maxDepth; depth += 1) {
-          const current = store.getState();
-          for (const leaf of leavesOf(current.tree)) {
-            if (leaf.depth !== depth) continue;
-            const bucket = samplesAt(store.getState(), leaf.id);
-            const candidate = bestSplit(bucket);
-            if (candidate === null || candidate.gain <= 0) continue;
-            store.getState().splitAt(leaf.id, {
-              feature: candidate.feature,
-              threshold: candidate.threshold,
-            });
-          }
-        }
-      },
-
-      signOff: () => store.getState().signOff(),
-      nextRound: () => store.getState().nextRound(),
-      restart: () => store.getState().restart(),
-
-      /** The gain table at a node, lookahead column included. */
-      gainTable: (nodeId = "n0") => {
-        const bucket = samplesAt(store.getState(), nodeId);
-        return candidateSplitsWithLookahead(bucket).map((candidate, index) => ({
-          feature: index,
-          name: FEATURES[index]!.name,
-          threshold: candidate?.threshold ?? null,
-          gain: candidate?.gain ?? 0,
-          lookaheadGain: candidate?.lookaheadGain ?? 0,
-        }));
-      },
-      /** Gain of any gate you like, without building it. */
-      gainOf: (nodeId: string, feature: number, threshold: number) =>
-        gainOf(samplesAt(store.getState(), nodeId), { feature, threshold }),
-      impurityAt: (nodeId: string) =>
-        giniOf(countsOf(samplesAt(store.getState(), nodeId))),
-      countsAt: (nodeId: string) =>
-        countsOf(samplesAt(store.getState(), nodeId)),
-
-      leaves: () => leavesOf(store.getState().tree).map((leaf) => leaf.id),
-      gate: (nodeId: string) => {
-        const node = store.getState().tree[nodeId];
-        return node?.split === null || !node
-          ? null
-          : { ...node.split, describe: describeSplit(node.split) };
-      },
-
-      /** Greedy CART's accuracies at each depth, without touching your tree. */
-      depthCurve: (maxDepth = 9) =>
-        depthCurve(store.getState().dataset, maxDepth),
-      /** How many starved leaves greedy CART would have at a depth. */
-      starvedAtDepth: (maxDepth: number) => {
-        const { dataset } = store.getState();
-        const tree = buildGreedyTree(dataset.train, maxDepth);
-        const stats = nodeStats(tree, dataset.train);
-        return leavesOf(tree).filter((leaf) => {
-          const total = stats[leaf.id]?.counts.total ?? 0;
-          return total > 0 && total < 5;
-        }).length;
-      },
-      /** Score any depth of greedy CART without committing to it. */
-      tryGreedy: (maxDepth: number) => {
-        const { dataset } = store.getState();
-        const tree = buildGreedyTree(dataset.train, maxDepth);
-        const stats = nodeStats(tree, dataset.train);
-        return {
-          trainAccuracy: accuracyOf(tree, stats, dataset.train),
-          validationAccuracy: accuracyOf(tree, stats, dataset.validation),
-        };
-      },
-
-      trainAccuracy: () => store.getState().trainAccuracy,
-      validationAccuracy: () => store.getState().validationAccuracy,
-      depth: () => store.getState().depth,
-      splits: () => store.getState().splits,
-      starved: () => store.getState().starved,
-      peak: () => ({
-        validation: store.getState().peakValidation,
-        depth: store.getState().peakDepth,
-      }),
-
-      round: () => {
-        const round = roundAt(store.getState().roundIndex);
-        return {
-          index: round.index,
-          name: round.name,
-          boundary: round.boundary,
-          target: round.target,
-          maxDepth: round.maxDepth,
-          trainPoints: round.trainPoints,
-        };
-      },
-      trainPoints: () => store.getState().dataset.train.length,
-      achievable: () => store.getState().dataset.achievable,
-      features: () => FEATURES.map((meta) => ({ ...meta })),
-      phase: () => store.getState().phase,
-      cleared: () => store.getState().clearedScores.length,
-      lastEvaluation: () => store.getState().evaluation,
-    }),
-    [store],
-  );
+  // One api object per mount: `createCodeApi` reads the store on every call,
+  // so it never goes stale.
+  const api = useMemo(() => createCodeApi(), []);
 
   const lane = useCodeLane({ initialCode: STARTER_CODE, api, maxRunMs: 30000 });
 
@@ -238,7 +112,7 @@ export function CodeLane() {
         language="javascript"
         error={lane.error}
         rows={18}
-        hint="api.split · api.greedyAt · api.growGreedy · api.prune · api.clear · api.signOff · api.gainTable · api.gainOf · api.impurityAt · api.countsAt · api.leaves · api.depthCurve · api.tryGreedy · api.depth · api.peak · api.round"
+        hint="api.split · api.greedyAt · api.growGreedy · api.prune · api.clear · api.signOff · api.retryRound · api.gainTable · api.gainOf · api.lookaheadOf · api.impurityAt · api.countsAt · api.leaves · api.depthCurve · api.tryGreedy · api.depth · api.peak · api.round"
       />
 
       <section aria-label="Script output" className="min-h-24">

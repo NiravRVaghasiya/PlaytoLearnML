@@ -364,13 +364,21 @@ export function bestSplitOn(
  * This is one-step lookahead, and real CART does not do it — which is precisely
  * why it is here. On an XOR-shaped boundary the best first split has almost no
  * immediate gain, so a greedy learner picks a worthless feature and never
- * recovers. Measured on the ridge plot: splitting on slope gains 0.0011 and
- * unlocks children worth 0.40 and 0.38, while the useless wind reading gains
- * 0.0177 and unlocks nothing.
+ * recovers. Measured on the ridge plot: slope < 0.50 gains 0.0011 and has a
+ * lookahead of 0.393, while the useless wind reading's best gate gains 0.0177
+ * and has a lookahead of 0.019.
  *
- * Showing both columns is what makes that difference something the player can
- * see and act on, rather than a trap they have to guess their way out of. The
- * gap between the two columns IS the greedy learner's blind spot.
+ * Two things this number is NOT, both measured, both easy to get wrong:
+ *
+ *   - It is not shown for slope < 0.50 in the gain table. The table tries each
+ *     reading at its best IMMEDIATE threshold, which on XOR data is a sliver at
+ *     the edge (slope < 0.04, lookahead 0.017). The right gate is found with the
+ *     threshold slider, whose readout shows this number live.
+ *   - A high value alone is not "hidden structure". A gate that peels off a
+ *     sliver leaves the big side almost exactly as it was, so its lookahead
+ *     is roughly the best gain the node ALREADY had (terrace root: soil pH <
+ *     0.97 gains 0.0125, lookahead 0.150, against 0.153 available anyway). Use
+ *     `unlockedGainOf` to ask whether a gate created structure.
  */
 export function lookaheadGainOf(samples: Sample[], split: Split): number {
   const { left, right } = partition(samples, split);
@@ -383,6 +391,23 @@ export function lookaheadGainOf(samples: Sample[], split: Split): number {
     (left.length / samples.length) * Math.max(0, leftBest) +
     (right.length / samples.length) * Math.max(0, rightBest)
   );
+}
+
+/**
+ * Lookahead beyond what the node could already buy in one gate.
+ *
+ * Lookahead minus the best immediate gain at the node. Positive means the gate
+ * uncovered structure a one-step score could not see — the ridge root's
+ * slope < 0.50 unlocks 0.375. Near zero or negative means it only passed the
+ * node's existing problem down a level, however large its lookahead looks.
+ * This is the number the "almost no gain, a lot underneath" reading needs.
+ */
+export function unlockedGainOf(
+  samples: Sample[],
+  split: Split,
+  parentBest: number = bestSplit(samples)?.gain ?? 0,
+): number {
+  return lookaheadGainOf(samples, split) - Math.max(0, parentBest);
 }
 
 export interface SplitCandidateWithLookahead extends SplitCandidate {
@@ -441,6 +466,15 @@ export interface TreeNode {
 export type Tree = Record<string, TreeNode>;
 
 export const ROOT_ID = "n0";
+
+/**
+ * The deepest a script may ask for in one call (`growGreedy`, `depthCurve`, …).
+ *
+ * Every plot's greedy tree is pure throughout by depth 12 (terrace 6, hillside
+ * 12, ridge 10, measured), so past this a depth argument can only be a typo —
+ * or a loop bound like 1e9 that would hang the tab building trees.
+ */
+export const DEPTH_ARG_LIMIT = 16;
 
 export function emptyTree(): Tree {
   return { [ROOT_ID]: { id: ROOT_ID, split: null, left: null, right: null, depth: 0 } };
@@ -704,6 +738,12 @@ export interface Evaluation {
   splits: number;
   starved: number;
   score: number;
+  /**
+   * The ghost's test (`givesGroundBack`) on this tree. The copy of every other
+   * verdict reads it, so a sign-off never says "nothing is being memorised"
+   * beside a ghost that says overfitting.
+   */
+  givingGroundBack: boolean;
   failure: NamedFailure | null;
 }
 
@@ -712,6 +752,45 @@ const points = (value: number) => `${(value * 100).toFixed(1)}%`;
 
 /** How far validation must fall below its own peak to count as overfitting. */
 export const OVERFIT_DROP = 0.025;
+
+/** How far below the peak the ghost and the WhyCards start warning. */
+export const GIVING_BACK_DROP = 0.01;
+
+/** A train-validation gap under this is narrow: the tree is generalising. */
+export const NARROW_GAP = 0.06;
+
+/**
+ * Is the tree giving back validation accuracy the player already had?
+ *
+ * The one test behind the ghost, the live metric's warning and the WhyCards
+ * that link to overfitting, so no two of them can disagree about a tree.
+ * Validation below the peak is not enough on its own: a tree SMALLER than the
+ * peak scores lower too. Grow the terrace to depth 3 and then back to depth 1,
+ * and validation is 15 points down with training 17 points down beside it —
+ * too little tree, which sign-off rightly calls an Underfit stump. Overfitting
+ * is validation down while training is at least where it was at the peak.
+ *
+ * No depth test, deliberately: the peak can be a half-built level at the same
+ * depth (see `growGreedy` in the store), and finishing that level lowers
+ * validation at equal depth — overfitting all the same.
+ */
+export function givesGroundBack({
+  peakValidation,
+  validationAccuracy,
+  trainAccuracy,
+  peakTrainAccuracy,
+}: {
+  peakValidation: number;
+  validationAccuracy: number;
+  trainAccuracy: number;
+  peakTrainAccuracy: number;
+}): boolean {
+  return (
+    peakValidation > 0 &&
+    peakValidation - validationAccuracy >= GIVING_BACK_DROP &&
+    trainAccuracy >= peakTrainAccuracy
+  );
+}
 
 /**
  * Score the tree the player signed off.
@@ -754,6 +833,23 @@ export function evaluateTree({
   // with fewer gates is the better piece of engineering.
   const depthPenalty = round.maxDepth === 0 ? 0 : (depth / round.maxDepth) * 0.2;
   const score = clamp(validationAccuracy * (1 - depthPenalty), 0, 1);
+  const gap = Math.max(0, trainAccuracy - validationAccuracy);
+  const givingGroundBack = givesGroundBack({
+    peakValidation,
+    validationAccuracy,
+    trainAccuracy,
+    peakTrainAccuracy,
+  });
+  // Said in the two verdicts below whenever the ghost is up — a drop smaller
+  // than OVERFIT_DROP, or one the target still clears — so they explain it
+  // rather than contradict it.
+  const sincePeak = `validation is ${points(
+    validationAccuracy,
+  )}, below the ${points(
+    peakValidation,
+  )} you had at depth ${peakDepth} while training has not fallen, so the gates since then are fitting these ${
+    dataset.train.length
+  } plots rather than the ground`;
 
   const base = {
     trainAccuracy,
@@ -764,6 +860,7 @@ export function evaluateTree({
     splits,
     starved,
     score,
+    givingGroundBack,
   };
 
   // 1. Had it, gave it away.
@@ -826,11 +923,21 @@ export function evaluateTree({
           splits === 0
             ? "There are no gates at all, so every plot gets the same verdict."
             : `${splits} gate${splits === 1 ? "" : "s"} at depth ${depth} is not enough shape for this boundary.`
-        } Validation is ${points(
-          validationAccuracy,
-        )} and the gap to training is only ${points(
-          Math.max(0, trainAccuracy - validationAccuracy),
-        )}, so nothing is being memorised. Add gates.`,
+        } ${
+          // "Nothing is being memorised" only when the numbers say so: the
+          // ridge's greedy gates fit noise long before they fit the ground.
+          givingGroundBack
+            ? `And ${sincePeak}. Add gates that follow the boundary, not more like those: look at the lookahead column as well as the gain.`
+            : gap < NARROW_GAP
+              ? `Validation is ${points(
+                  validationAccuracy,
+                )} and the gap to training is only ${points(
+                  gap,
+                )}, so nothing is being memorised. Add gates.`
+              : `Validation is ${points(validationAccuracy)}, ${points(
+                  gap,
+                )} below training, so some of these gates describe the plots rather than the ground — but mostly the tree has too little of the right shape. Add gates that follow the boundary: look at the lookahead column as well as the gain.`
+        }`,
       },
     };
   }
@@ -847,14 +954,16 @@ export function evaluateTree({
         depth > round.maxDepth
           ? `, and depth ${depth} is over the ${round.maxDepth} allowed`
           : ""
-      }. Training is ${points(
-        trainAccuracy,
-      )}, so ${
-        trainAccuracy - validationAccuracy > 0.1
-          ? `the ${points(
-              trainAccuracy - validationAccuracy,
-            )} gap says some of what you have built is specific to these plots.`
-          : "the tree is generalising what it has learned — there is just not enough of it yet."
+      }. Training is ${points(trainAccuracy)}, ${
+        givingGroundBack
+          ? `and ${sincePeak}. Pruning back toward depth ${peakDepth} may raise validation even though it lowers training.`
+          : `so ${
+              trainAccuracy - validationAccuracy > 0.1
+                ? `the ${points(
+                    trainAccuracy - validationAccuracy,
+                  )} gap says some of what you have built is specific to these plots.`
+                : "the tree is generalising what it has learned — there is just not enough of it yet."
+            }`
       } Check the gain table on your largest leaf.`,
     },
   };
@@ -886,7 +995,9 @@ export function gainOf(samples, split) {
 // Greedy CART is this, applied recursively, always taking the best gain.
 // Choosing a gate by hand is the same decision, made by you instead.
 export function bestSplitOn(samples, feature) {
-  const values = [...new Set(samples.map(s => s.features[feature]))].sort();
+  // Numbers need a comparator: sort() without one compares them as strings.
+  const values = [...new Set(samples.map(s => s.features[feature]))]
+    .sort((a, b) => a - b);
   let best = null;
   // Only midpoints between observed values matter: any threshold between
   // two neighbours partitions the data identically.

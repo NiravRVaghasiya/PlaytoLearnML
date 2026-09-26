@@ -1,6 +1,17 @@
+import { createElement } from "react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  EMPTY_PROGRESSION,
+  createMemoryAdapter,
+  useProgression,
+} from "@/engine/progression";
+import { createJsExecutor } from "@/engine/useCodeLane";
+import {
+  DEPTH_ARG_LIMIT,
   FEATURES,
+  GIVING_BACK_DROP,
+  MATH_CODE,
   MIN_HONEST_LEAF,
   OVERFIT_DROP,
   ROOT_ID,
@@ -23,6 +34,7 @@ import {
   gainOf,
   generateDataset,
   giniOf,
+  givesGroundBack,
   leavesOf,
   lookaheadGainOf,
   nodeStats,
@@ -33,16 +45,24 @@ import {
   routeSample,
   splitCountOf,
   starvedLeaves,
+  unlockedGainOf,
   type Dataset,
   type Round,
   type Sample,
   type Tree,
 } from "./ml";
 import {
+  SLUG,
+  createCodeApi,
   isGivingGroundBack,
   samplesAt,
   useArchitectStore,
+  validationMetricState,
 } from "./store";
+import { whyCardFor } from "./why-cards";
+import { STARTER_CODE } from "./CodeLane";
+import { SplitGate } from "./SplitGate";
+import { TreeOutline } from "./TreeCanvas";
 
 const DATA_SEED = 4417;
 
@@ -875,10 +895,26 @@ describe("the store's build flow", () => {
   });
 
   it("names Overfit depth through the real actions, not just the pure function", () => {
+    // The peak is tracked live while building, so there is no need to sign the
+    // good tree off first — and signing it off would close the plot (see the
+    // re-entrancy tests below), which is not what this is about.
     store.getState().splitAt(ROOT_ID, { feature: 0, threshold: 0.45 });
     store.getState().splitAt(`${ROOT_ID}L`, { feature: 1, threshold: 0.4 });
-    store.getState().signOff();
-    expect(store.getState().failure).toBeNull();
+    // The good tree IS the peak, and judging it now would be a win — the
+    // contrast the deep tree below is judged against.
+    const good = store.getState();
+    expect(good.peakValidation).toBe(good.validationAccuracy);
+    expect(isGivingGroundBack(good)).toBe(false);
+    expect(
+      evaluateTree({
+        round: roundAt(good.roundIndex),
+        tree: good.tree,
+        dataset: good.dataset,
+        peakValidation: good.peakValidation,
+        peakDepth: good.peakDepth,
+        peakTrainAccuracy: good.peakTrainAccuracy,
+      }).outcome,
+    ).toBe("win");
 
     for (let pass = 0; pass < 5; pass += 1) {
       for (const leaf of leavesOf(store.getState().tree)) {
@@ -900,5 +936,736 @@ describe("the store's build flow", () => {
   it("selects only nodes that exist", () => {
     store.getState().selectNode("nonsense");
     expect(store.getState().selectedNodeId).toBe(ROOT_ID);
+  });
+});
+
+describe("what lookahead may and may not be credited with", () => {
+  const terrace = datasetFor(roundAt(1));
+  const ridge = datasetFor(roundAt(3));
+
+  const gateCard = (round: Round, bucket: Sample[], split: { feature: number; threshold: number }) =>
+    whyCardFor({
+      kind: "gate-built",
+      round,
+      nodeId: ROOT_ID,
+      split,
+      bucket,
+      trainAccuracy: 0.8,
+      validationAccuracy: 0.8,
+      previousValidation: 0.8,
+      peakValidation: 0.8,
+      peakDepth: 1,
+      peakTrainAccuracy: 0.8,
+      starved: 0,
+      depth: 1,
+    });
+
+  it("measures what a gate unlocked against what the node already offered", () => {
+    // The right ridge gate creates structure no single gate could see…
+    expect(unlockedGainOf(ridge.train, { feature: 0, threshold: 0.5 })).toBeGreaterThan(0.3);
+    // …while the terrace root's soil-pH sliver has a big lookahead only because
+    // it left the node's own structure intact below it.
+    const sliver = candidateSplits(terrace.train)[2]!;
+    expect(FEATURES[sliver.feature]!.irrelevant).toBe(true);
+    expect(lookaheadGainOf(terrace.train, sliver)).toBeGreaterThan(0.1);
+    expect(unlockedGainOf(terrace.train, sliver)).toBeLessThan(0.01);
+  });
+
+  it("does not praise an irrelevant sliver as the right gate", () => {
+    // Plot 1, first decision, one click on soil pH's Build button: the card
+    // used to read "Almost no gain, and exactly the right gate".
+    const sliver = candidateSplits(terrace.train)[2]!;
+    const card = gateCard(roundAt(1), terrace.train, sliver);
+    expect(card.tone).not.toBe("good");
+    expect(card.title).not.toMatch(/right gate|a lot underneath/i);
+  });
+
+  it("still praises the right ridge gate, and says what CART actually does", () => {
+    const card = gateCard(roundAt(3), ridge.train, { feature: 0, threshold: 0.5 });
+    expect(card.tone).toBe("good");
+    expect(card.title).toBe("Almost no gain now, a lot underneath");
+    expect(card.body).toMatch(/Real CART only scores the gate it is about to build/);
+    expect(card.body).not.toMatch(/looks one gate ahead/);
+  });
+
+  it("calls a sliver that passes the problem down a weak gate, in numbers", () => {
+    // Ridge root, slope at the table's own threshold (< 0.04): no gain, and a
+    // lookahead no bigger than what the node already had.
+    const sliver = candidateSplits(ridge.train)[0]!;
+    const card = gateCard(roundAt(3), ridge.train, sliver);
+    expect(card.title).toMatch(/bought almost nothing/);
+    expect(card.body).toMatch(/a single gate here could already buy/);
+    expect(card.body).not.toMatch(/lookahead column is/);
+  });
+
+  it("shows the right gate's lookahead live in the manual readout", () => {
+    // The table tries each reading at its best IMMEDIATE threshold, so on the
+    // ridge it never shows slope < 0.50. The slider's readout must.
+    render(
+      createElement(SplitGate, {
+        nodeId: ROOT_ID,
+        bucket: ridge.train,
+        isLeaf: true,
+        atDepthLimit: false,
+        onSplit: () => {},
+        onPrune: () => {},
+      }),
+    );
+    fireEvent.change(screen.getByRole("slider", { name: /Threshold on slope/ }), {
+      target: { value: "0.5" },
+    });
+    const expected = lookaheadGainOf(ridge.train, { feature: 0, threshold: 0.5 });
+    expect(expected).toBeGreaterThan(0.3);
+    expect(screen.getByText(expected.toFixed(3))).toBeInTheDocument();
+  });
+
+  it("builds gates with the shared 44px Button, not a hand-rolled one", () => {
+    render(
+      createElement(SplitGate, {
+        nodeId: ROOT_ID,
+        bucket: terrace.train,
+        isLeaf: true,
+        atDepthLimit: false,
+        onSplit: () => {},
+        onPrune: () => {},
+      }),
+    );
+    for (const meta of FEATURES) {
+      const button = screen.getByRole("button", {
+        name: new RegExp(`Build a gate on ${meta.name}`),
+      });
+      expect(button.className).toMatch(/\bmin-h-11\b/);
+    }
+  });
+
+  it("reveals a split search that sorts numbers as numbers", () => {
+    // Bare .sort() compares as strings: [10, 9, 2] becomes [10, 2, 9].
+    expect(MATH_CODE).not.toMatch(/\.sort\(\)/);
+    expect(MATH_CODE).toMatch(/\.sort\(\(a, b\) => a - b\)/);
+  });
+});
+
+describe("the tree in words", () => {
+  it("states every gate, branch and leaf verdict for assistive tech", () => {
+    const dataset = datasetFor(roundAt(1));
+    const tree = handBuiltBox();
+    const stats = nodeStats(tree, dataset.train);
+    render(createElement(TreeOutline, { tree, stats }));
+
+    const list = screen.getByRole("list", { name: "The tree, gate by gate" });
+    const text = list.textContent ?? "";
+    expect(text).toContain(`gate n0, slope < 0.45, ${stats[ROOT_ID]!.counts.total} plots`);
+    expect(text).toContain("yes: gate n0L, bedrock < 0.40");
+    expect(text).toMatch(/no: leaf n0R, \d+ plots, impurity 0\.\d\d, says unsafe/);
+    // One list item per node.
+    expect(within(list).getAllByRole("listitem")).toHaveLength(Object.keys(tree).length);
+  });
+});
+
+describe("growing greedily from the code lane", () => {
+  const store = useArchitectStore;
+
+  beforeEach(() => {
+    store.getState().restart();
+  });
+
+  it("builds exactly the tree the breadth-first walk would, in one update", () => {
+    const walked = (() => {
+      let tree = emptyTree();
+      const dataset = datasetFor(roundAt(1));
+      for (let depth = 0; depth < 4; depth += 1) {
+        for (const leaf of leavesOf(tree)) {
+          if (leaf.depth !== depth) continue;
+          const bucket = dataset.train.filter(
+            (sample) => routeSample(tree, sample) === leaf.id,
+          );
+          const candidate = bestSplit(bucket);
+          if (candidate === null || candidate.gain <= 0) continue;
+          tree = applySplit(tree, leaf.id, candidate);
+        }
+      }
+      return tree;
+    })();
+
+    let updates = 0;
+    const unsubscribe = store.subscribe(() => {
+      updates += 1;
+    });
+    store.getState().growGreedy(4);
+    unsubscribe();
+
+    expect(updates).toBe(1);
+    expect(Object.keys(store.getState().tree).sort()).toEqual(Object.keys(walked).sort());
+    for (const [id, node] of Object.entries(walked)) {
+      expect(store.getState().tree[id]!.split).toEqual(
+        node.split === null ? null : { feature: node.split.feature, threshold: node.split.threshold },
+      );
+    }
+  });
+
+  it("does not report overfitting after growing straight to greedy's peak", () => {
+    // The starter snippet grows to the validation peak (terrace: depth 3,
+    // 92.7%). Gate by gate, a half-built level scored 93.8% on the way, so the
+    // ghost appeared the moment the snippet said "validation peaks here".
+    store.getState().growGreedy(3);
+    const state = store.getState();
+    expect(state.depth).toBe(3);
+    expect(state.peakDepth).toBe(3);
+    expect(state.peakValidation).toBeCloseTo(state.validationAccuracy, 12);
+    expect(isGivingGroundBack(state)).toBe(false);
+    expect(state.whyCard?.title).toBe("Greedy CART, grown to depth 3");
+    expect(state.signOff().outcome).toBe("win");
+  });
+
+  it("still remembers the complete levels it grew through on the way down", () => {
+    // Growing to depth 6 passes through the depth-3 tree, so "you had 92.7% at
+    // depth 3" is true of this run too — and signing it off is overfitting.
+    store.getState().growGreedy(6);
+    const state = store.getState();
+    expect(state.peakDepth).toBe(3);
+    expect(state.peakValidation).toBeGreaterThan(state.validationAccuracy + OVERFIT_DROP);
+    expect(isGivingGroundBack(state)).toBe(true);
+    expect(state.whyCard?.conceptHref).toBe("/concepts/overfitting");
+    expect(state.signOff().outcome).toBe("overfit-depth");
+    expect(store.getState().failure?.name).toBe("Overfit depth");
+  });
+
+  const runStarter = async () => {
+    const logs: string[] = [];
+    await createJsExecutor<ReturnType<typeof createCodeApi>>()(STARTER_CODE, {
+      api: createCodeApi(),
+      log: (...args: unknown[]) => logs.push(args.map(String).join(" ")),
+      checkBudget: () => {},
+    });
+    return logs;
+  };
+
+  it("runs the starter snippet to a clean win, and can run it twice", async () => {
+    const first = await runStarter();
+    expect(first.some((line) => /verdict: win/.test(line))).toBe(true);
+    expect(isGivingGroundBack(store.getState())).toBe(false);
+    expect(store.getState().phase).toBe("cleared");
+
+    await runStarter();
+    expect(store.getState().clearedScores).toHaveLength(1);
+    expect(store.getState().phase).toBe("cleared");
+    expect(store.getState().codeLaneWin).toBe(true);
+  });
+
+  it("never builds past the plot's depth limit from the starter", async () => {
+    // It used to sweep depthCurve(9) on every plot; the ridge allows 8.
+    store.getState().growGreedy(2);
+    store.getState().signOff();
+    store.getState().nextRound();
+    store.getState().growGreedy(4);
+    store.getState().signOff();
+    store.getState().nextRound();
+    expect(store.getState().roundIndex).toBe(3);
+
+    await runStarter();
+    expect(store.getState().depth).toBeLessThanOrEqual(roundAt(3).maxDepth);
+    expect(store.getState().failure?.detail ?? "").not.toMatch(/over the \d+ allowed/);
+  });
+
+  const runScript = async (code: string) => {
+    const logs: string[] = [];
+    await createJsExecutor<ReturnType<typeof createCodeApi>>()(code, {
+      api: createCodeApi(),
+      log: (...args: unknown[]) => logs.push(args.map(String).join(" ")),
+      checkBudget: () => {},
+    });
+    return logs;
+  };
+
+  it("only says validation turns down past the peak when the sweep saw it", async () => {
+    // The sweep stops at each plot's depth limit. On the ridge greedy is still
+    // climbing there (depth 9 scores higher than 8), so "deeper than that,
+    // validation does not" was a claim nothing had measured.
+    for (const round of ROUNDS) {
+      expect(store.getState().roundIndex).toBe(round.index);
+      const logs = await runStarter();
+      const curve = depthCurve(store.getState().dataset, round.maxDepth);
+      const peak = curve.reduce((best, point) =>
+        point.validationAccuracy > best.validationAccuracy ? point : best,
+      );
+      const said = (pattern: RegExp) => logs.some((line) => pattern.test(line));
+
+      if (peak.depth < round.maxDepth) {
+        expect(said(/deeper than that, training keeps rising and validation does not/)).toBe(true);
+        // …and it is true of every deeper row the table printed.
+        for (const point of curve.filter((entry) => entry.depth > peak.depth)) {
+          expect(point.trainAccuracy, `depth ${point.depth}`).toBeGreaterThan(peak.trainAccuracy);
+          expect(point.validationAccuracy, `depth ${point.depth}`).toBeLessThanOrEqual(
+            peak.validationAccuracy,
+          );
+        }
+      } else {
+        expect(said(/deeper than that/), round.name).toBe(false);
+        expect(said(/that is the depth limit/), round.name).toBe(true);
+      }
+      expect(said(/no depth up to the limit reaches/), round.name).toBe(
+        peak.validationAccuracy < round.target,
+      );
+
+      if (round.index < ROUNDS.length) {
+        // Walk on: the starter wins the first two plots itself.
+        expect(store.getState().phase).toBe("cleared");
+        store.getState().nextRound();
+      }
+    }
+    // The ridge is the plot the limit line is for.
+    expect(store.getState().roundIndex).toBe(3);
+  });
+
+  it("the experiment the starter's closing comment suggests names the failure", async () => {
+    // "start it over first - api.retryRound() - then api.growGreedy(maxDepth)
+    // and sign that off … on the first two plots the verdict changes". Without
+    // the retry, the signed-off plot stays signed off and nothing is named.
+    expect(STARTER_CODE).toContain("api.retryRound()");
+    expect(STARTER_CODE).toContain("api.growGreedy(api.round().maxDepth)");
+    for (const index of [1, 2]) {
+      const starter = await runStarter();
+      expect(starter.some((line) => /verdict: win/.test(line)), `plot ${index}`).toBe(true);
+
+      const logs = await runScript(
+        "api.retryRound();\napi.growGreedy(api.round().maxDepth);\nlog('verdict:', api.signOff().outcome);",
+      );
+      expect(logs.some((line) => /verdict: win/.test(line)), `plot ${index}`).toBe(false);
+      expect(store.getState().failure?.name, `plot ${index}`).toBe("Overfit depth");
+      expect(validationMetricState(store.getState())).toBe("bad");
+
+      // Back to the peak to move on.
+      store.getState().retryRound();
+      await runStarter();
+      store.getState().nextRound();
+    }
+  });
+});
+
+describe("the store cannot double-count, un-sign, or wipe a plot", () => {
+  const store = useArchitectStore;
+
+  beforeEach(() => {
+    useProgression.setState({
+      ...EMPTY_PROGRESSION,
+      hydrated: true,
+      syncError: null,
+      lastGain: null,
+    });
+    useProgression.getState().setAdapter(createMemoryAdapter());
+    store.getState().restart();
+    store.getState().setLane("visual");
+  });
+
+  /** Sign off every plot with a tree that wins it. */
+  const winEveryPlot = (source: "visual" | "code") => {
+    store.getState().growGreedy(2);
+    store.getState().signOff(source);
+    store.getState().nextRound();
+    store.getState().growGreedy(4);
+    store.getState().signOff(source);
+    store.getState().nextRound();
+    store.getState().splitAt(ROOT_ID, { feature: 0, threshold: 0.5 });
+    store.getState().splitAt(`${ROOT_ID}L`, { feature: 1, threshold: 0.5 });
+    store.getState().splitAt(`${ROOT_ID}R`, { feature: 1, threshold: 0.5 });
+    return store.getState().signOff(source);
+  };
+
+  it("banks a signed-off plot once, however many times it is signed off", () => {
+    store.getState().growGreedy(2);
+    expect(store.getState().signOff().outcome).toBe("win");
+    store.getState().signOff();
+    store.getState().signOff("code");
+    expect(store.getState().clearedScores).toHaveLength(1);
+    expect(store.getState().attempts).toBe(1);
+    expect(store.getState().phase).toBe("cleared");
+  });
+
+  it("keeps a signed-off plot signed off when a worse tree is judged after it", () => {
+    store.getState().growGreedy(3);
+    const won = store.getState().signOff();
+    store.getState().growGreedy(6);
+    const judged = store.getState().signOff();
+
+    // An honest verdict on the tree the caller asked about…
+    expect(judged.outcome).toBe("overfit-depth");
+    // …without un-signing the plot or re-scoring it.
+    expect(store.getState().phase).toBe("cleared");
+    expect(store.getState().clearedScores).toEqual([won.score]);
+    expect(store.getState().failure).toBeNull();
+  });
+
+  it("records a finished survey with progression exactly once", () => {
+    expect(winEveryPlot("visual").outcome).toBe("win");
+    expect(store.getState().phase).toBe("complete");
+    expect(useProgression.getState().games[SLUG]?.playCount).toBe(1);
+    store.getState().signOff();
+    store.getState().signOff("code");
+    expect(useProgression.getState().games[SLUG]?.playCount).toBe(1);
+  });
+
+  it("retries the current plot and keeps the ones already signed off", () => {
+    store.getState().growGreedy(2);
+    store.getState().signOff();
+    store.getState().nextRound();
+    store.getState().signOff();
+    expect(store.getState().failure?.name).toBe("Underfit stump");
+
+    store.getState().retryRound();
+    expect(store.getState().roundIndex).toBe(2);
+    expect(store.getState().clearedScores).toHaveLength(1);
+    expect(store.getState().failure).toBeNull();
+    expect(store.getState().splits).toBe(0);
+    expect(store.getState().peakValidation).toBe(0);
+    expect(store.getState().phase).toBe("building");
+  });
+
+  it("counts the third star from the lane that signed off, not the tab that is open", () => {
+    store.getState().setLane("code");
+    winEveryPlot("visual");
+    expect(useProgression.getState().games[SLUG]?.codeLaneCleared).toBe(false);
+  });
+
+  it("awards the code-lane clear when a plot is signed off through the api", () => {
+    const api = createCodeApi();
+    api.growGreedy(2);
+    expect(api.signOff().outcome).toBe("win");
+    store.getState().nextRound();
+    store.getState().growGreedy(4);
+    store.getState().signOff("visual");
+    store.getState().nextRound();
+    store.getState().splitAt(ROOT_ID, { feature: 0, threshold: 0.5 });
+    store.getState().splitAt(`${ROOT_ID}L`, { feature: 1, threshold: 0.5 });
+    store.getState().splitAt(`${ROOT_ID}R`, { feature: 1, threshold: 0.5 });
+    store.getState().signOff("visual");
+    expect(store.getState().phase).toBe("complete");
+    expect(useProgression.getState().games[SLUG]?.codeLaneCleared).toBe(true);
+  });
+
+  it("rejects bad script input with a named error instead of corrupting state", () => {
+    const api = createCodeApi();
+    const before = store.getState().tree;
+    expect(() => api.split("nowhere", 0, 0.5)).toThrow(/no node "nowhere"/);
+    expect(() => api.split(ROOT_ID, 7, 0.5)).toThrow(/feature must be an integer/);
+    expect(() => api.split(ROOT_ID, 0, Number.NaN)).toThrow(/finite number/);
+    expect(() => api.gainOf(ROOT_ID, 1.5, 0.5)).toThrow(/feature/);
+    expect(() => api.gainTable("n9")).toThrow(/no node/);
+    expect(() => api.prune(ROOT_ID)).toThrow(/is a leaf/);
+    // Depths are bounded, so a script cannot hang the tab building 1e9 trees.
+    expect(() => api.growGreedy(1e9)).toThrow(/depth must be a whole number/);
+    expect(() => api.depthCurve(-1)).toThrow(/depth/);
+    expect(() => api.tryGreedy(2.5)).toThrow(/depth/);
+    expect(() => api.starvedAtDepth(DEPTH_ARG_LIMIT + 1)).toThrow(/depth/);
+    expect(store.getState().tree).toBe(before);
+
+    api.split(ROOT_ID, 0, 0.45);
+    expect(() => api.split(ROOT_ID, 1, 0.4)).toThrow(/already has a gate/);
+    expect(() => api.greedyAt(ROOT_ID)).toThrow(/already has a gate/);
+  });
+});
+
+describe("overfitting is only named on a tree that overfits", () => {
+  const store = useArchitectStore;
+  const OVERFIT = "/concepts/overfitting";
+
+  /** Walk to a plot by winning the ones before it, as a player must. */
+  const goToPlot = (index: number) => {
+    store.getState().restart();
+    if (index >= 2) {
+      store.getState().growGreedy(2);
+      store.getState().signOff();
+      store.getState().nextRound();
+    }
+    if (index >= 3) {
+      store.getState().growGreedy(4);
+      store.getState().signOff();
+      store.getState().nextRound();
+    }
+    expect(store.getState().roundIndex).toBe(index);
+  };
+
+  const judge = () => {
+    const state = store.getState();
+    return evaluateTree({
+      round: roundAt(state.roundIndex),
+      tree: state.tree,
+      dataset: state.dataset,
+      peakValidation: state.peakValidation,
+      peakDepth: state.peakDepth,
+      peakTrainAccuracy: state.peakTrainAccuracy,
+    });
+  };
+
+  /** Copy that says the tree is NOT memorising anything. */
+  const ALL_CLEAR =
+    /nothing is being memorised|nothing here is about generalisation|generalising what it|holds outside the sample it learned/i;
+
+  beforeEach(() => {
+    store.getState().restart();
+  });
+
+  it("does not call a tree grown back to depth 1 overfit", () => {
+    // The review's repro: depth 1 after depth 3 is 77.8% validation, 15 points
+    // under the peak — with training 17 points under it too.
+    store.getState().growGreedy(3);
+    const peak = store.getState();
+    store.getState().growGreedy(1);
+    const state = store.getState();
+
+    expect(state.trainAccuracy).toBeLessThan(peak.trainAccuracy);
+    expect(isGivingGroundBack(state)).toBe(false);
+    expect(state.whyCard?.tone).not.toBe("warn");
+    expect(state.whyCard?.conceptHref).toBeUndefined();
+    expect(state.whyCard?.body).not.toMatch(/fitting these/);
+    // It says what did happen, in the numbers on screen.
+    expect(state.whyCard?.body).toContain(
+      `short of the ${(peak.validationAccuracy * 100).toFixed(1)}% you reached at depth 3`,
+    );
+    expect(state.whyCard?.body).toContain(
+      `training is short of that tree's ${(peak.trainAccuracy * 100).toFixed(1)}%`,
+    );
+    expect(validationMetricState(state)).not.toBe("warn");
+    // …and the sign-off one click later agrees: too little tree.
+    expect(store.getState().signOff().outcome).toBe("underfit-stump");
+  });
+
+  it("does not call a different root gate overfit after pruning the first", () => {
+    // Take the greedy root, prune it, try another reading: the basic visual-lane
+    // loop. Training is under the peak's, so each gate is judged on what it
+    // bought — and on soil pH that is nothing.
+    store.getState().takeGreedySplit(ROOT_ID);
+    store.getState().prune(ROOT_ID);
+    for (const feature of [1, 2, 3]) {
+      store.getState().splitAt(ROOT_ID, { feature, threshold: 0.5 });
+      const state = store.getState();
+      expect(state.trainAccuracy).toBeLessThan(state.peakTrainAccuracy);
+      expect(state.whyCard?.title, `feature ${feature}`).not.toMatch(/validation down/);
+      expect(state.whyCard?.conceptHref, `feature ${feature}`).toBeUndefined();
+      store.getState().prune(ROOT_ID);
+    }
+    store.getState().splitAt(ROOT_ID, { feature: 2, threshold: 0.5 });
+    expect(store.getState().whyCard?.title).toMatch(/bought almost nothing/);
+  });
+
+  it("does not call a gate that RAISED validation overfit after starting over", () => {
+    // Greedy gates three levels deep, "Start the tree over", greedy root again:
+    // validation goes from 68.0% to 77.8%. The peak is kept, and the card used to
+    // read "Training up, validation down".
+    for (let depth = 0; depth < 3; depth += 1) {
+      for (const leaf of leavesOf(store.getState().tree)) {
+        if (leaf.depth === depth) store.getState().takeGreedySplit(leaf.id);
+      }
+    }
+    store.getState().clearTree();
+    const before = store.getState().validationAccuracy;
+    store.getState().takeGreedySplit(ROOT_ID);
+    const state = store.getState();
+
+    expect(state.validationAccuracy).toBeGreaterThan(before);
+    expect(state.peakValidation - state.validationAccuracy).toBeGreaterThan(0.1);
+    expect(isGivingGroundBack(state)).toBe(false);
+    expect(state.whyCard?.tone).not.toBe("warn");
+    expect(state.whyCard?.conceptHref).toBeUndefined();
+    expect(state.whyCard?.body).toMatch(/— up \d+\.\d%/);
+  });
+
+  it("titles the card from the numbers: training up, or merely no higher", () => {
+    const round = roundAt(1);
+    const bucket = datasetFor(round).train;
+    const card = (trainAccuracy: number) =>
+      whyCardFor({
+        kind: "gate-built",
+        round,
+        nodeId: ROOT_ID,
+        split: { feature: 0, threshold: 0.45 },
+        bucket,
+        trainAccuracy,
+        validationAccuracy: 0.9,
+        previousValidation: 0.93,
+        peakValidation: 0.94,
+        peakDepth: 2,
+        peakTrainAccuracy: 0.943,
+        starved: 0,
+        depth: 3,
+      });
+    expect(card(0.96).title).toBe("Training up, validation down");
+    expect(card(0.943).title).toBe("Training no higher, validation down");
+    expect(card(0.943).conceptHref).toBe(OVERFIT);
+    // Training below the peak's: not overfitting, whatever validation did.
+    expect(card(0.93).title).not.toMatch(/validation down/);
+    expect(card(0.93).conceptHref).toBeUndefined();
+  });
+
+  it("ghost, WhyCard, live metric and sign-off agree on every plot, for every greedy depth pair", () => {
+    // Grow greedy to depth a, then to depth b, on all three plots and every
+    // pair of depths each allows. One predicate decides all four.
+    const seen = { ghost: 0, clear: 0, smaller: 0 };
+    for (const round of ROUNDS) {
+      goToPlot(round.index);
+      for (let a = 0; a <= round.maxDepth; a += 1) {
+        for (let b = 0; b <= round.maxDepth; b += 1) {
+          const label = `plot ${round.index}, depth ${a} then ${b}`;
+          store.getState().retryRound();
+          store.getState().growGreedy(a);
+          store.getState().growGreedy(b);
+          const state = store.getState();
+          const ghost = isGivingGroundBack(state);
+          const card = state.whyCard!;
+
+          expect(ghost, label).toBe(givesGroundBack(state));
+          expect(card.conceptHref === OVERFIT, label).toBe(ghost);
+          expect(card.tone === "warn", label).toBe(ghost);
+          expect(validationMetricState(state) === "warn", label).toBe(ghost);
+
+          if (ghost) {
+            seen.ghost += 1;
+            expect(state.trainAccuracy, label).toBeGreaterThanOrEqual(
+              state.peakTrainAccuracy,
+            );
+            expect(
+              state.peakValidation - state.validationAccuracy,
+              label,
+            ).toBeGreaterThanOrEqual(GIVING_BACK_DROP);
+          } else {
+            seen.clear += 1;
+          }
+          // A greedy tree shallower than the peak is a prefix of it, so it has
+          // less training accuracy: never overfitting.
+          if (state.depth < state.peakDepth) {
+            expect(ghost, label).toBe(false);
+            if (state.peakValidation - state.validationAccuracy >= GIVING_BACK_DROP) {
+              seen.smaller += 1;
+              expect(card.body, label).toMatch(/fits less rather than memorising more/);
+            }
+          }
+
+          // One click later, the verdict must not say the opposite.
+          const evaluation = judge();
+          expect(evaluation.givingGroundBack, label).toBe(ghost);
+          const verdict = `${evaluation.failure?.detail ?? ""} ${
+            whyCardFor({
+              kind: "signed-off",
+              round,
+              evaluation,
+              complete: false,
+              attempts: 1,
+            }).body
+          }`;
+          if (ghost) expect(verdict, label).not.toMatch(ALL_CLEAR);
+          if (evaluation.outcome === "overfit-depth") expect(ghost, label).toBe(true);
+        }
+      }
+    }
+    // Not vacuous: every branch was reached.
+    expect(seen.ghost).toBeGreaterThan(20);
+    expect(seen.clear).toBeGreaterThan(20);
+    expect(seen.smaller).toBeGreaterThan(20);
+  });
+
+  it("keeps the gate-built card and the ghost in step, gate by gate, on every plot", () => {
+    // The visual lane's path: the greedy gate at every leaf, level by level, to
+    // the plot's limit — then pruned back one level at a time and regrown.
+    let gates = 0;
+    let warnings = 0;
+    for (const round of ROUNDS) {
+      goToPlot(round.index);
+      const check = (label: string) => {
+        const state = store.getState();
+        const ghost = isGivingGroundBack(state);
+        expect(state.whyCard?.conceptHref === OVERFIT, label).toBe(ghost);
+        expect(validationMetricState(state) === "warn", label).toBe(ghost);
+        gates += 1;
+        if (ghost) warnings += 1;
+      };
+      const grow = (to: number) => {
+        for (let depth = 0; depth < to; depth += 1) {
+          for (const leaf of leavesOf(store.getState().tree)) {
+            if (leaf.depth !== depth) continue;
+            const before = store.getState().tree;
+            store.getState().takeGreedySplit(leaf.id);
+            if (store.getState().tree !== before) {
+              check(`plot ${round.index}, gate at ${leaf.id}`);
+            }
+          }
+        }
+      };
+      grow(round.maxDepth);
+      for (let depth = round.maxDepth - 1; depth >= 1; depth -= 1) {
+        for (const node of Object.values(store.getState().tree)) {
+          if (node.depth === depth && store.getState().tree[node.id]?.split) {
+            store.getState().prune(node.id);
+          }
+        }
+        // The prune card is never the overfitting warning.
+        expect(store.getState().whyCard?.tone).toBe("info");
+        grow(depth + 1);
+      }
+    }
+    expect(gates).toBeGreaterThan(100);
+    expect(warnings).toBeGreaterThan(0);
+  });
+
+  it("explains the ghost rather than denying it when the ridge's gates fit noise", () => {
+    // Greedy's first gates on the ridge raise training and lower validation, so
+    // the ghost is right — and the tree is still far too simple, so the sign-off
+    // is Underfit stump. It must say both.
+    goToPlot(3);
+    store.getState().growGreedy(0);
+    store.getState().growGreedy(2);
+    expect(isGivingGroundBack(store.getState())).toBe(true);
+    const evaluation = store.getState().signOff();
+    expect(evaluation.outcome).toBe("underfit-stump");
+    expect(evaluation.failure?.detail).toMatch(
+      /fitting these 200 plots rather than the ground/,
+    );
+    expect(evaluation.failure?.detail).not.toMatch(/nothing is being memorised/);
+    expect(evaluation.failure?.detail).toMatch(/add gates/i);
+  });
+
+  it("does not call a tree past its peak 'narrow' when it scrapes a win", () => {
+    // Terrace, depth 3 then 4: 2.2 points under the peak — under the named
+    // failure's 2.5, and over the target. It wins, with the ghost up.
+    store.getState().growGreedy(3);
+    store.getState().growGreedy(4);
+    expect(isGivingGroundBack(store.getState())).toBe(true);
+    const evaluation = store.getState().signOff();
+    expect(evaluation.outcome).toBe("win");
+    const body = store.getState().whyCard?.body ?? "";
+    expect(body).toContain(
+      `below the ${(evaluation.peakValidation * 100).toFixed(1)}% you had at depth 3`,
+    );
+    expect(body).not.toMatch(ALL_CLEAR);
+  });
+});
+
+describe("the live metric's colour", () => {
+  const store = useArchitectStore;
+
+  beforeEach(() => {
+    store.getState().restart();
+  });
+
+  it("is neutral below the target, good at it, and bad on a named failure", () => {
+    expect(validationMetricState(store.getState())).toBeUndefined();
+    store.getState().growGreedy(2);
+    expect(validationMetricState(store.getState())).toBe("good");
+    store.getState().restart();
+    store.getState().signOff();
+    expect(store.getState().failure?.name).toBe("Underfit stump");
+    expect(validationMetricState(store.getState())).toBe("bad");
+  });
+
+  it("warns on a tree grown past its peak even after the plot is signed off", () => {
+    // The starter clears the plot, and the experiment its comment suggests
+    // grows past the peak afterwards: the metric used to stay green.
+    store.getState().growGreedy(3);
+    store.getState().signOff();
+    expect(store.getState().phase).toBe("cleared");
+    expect(validationMetricState(store.getState())).toBe("good");
+
+    store.getState().growGreedy(roundAt(1).maxDepth);
+    expect(store.getState().phase).toBe("cleared");
+    expect(isGivingGroundBack(store.getState())).toBe(true);
+    expect(validationMetricState(store.getState())).toBe("warn");
   });
 });

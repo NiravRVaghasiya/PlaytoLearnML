@@ -1,20 +1,32 @@
 import type { WhyCardContent } from "@/components";
 import {
   FEATURES,
+  GIVING_BACK_DROP,
   MIN_HONEST_LEAF,
+  NARROW_GAP,
   ROUNDS,
   bestSplit,
   countsOf,
   describeSplit,
   gainOf,
   giniOf,
+  givesGroundBack,
   lookaheadGainOf,
   partition,
+  unlockedGainOf,
   type Evaluation,
   type Round,
   type Sample,
   type Split,
 } from "./ml";
+
+/**
+ * Concept Library links. Only to sections that genuinely cover the card — the
+ * label must equal a section heading exactly (concepts.test.ts enforces it), and
+ * this game is listed on both pages, so each link funnels back here.
+ */
+const OVERFIT_HREF = "/concepts/overfitting";
+const BOUNDARY_HREF = "/concepts/decision-boundaries";
 
 /**
  * "Why did that happen?" copy for Decision Tree Architect.
@@ -42,8 +54,23 @@ export type ArchitectEvent =
       previousValidation: number;
       peakValidation: number;
       peakDepth: number;
+      /** Training accuracy of the peak tree: overfitting needs it matched. */
+      peakTrainAccuracy: number;
       starved: number;
       depth: number;
+    }
+  | {
+      /** A whole greedy tree applied in one step (the code lane's growGreedy). */
+      kind: "greedy-grown";
+      round: Round;
+      depth: number;
+      splits: number;
+      trainAccuracy: number;
+      validationAccuracy: number;
+      peakValidation: number;
+      peakDepth: number;
+      peakTrainAccuracy: number;
+      starved: number;
     }
   | {
       kind: "pruned";
@@ -92,6 +119,7 @@ export function whyCardFor(event: ArchitectEvent): WhyCardContent {
         previousValidation,
         peakValidation,
         peakDepth,
+        peakTrainAccuracy,
         starved,
         depth,
       } = event;
@@ -100,13 +128,34 @@ export function whyCardFor(event: ArchitectEvent): WhyCardContent {
       const { left, right } = partition(bucket, split);
       const parentGini = giniOf(countsOf(bucket));
       const lookahead = lookaheadGainOf(bucket, split);
+      // What one gate could already buy here, and how much lookahead this gate
+      // adds on top of it. Raw lookahead cannot tell a gate that CREATES
+      // structure from a sliver that passes the node's structure straight down
+      // (terrace root, soil pH < 0.97: lookahead 0.150 against 0.153 already
+      // available). Only the difference can.
+      const parentBest = Math.max(0, bestSplit(bucket)?.gain ?? 0);
+      const unlocked = unlockedGainOf(bucket, split, parentBest);
+      const irrelevant = FEATURES[split.feature]?.irrelevant ?? false;
       const validationDelta = validationAccuracy - previousValidation;
 
-      // Gave ground back. The most important card in the game.
-      if (peakValidation > 0 && peakValidation - validationAccuracy >= 0.01) {
+      // Gave ground back. The most important card in the game — and only
+      // when training is at least where it was at the peak, the ghost's own
+      // test. A smaller or worse tree is below the peak on both, and calling
+      // that overfitting sent players to prune a tree that needed gates.
+      if (
+        givesGroundBack({
+          peakValidation,
+          validationAccuracy,
+          trainAccuracy,
+          peakTrainAccuracy,
+        })
+      ) {
         return {
           key: `giving-back-${depth}-${validationAccuracy.toFixed(3)}`,
-          title: "Training up, validation down",
+          title:
+            trainAccuracy > peakTrainAccuracy
+              ? "Training up, validation down"
+              : "Training no higher, validation down",
           body: `${describeSplit(split)} took training accuracy to ${points(
             trainAccuracy,
           )} and validation to ${points(
@@ -121,11 +170,13 @@ export function whyCardFor(event: ArchitectEvent): WhyCardContent {
                 )} of verdicts that are wrong.`
           }`,
           tone: "warn",
+          conceptHref: OVERFIT_HREF,
+          conceptLabel: "What is overfitting?",
         };
       }
 
-      // A gate that barely moved anything.
-      if (gain < 0.01 && lookahead < 0.05) {
+      // A gate that barely moved anything, and uncovered nothing either.
+      if (gain < 0.01 && unlocked < 0.05) {
         return {
           key: `weak-gate-${describeSplit(split)}`,
           title: `${describeSplit(split)} bought almost nothing`,
@@ -138,22 +189,27 @@ export function whyCardFor(event: ArchitectEvent): WhyCardContent {
           )}, and the two sides came out ${left.length} and ${
             right.length
           }. ${
-            FEATURES[split.feature]?.irrelevant
+            irrelevant
               ? `${FEATURES[split.feature]!.name} is a reading that has nothing to do with whether the ground holds — no threshold on it will ever help, though on a small sample one will always look slightly better than the rest.`
-              : `The lookahead column is ${lookahead.toFixed(
+              : `The best gate underneath it is worth ${lookahead.toFixed(
                   3,
-                )} too, so there is no hidden structure waiting below this one either.`
+                )}, and a single gate here could already buy ${parentBest.toFixed(
+                  3,
+                )}, so it has not uncovered any hidden structure either — only passed the same problem down a level.`
           } Prune it and try another feature.`,
           tone: "warn",
         };
       }
 
-      // A gate with little immediate gain but a lot underneath — the lesson of
-      // the ridge plot.
-      if (gain < 0.02 && lookahead >= 0.15) {
+      // A gate with little immediate gain but real structure underneath — the
+      // lesson of the ridge plot. Judged on what it UNLOCKED over the node's own
+      // best gate, and never for a reading that carries no signal: an
+      // irrelevant sliver inherits a big lookahead from the node it barely
+      // touched, and used to be praised as "exactly the right gate".
+      if (gain < 0.02 && unlocked >= 0.1 && !irrelevant) {
         return {
           key: `lookahead-gate-${describeSplit(split)}`,
-          title: "Almost no gain, and exactly the right gate",
+          title: "Almost no gain now, a lot underneath",
           body: `${describeSplit(split)} gained only ${gain.toFixed(
             4,
           )} — a greedy learner would have rejected it. But it split ${
@@ -162,7 +218,9 @@ export function whyCardFor(event: ArchitectEvent): WhyCardContent {
             right.length
           }, and the best gate available inside those two is now worth ${lookahead.toFixed(
             3,
-          )}. That is what the lookahead column was showing you. Real CART only ever looks one gate ahead, which is exactly why it cannot solve this shape and you can.`,
+          )}, against the ${parentBest.toFixed(
+            3,
+          )} the best single gate here could buy. That difference is what lookahead measures and gain cannot see. Real CART only scores the gate it is about to build, which is exactly why it cannot solve this shape and you can.`,
           tone: "good",
         };
       }
@@ -189,6 +247,58 @@ export function whyCardFor(event: ArchitectEvent): WhyCardContent {
       };
     }
 
+    case "greedy-grown": {
+      const {
+        round,
+        depth,
+        splits,
+        trainAccuracy,
+        validationAccuracy,
+        peakValidation,
+        peakDepth,
+        peakTrainAccuracy,
+        starved,
+      } = event;
+      const givingBack = givesGroundBack(event);
+      // Below the peak on validation AND training: a tree with less shape
+      // than the peak's, not one that has memorised more.
+      const smaller =
+        !givingBack &&
+        peakValidation - validationAccuracy >= GIVING_BACK_DROP &&
+        trainAccuracy < peakTrainAccuracy;
+      return {
+        key: `greedy-${depth}-${validationAccuracy.toFixed(3)}`,
+        title: `Greedy CART, grown to depth ${depth}`,
+        body: `${splits} gate${
+          splits === 1 ? "" : "s"
+        }, each the best immediate gain at its leaf — the choice "Take the greedy gate" makes, applied to every leaf at once. Training ${points(
+          trainAccuracy,
+        )}, validation ${points(validationAccuracy)}${
+          givingBack
+            ? ` — below the ${points(
+                peakValidation,
+              )} you reached at depth ${peakDepth}. ${
+                starved > 0
+                  ? `${starved} leaf${starved === 1 ? " holds" : "s hold"} fewer than ${MIN_HONEST_LEAF} plots. `
+                  : ""
+              }The gates past that depth are fitting these ${
+                round.trainPoints
+              } surveys, not the ground under them.`
+            : smaller
+              ? ` — short of the ${points(
+                  peakValidation,
+                )} you reached at depth ${peakDepth}, but training is short of that tree's ${points(
+                  peakTrainAccuracy,
+                )} as well, so this tree fits less rather than memorising more.`
+              : "."
+        }`,
+        tone: givingBack ? "warn" : "info",
+        ...(givingBack
+          ? { conceptHref: OVERFIT_HREF, conceptLabel: "What is overfitting?" }
+          : {}),
+      };
+    }
+
     case "pruned": {
       const { validationAccuracy, previousValidation, peakValidation, depth } =
         event;
@@ -212,6 +322,9 @@ export function whyCardFor(event: ArchitectEvent): WhyCardContent {
                   : "."
               } A smaller tree that scores the same is the better piece of engineering — fewer gates means fewer places for the next survey to surprise you.`,
         tone: "info",
+        ...(recovered > 0.001
+          ? { conceptHref: OVERFIT_HREF, conceptLabel: "Why simpler generalises" }
+          : {}),
       };
     }
 
@@ -240,9 +353,18 @@ export function whyCardFor(event: ArchitectEvent): WhyCardContent {
           )}, so the gap is ${points(
             Math.max(0, evaluation.trainAccuracy - evaluation.validationAccuracy),
           )} — ${
-            evaluation.trainAccuracy - evaluation.validationAccuracy < 0.06
-              ? "narrow, which means what the tree learned holds outside the sample it learned from."
-              : "wide enough that some of this tree is about these particular surveys."
+            // The ghost can still be up on a win: a drop smaller than the
+            // named failure's. Then the gap is not the story; the peak is.
+            evaluation.givingGroundBack
+              ? `but validation is ${points(
+                  evaluation.peakValidation - evaluation.validationAccuracy,
+                )} below the ${points(
+                  evaluation.peakValidation,
+                )} you had at depth ${evaluation.peakDepth}, so the gates since then bought nothing that holds outside this sample. The smaller tree was the better one.`
+              : evaluation.trainAccuracy - evaluation.validationAccuracy <
+                  NARROW_GAP
+                ? "narrow, which means what the tree learned holds outside the sample it learned from."
+                : "wide enough that some of this tree is about these particular surveys."
           } ${
             attempts === 1
               ? "First tree you signed off."
@@ -266,14 +388,24 @@ export function whyCardFor(event: ArchitectEvent): WhyCardContent {
             evaluation.peakValidation,
           )}. The two curves separating is not a defect in the tree — it is the definition of overfitting, and a tree shows it to you one gate at a time. ${
             evaluation.starved > 0
-              ? `${evaluation.starved} leaves are down to fewer than ${MIN_HONEST_LEAF} plots each.`
+              ? `${evaluation.starved} leaf${
+                  evaluation.starved === 1 ? " is" : "s are"
+                } down to fewer than ${MIN_HONEST_LEAF} plots${
+                  evaluation.starved === 1 ? "" : " each"
+                }.`
               : ""
           } Prune back.`,
           tone: "bad",
+          conceptHref: OVERFIT_HREF,
+          conceptLabel: "Why complexity is a cost",
         };
       }
 
       if (evaluation.outcome === "underfit-stump") {
+        const underfitGap = Math.max(
+          0,
+          evaluation.trainAccuracy - evaluation.validationAccuracy,
+        );
         return {
           key: `underfit-${evaluation.splits}`,
           title: "Not enough tree",
@@ -281,10 +413,28 @@ export function whyCardFor(event: ArchitectEvent): WhyCardContent {
             evaluation.trainAccuracy,
           )} with ${evaluation.splits} gate${
             evaluation.splits === 1 ? "" : "s"
-          } — the tree cannot describe this ground even where it has been given the answers, so nothing here is about generalisation yet. The gap to validation is only ${points(
-            Math.max(0, evaluation.trainAccuracy - evaluation.validationAccuracy),
-          )}, which is the signature of a model that is too simple rather than too complex. Add gates: check the gain table on your largest leaf, and look at the lookahead column as well as the gain.`,
+          } — the tree cannot describe this ground even where it has been given the answers. ${
+            // Said only when the numbers say it: beside the ghost, "nothing is
+            // about generalisation" contradicts the screen.
+            evaluation.givingGroundBack
+              ? `Validation has also slipped below the ${points(
+                  evaluation.peakValidation,
+                )} you had at depth ${
+                  evaluation.peakDepth
+                } while training has not fallen, so the gates since then describe these surveys rather than the ground — overfitting inside a tree that is still too simple. Add gates that follow the boundary, not more like those: look at the lookahead column as well as the gain.`
+              : `${
+                  underfitGap < NARROW_GAP
+                    ? `Nothing here is about generalisation yet: the gap to validation is only ${points(
+                        underfitGap,
+                      )}, the signature of a model that is too simple rather than too complex.`
+                    : `The gap to validation is ${points(
+                        underfitGap,
+                      )}, so some of these gates describe these surveys rather than the ground — but mostly the tree has too little of the right shape.`
+                } Add gates: check the gain table on your largest leaf, and look at the lookahead column as well as the gain.`
+          }`,
           tone: "bad",
+          conceptHref: BOUNDARY_HREF,
+          conceptLabel: "Bias and capacity",
         };
       }
 
@@ -294,11 +444,19 @@ export function whyCardFor(event: ArchitectEvent): WhyCardContent {
         body: `Depth ${evaluation.depth} of ${round.maxDepth} allowed, ${
           evaluation.splits
         } gates, training ${points(evaluation.trainAccuracy)}. ${
-          evaluation.trainAccuracy - evaluation.validationAccuracy > 0.1
-            ? `The ${points(
-                evaluation.trainAccuracy - evaluation.validationAccuracy,
-              )} gap says part of this tree is specific to these ${round.trainPoints} surveys. Pruning may raise validation even though it lowers training.`
-            : `Training and validation are close, so the tree is generalising what it knows — there is just not enough of it. Look for the leaf with the most plots in it and check what a gate there would buy.`
+          evaluation.givingGroundBack
+            ? `Validation is below the ${points(
+                evaluation.peakValidation,
+              )} you had at depth ${
+                evaluation.peakDepth
+              } while training has not fallen, so the gates since then are specific to these ${round.trainPoints} surveys. Pruning back toward depth ${
+                evaluation.peakDepth
+              } may raise validation even though it lowers training.`
+            : evaluation.trainAccuracy - evaluation.validationAccuracy > 0.1
+              ? `The ${points(
+                  evaluation.trainAccuracy - evaluation.validationAccuracy,
+                )} gap says part of this tree is specific to these ${round.trainPoints} surveys. Pruning may raise validation even though it lowers training.`
+              : `Training and validation are close, so the tree is generalising what it knows — there is just not enough of it. Look for the leaf with the most plots in it and check what a gate there would buy.`
         }`,
         tone: "warn",
       };

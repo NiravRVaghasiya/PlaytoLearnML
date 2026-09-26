@@ -30,15 +30,21 @@ import {
   currentRound,
   samplesInNode,
   useArchitectStore,
+  validationMetricState,
 } from "./store";
 import { SplitGate } from "./SplitGate";
 import { VisualLane } from "./VisualLane";
 import { CodeLane } from "./CodeLane";
 
+/**
+ * The engine's rule, stated per game: ★1 finish, ★2 a best score of at least
+ * HIGH_SCORE_THRESHOLD, ★3 that plus a code-lane clear. A plot's score is its
+ * validation accuracy less up to 20% for depth used, averaged over the plots.
+ */
 const STAR_CRITERIA = [
   "Sign off all three plots",
   `Score ${Math.round(HIGH_SCORE_THRESHOLD * 100)}% or better by keeping trees shallow`,
-  "Sign off a plot from the code lane",
+  "Sign off a plot with api.signOff() from the code lane",
 ];
 
 /**
@@ -80,7 +86,9 @@ function NodePicker() {
           return (
             <label
               key={leaf.id}
-              className={`flex cursor-pointer items-center gap-2 rounded border px-2 py-1.5 text-xs ${
+              // min-h-11: DESIGN.md's 44px target. These rows ARE the leaf
+              // picker, the primary way into the tree on a phone.
+              className={`flex min-h-11 cursor-pointer items-center gap-2 rounded border px-2 py-1.5 text-xs ${
                 leaf.id === selectedNodeId
                   ? "border-primary bg-primary/10"
                   : "border-border bg-surface-2 hover:bg-surface"
@@ -218,7 +226,9 @@ function Controls() {
           <Button
             variant="primary"
             className="w-full"
-            onClick={signOff}
+            // Arrow, not `onClick={signOff}`: signOff's argument is the lane
+            // it came from, and a click would pass the event in its place.
+            onClick={() => signOff("visual")}
             icon={<ClipboardCheck className="size-4" />}
           >
             Sign off this tree
@@ -232,6 +242,17 @@ function Controls() {
           disabled={splits === 0}
         >
           Start the tree over
+        </Button>
+        {/* The shell's Retry now retries THIS plot, so the full restart it
+            used to be needs a button that says what it does — the same one
+            Confusion Matrix Chef has. */}
+        <Button
+          variant="ghost"
+          className="mt-2 w-full"
+          onClick={restart}
+          disabled={round.index === 1 && splits === 0 && attempts === 0}
+        >
+          Back to plot one
         </Button>
         {attempts > 0 ? (
           <p className="mt-1.5 text-center text-xs text-text-muted">
@@ -255,6 +276,7 @@ export default function DecisionTreeArchitect() {
   const starved = useArchitectStore((s) => s.starved);
   const peakValidation = useArchitectStore((s) => s.peakValidation);
   const peakDepth = useArchitectStore((s) => s.peakDepth);
+  const metricState = useArchitectStore(validationMetricState);
   const clearedScores = useArchitectStore((s) => s.clearedScores);
   const phase = useArchitectStore((s) => s.phase);
   const failure = useArchitectStore((s) => s.failure);
@@ -262,6 +284,7 @@ export default function DecisionTreeArchitect() {
   const lane = useArchitectStore((s) => s.lane);
   const setLane = useArchitectStore((s) => s.setLane);
   const nextRound = useArchitectStore((s) => s.nextRound);
+  const retryRound = useArchitectStore((s) => s.retryRound);
   const restart = useArchitectStore((s) => s.restart);
   const games = useProgression((s) => s.games);
 
@@ -282,6 +305,7 @@ export default function DecisionTreeArchitect() {
    * stated metric. It recomputes on every gate, and it is the number that can go
    * DOWN when the tree gets bigger — which is the whole lesson, and the reason
    * training accuracy sits beside it rather than replacing it.
+   * Its colour is `validationMetricState`, which the tests pin down.
    */
   const metric: MetricSpec = {
     label: "Validation accuracy",
@@ -289,16 +313,7 @@ export default function DecisionTreeArchitect() {
     format: "percent",
     precision: 1,
     goodDirection: "up",
-    state:
-      failure !== null
-        ? "bad"
-        : phase === "complete" || phase === "cleared"
-          ? "good"
-          : peakValidation - validationAccuracy >= 0.01
-            ? "warn"
-            : validationAccuracy >= round.target
-              ? "good"
-              : undefined,
+    state: metricState,
     caption: `needs ${Math.round(round.target * 100)}%${
       peakValidation > 0.01
         ? ` · your best ${Math.round(peakValidation * 100)}% at depth ${peakDepth}`
@@ -370,7 +385,9 @@ export default function DecisionTreeArchitect() {
         recentGain: lastGain,
         starCriteria: STAR_CRITERIA,
       }}
-      onRetry={restart}
+      // Retry means this plot again. Wiping every plot already signed off is
+      // "Back to plot one", which says so.
+      onRetry={retryRound}
       onNext={
         phase === "cleared"
           ? nextRound

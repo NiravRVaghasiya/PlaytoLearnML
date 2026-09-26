@@ -11,6 +11,7 @@ import {
   countsOf,
   gainOf,
   giniOf,
+  lookaheadGainOf,
   partition,
   type Sample,
   type Split,
@@ -36,11 +37,18 @@ export interface SplitGateProps {
  *
  * The second column is the one that is not in CART. One-step lookahead — how much
  * gain becomes available in the children if this gate is built — exists because
- * an XOR-shaped boundary gives the RIGHT gate almost no immediate gain. Measured
- * on the ridge plot: the correct first gate gains 0.001 and unlocks 0.39, while
- * a useless survey reading gains 0.018 and unlocks nothing. Greedy CART takes the
- * 0.018 and never recovers. Showing both columns turns that from a trap into the
- * lesson, and the gap between them IS the greedy learner's blind spot.
+ * an XOR-shaped boundary gives the RIGHT gate almost no immediate gain. Greedy
+ * CART takes the useless wind reading's 0.018 and never recovers.
+ *
+ * The table cannot show the right gate itself, and says so. Each row is a
+ * reading at its best IMMEDIATE threshold — exactly what CART would try — and on
+ * the ridge that puts slope at a sliver, "< 0.04", lookahead 0.017. The right
+ * gate is slope < 0.50: gain 0.001, lookahead 0.39. It is found with the
+ * threshold slider, whose readout computes lookahead live for wherever the
+ * player puts it, beside the best gain the table offers for comparison. What
+ * the table's column does show there is a hint worth following: bedrock's
+ * lookahead (0.125) stands clear of the others (about 0.02), so something real
+ * is underneath one of the two readings that looked worthless.
  */
 export function SplitGate({
   nodeId,
@@ -70,6 +78,19 @@ export function SplitGate({
   const liveGain = useMemo(
     () => (bucket.length > 1 ? gainOf(bucket, liveSplit) : 0),
     [bucket, liveSplit],
+  );
+  // Live lookahead for wherever the slider sits — the only place the right
+  // ridge gate (slope < 0.50) ever shows its 0.39. Two partitions and a split
+  // search on each child: well under a millisecond per slider step.
+  const liveLookahead = useMemo(
+    () => (bucket.length > 1 ? lookaheadGainOf(bucket, liveSplit) : 0),
+    [bucket, liveSplit],
+  );
+  // What one gate could already buy here, so lookahead has a yardstick: a gate
+  // whose lookahead only matches this has passed the problem down, not solved it.
+  const bestGain = table.reduce(
+    (best, candidate) => Math.max(best, candidate?.gain ?? 0),
+    0,
   );
   const { left, right } = useMemo(
     () => partition(bucket, liveSplit),
@@ -121,8 +142,11 @@ export function SplitGate({
         <>
           <table className="mt-3 w-full border-collapse text-left text-xs">
             <caption className="mb-1 text-left text-[11px] text-text-muted">
-              Best gate on each reading. Gain is what it buys now; lookahead is
-              what becomes available underneath it.
+              Each reading at its best immediate threshold. Gain is what it buys
+              now; lookahead is the best gate available underneath it. A gate
+              that changes little passes the same structure down, so its
+              lookahead only matches the best gain here — look for one well
+              above it.
             </caption>
             <thead>
               <tr className="border-b border-border">
@@ -165,9 +189,13 @@ export function SplitGate({
                     <td className="py-1 text-right font-mono">
                       {candidate ? candidate.lookaheadGain.toFixed(3) : "—"}
                     </td>
-                    <td className="py-1 text-right">
-                      <button
-                        type="button"
+                    <td className="py-1 pl-1 text-right">
+                      {/* The shared Button, not a hand-rolled one: its 44px
+                          minimum target (DESIGN.md §9) is the point, and this
+                          is the main way a gate gets built on a phone. */}
+                      <Button
+                        variant="secondary"
+                        size="sm"
                         disabled={!candidate || !canSplit}
                         onClick={() => {
                           setFeature(index);
@@ -188,10 +216,9 @@ export function SplitGate({
                               )}, lookahead ${candidate.lookaheadGain.toFixed(3)}`
                             : ", not available"
                         }`}
-                        className="rounded border border-border px-1.5 py-0.5 hover:bg-surface focus-visible:ring-2 focus-visible:ring-primary focus-visible:outline-none disabled:opacity-40"
                       >
                         Build
-                      </button>
+                      </Button>
                     </td>
                   </tr>
                 );
@@ -213,7 +240,7 @@ export function SplitGate({
                 setFeature(Number(event.target.value));
                 setManual(null);
               }}
-              className="mt-1.5 w-full rounded-md border border-border bg-surface-2 px-2 py-1.5 text-sm"
+              className="mt-1.5 min-h-11 w-full rounded-md border border-border bg-surface-2 px-2 py-1.5 text-sm"
             >
               {FEATURES.map((meta, index) => (
                 <option key={meta.name} value={index}>
@@ -230,12 +257,16 @@ export function SplitGate({
               step={0.01}
               onChange={(value) => setManual(value)}
               format={(value) => value.toFixed(2)}
-              hint="Plots below the threshold go left."
+              hint="Plots below the threshold go left. The table only tries each reading's best immediate threshold; here you can try any, with lookahead computed live."
             />
 
             <p className="mt-1 text-xs text-text-muted">
               gain{" "}
-              <span className="font-mono">{liveGain.toFixed(4)}</span> · splits{" "}
+              <span className="font-mono">{liveGain.toFixed(4)}</span> ·
+              lookahead{" "}
+              <span className="font-mono">{liveLookahead.toFixed(3)}</span>{" "}
+              (best gain here{" "}
+              <span className="font-mono">{bestGain.toFixed(4)}</span>) · splits{" "}
               {left.length} / {right.length}
               {left.length === 0 || right.length === 0
                 ? " — everything goes one way, so this gate does nothing"
