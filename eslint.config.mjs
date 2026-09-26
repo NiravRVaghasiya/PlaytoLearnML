@@ -26,6 +26,8 @@ const config = [
       // buries our own diagnostics under hundreds of upstream warnings.
       "public/pyodide/**",
       "next-env.d.ts",
+      // Gitignored scratch space (see .gitignore). Never part of the app.
+      ".tmp-*/**",
     ],
   },
 

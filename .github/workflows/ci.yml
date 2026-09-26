@@ -1,0 +1,213 @@
+# GameML CI.
+#
+# Vercel's only gate is `bun run build`, which type-checks but does not lint,
+# run a single unit test, or open a browser. Everything the repo already has for
+# proving a change works runs here instead, on a clean runner — which is what
+# matters most for this repo: a clean install is exactly the environment where
+# the Pyodide wheels used to go missing and the Python lane shipped broken while
+# every local check passed.
+#
+# Three jobs, in parallel:
+#   static   typecheck + lint                                     (~3 min)
+#   unit     vitest, sharded 3 ways — the full suite is ~10 min on a 12-thread
+#            laptop and TF.js training is CPU-bound, so a 4-vCPU runner needs
+#            the split to finish in reasonable wall time
+#   browser  production build (strict Pyodide staging), `next start`, then the
+#            three browser harnesses against it: playthroughs, phone layout,
+#            Lighthouse accessibility
+#
+# Make all three required status checks on `main` (branch protection, or
+# Vercel's "deployment checks") so a production deploy only ever comes from a
+# green commit.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Read-only token: nothing here writes to the repo.
+permissions:
+  contents: read
+
+# A new push to a PR supersedes its run in progress. Pushes to main are grouped
+# per commit, so none is ever cancelled or queued away: every commit there is a
+# production deploy and gets checked.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Match bun.lock (written by bun 1.3.13) and package.json "engines".
+  BUN_VERSION: "1.3.13"
+  NODE_VERSION: "22"
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  static:
+    name: Typecheck and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      # next, tsc, eslint and vitest all run under Node (their bins are
+      # `#!/usr/bin/env node`); bun is the package manager and script runner.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Cache bun's package store
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      - run: bun install --frozen-lockfile
+
+      # tsconfig includes next-env.d.ts and .next/types, which only a build
+      # generates. Neither is needed here: no source relies on Next's global
+      # route types or asset-module declarations, so a clean tree type-checks.
+      - run: bun run typecheck
+
+      - run: bun run lint
+
+  unit:
+    name: Unit tests (${{ matrix.shard }}/3)
+    runs-on: ubuntu-latest
+    # Generous: the heaviest TF.js cases take minutes each on a small runner.
+    # Don't shrink per-test timeouts to fit CI; add shards instead.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Cache bun's package store
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      - run: bun install --frozen-lockfile
+
+      # Vitest adds its github-actions reporter by itself on Actions, so
+      # failures are annotated on the PR diff.
+      - run: bun run test:run --shard=${{ matrix.shard }}/3
+
+  browser:
+    name: Build and browser verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Cache bun's package store
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      - run: bun install --frozen-lockfile
+
+      # `prebuild` runs scripts/setup-pyodide.mjs, which downloads the pandas
+      # wheel closure from Pyodide's CDN and checks every sha256 against the
+      # pinned lockfile. CI=1 makes a missing or mismatched wheel fail the
+      # build instead of warning (Actions sets CI=true anyway; this says so).
+      - name: Build
+        run: bun run build
+        env:
+          CI: "1"
+
+      - name: Cache Playwright's browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+
+      # --with-deps installs the OS libraries too, which are not cached.
+      - run: bunx playwright install --with-deps chromium
+
+      - name: Start the production server
+        id: server
+        run: |
+          nohup bun run start > "$RUNNER_TEMP/next-start.log" 2>&1 &
+          for attempt in $(seq 1 60); do
+            if curl --silent --fail --output /dev/null http://localhost:3000/; then
+              echo "next start is up after ${attempt}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "next start did not answer on :3000 within 60s"
+          cat "$RUNNER_TEMP/next-start.log"
+          exit 1
+
+      # next.config.ts's headers() are unit-tested as a pure function; this
+      # proves `next start` actually serves them — on a page and on a public/
+      # file, which is where a static-asset cache policy could silently lose.
+      - name: Security and cache headers are served
+        run: |
+          page=$(curl --silent --fail --dump-header - --output /dev/null http://localhost:3000/)
+          echo "$page"
+          echo "$page" | grep -iq "^content-security-policy: default-src 'self'"
+          echo "$page" | grep -iq "^x-content-type-options: nosniff"
+          echo "$page" | grep -iq "^x-frame-options: DENY"
+          if echo "$page" | grep -iq "^x-powered-by"; then
+            echo "X-Powered-By is still being sent"
+            exit 1
+          fi
+          wasm=$(curl --silent --fail --dump-header - --output /dev/null http://localhost:3000/pyodide/pyodide.asm.wasm)
+          echo "$wasm"
+          echo "$wasm" | grep -iq "^cache-control: public, max-age=86400, stale-while-revalidate=604800"
+
+      # The three harnesses report independently: one failing does not hide
+      # what the others would have found, but none runs without a server.
+      # Each playthrough also fails on any console error, which is how a
+      # Content-Security-Policy violation would surface.
+      - name: Playthroughs (every game, including the Python lane)
+        if: ${{ !cancelled() && steps.server.outcome == 'success' }}
+        run: bun run verify:play
+
+      - name: Phone layout
+        if: ${{ !cancelled() && steps.server.outcome == 'success' }}
+        run: bun run verify:mobile
+
+      - name: Lighthouse accessibility
+        if: ${{ !cancelled() && steps.server.outcome == 'success' }}
+        run: bun run audit:a11y
+
+      - name: Upload the server log
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: next-start-log
+          path: ${{ runner.temp }}/next-start.log
+          if-no-files-found: ignore
