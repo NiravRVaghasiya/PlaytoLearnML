@@ -23,10 +23,20 @@ import { VarianceGauge } from "./VarianceGauge";
 import { VisualLane } from "./VisualLane";
 import { CodeLane } from "./CodeLane";
 
+/**
+ * Exactly the progression engine's rule: a surfaced cloud, a best score at or
+ * above `HIGH_SCORE_THRESHOLD`, and that plus a code-lane clear. The third line
+ * used to be "separate the groups as well as any plane can" — the per-dive grade
+ * in ml.ts, which the engine never reads — so the star it promised never came.
+ * The first line names both halves of surfacing: keeping the variance alone
+ * (the needle at its PCA plane) is "mixed", and records nothing.
+ */
 const STAR_CRITERIA = [
-  `Retain ${Math.round(VARIANCE_TARGET * 100)}% of the best possible variance`,
-  `Score ${Math.round(HIGH_SCORE_THRESHOLD * 100)}% by landing on the optimum without the hint`,
-  "Find a shadow that separates the groups as well as any plane can",
+  `Surface a cloud: keep ${Math.round(
+    VARIANCE_TARGET * 100,
+  )}% of the best possible variance, and show the groups wherever a flat shadow can`,
+  `Score ${Math.round(HIGH_SCORE_THRESHOLD * 100)}% or better by landing on the optimum without the hint`,
+  "Surface a cloud from the code lane",
 ];
 
 function Controls() {
@@ -98,7 +108,9 @@ function Controls() {
           <Button
             variant="primary"
             className="w-full"
-            onClick={submit}
+            // Wrapped: handing `submit` straight to onClick would pass the click
+            // event in as the commit's `source`.
+            onClick={() => submit()}
             disabled={submitted}
             icon={<Anchor className="size-4" />}
           >

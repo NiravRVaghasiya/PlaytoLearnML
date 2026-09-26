@@ -4,6 +4,8 @@ import {
   GROUP_LABELS,
   SEPARATION_FLOOR,
   VARIANCE_TARGET,
+  gaugeSpan,
+  isNearIsotropic,
   varianceRetained,
   type Analysis,
   type CloudSpec,
@@ -73,7 +75,7 @@ export function whyCardFor(event: DiverEvent): WhyCardContent {
           .map((value) => value.toFixed(2))
           .join(
             ", ",
-          )}, and the best plane is simply the one that discards the smallest. That is what makes PCA unusual among everything else on this site: it has a closed-form answer, and the eigenvalues tell you what the answer is worth before you look at the picture. Using the hint costs you the top score for this cloud, which seems fair.`,
+          )}, and the best plane is simply the one that discards the smallest. That is what makes PCA unusual among everything else on this site: it has a closed-form answer, and the eigenvalues tell you what the answer is worth before you look at the picture. Using the hint costs you the top score for this cloud — restarting it included, since the angles are on screen now — which seems fair.`,
         tone: "info",
       };
     }
@@ -93,7 +95,11 @@ export function whyCardFor(event: DiverEvent): WhyCardContent {
               .map((value) => value.toFixed(2))
               .join(
                 ", ",
-              )}, nearly equal, so this cloud has no preferred plane to find. This is the exact gap t-SNE and UMAP exist to fill — they give up being linear, and being able to project a new point without refitting, in exchange for being able to see structure like this at all.`,
+              )}, nearly equal, so this cloud has barely any preferred plane to find — every shadow of it keeps between ${percent(
+              gaugeSpan(analysis.eigen)[0],
+            )} and ${percent(
+              gaugeSpan(analysis.eigen)[1],
+            )}. This is the exact gap t-SNE and UMAP exist to fill — they give up being linear, and being able to project a new point without refitting, in exchange for being able to see structure like this at all.`,
             tone: "good",
           };
         }
@@ -142,11 +148,38 @@ export function whyCardFor(event: DiverEvent): WhyCardContent {
         };
       }
 
+      /**
+       * "Short of the ceiling", not "thrown away". The old title read "65.4% kept,
+       * 3.8% thrown away" beside a Discarded-axis metric showing 34.6%: both true,
+       * about different things. What the title's number measures is the gap to
+       * the best plane, so that is what it now says.
+       */
+      const title = `${percent(evaluation.retained)} kept, ${(
+        (analysis.best - evaluation.retained) *
+        100
+      ).toFixed(1)} points short of the ceiling`;
+
+      if (isNearIsotropic(analysis.eigen)) {
+        const [floor, ceiling] = gaugeSpan(analysis.eigen);
+        return {
+          key: `lost-${cloud.id}-${Math.round(evaluation.retained * 1000)}`,
+          title,
+          body: `On this cloud the gauge barely moves: every shadow keeps between ${percent(
+            floor,
+          )} and ${percent(
+            ceiling,
+          )}, because the variances along its principal axes — ${analysis.eigen.values
+            .map((value) => value.toFixed(2))
+            .join(
+              ", ",
+            )} — are nearly equal, and what separates them is the sampling noise of a round cloud rather than structure. PCA still has a best plane, barely: you are hunting for the direction the data is thinnest along, however slightly thinner it is. The groups are showing now, and they will not help with this one — whichever way you turn it, they sit inside each other.`,
+          tone: "warn",
+        };
+      }
+
       return {
         key: `lost-${cloud.id}-${Math.round(evaluation.retained * 1000)}`,
-        title: `${percent(evaluation.retained)} kept, ${percent(
-          analysis.best - evaluation.retained,
-        )} thrown away`,
+        title,
         body: `The axis you are pointing away from has real spread along it, so flattening it destroys structure that was there. The cloud's variances along its own principal axes are ${analysis.eigen.values
           .map((value) => value.toFixed(2))
           .join(
@@ -180,9 +213,11 @@ export function gaugeCaption(
     )}% of the best possible ${(best * 100).toFixed(1)}%.`;
   }
   if (submitted) {
+    // "More … than has to be": the shadow always flattens (1 − retained) of the
+    // spread, and this number is only the avoidable part of it.
     return `${((best - retained) * 100).toFixed(
       1,
-    )} points of spread are being flattened away.`;
+    )} points more of the spread is being flattened away than has to be.`;
   }
   return `The ceiling is ${(best * 100).toFixed(
     1,

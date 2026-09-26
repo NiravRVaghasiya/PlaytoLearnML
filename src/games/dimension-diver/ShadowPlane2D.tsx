@@ -13,6 +13,22 @@ const SIZE = 320;
 const PAD = 14;
 
 /**
+ * The design tokens each group is drawn in, by group id, and the one an
+ * unrevealed point is drawn in. `<PointCloud3D>` reads the same list, so a group
+ * is the same colour in both views (DESIGN.md: class colours are fixed). The hex
+ * values are DESIGN.md's, used only where the stylesheet has not loaded.
+ */
+export const GROUP_COLOUR_TOKENS = [
+  { token: "--class-a", fallback: "#0072b2" },
+  { token: "--class-b", fallback: "#e69f00" },
+  { token: "--class-c", fallback: "#009e73" },
+] as const;
+export const UNREVEALED_COLOUR_TOKEN = {
+  token: "--text-muted",
+  fallback: "#9aa4b2",
+};
+
+/**
  * The 2D shadow (spec: `<ShadowPlane2D>`).
  *
  * SVG, not canvas, and this is the deliberate half of the split with
@@ -24,6 +40,12 @@ const PAD = 14;
  * Colour is never the only channel. Groups are drawn with distinct SHAPES as well
  * as distinct hues from the Okabe–Ito set, so three overlapping clusters remain
  * countable without colour vision.
+ *
+ * And each glyph has to be visible against what it is drawn on (WCAG 1.4.11,
+ * 3:1). The plot sits on --bg, not --surface-2: Okabe–Ito blue is 3.65:1 on
+ * --bg and only 2.88:1 on --surface-2, and the 0.82 opacity every glyph used
+ * to carry took group A down to 2.4:1. Group A is drawn solid for that reason;
+ * the other two clear 3:1 comfortably with the opacity kept.
  */
 export function ShadowPlane2D({
   shadow,
@@ -74,7 +96,7 @@ export function ShadowPlane2D({
     <figure className="m-0">
       <svg
         viewBox={`0 0 ${SIZE} ${SIZE}`}
-        className="w-full max-w-[340px] rounded-md border border-border bg-surface-2"
+        className="w-full max-w-[340px] rounded-md border border-border bg-bg"
         role="img"
         aria-label={description}
       >
@@ -96,13 +118,10 @@ export function ShadowPlane2D({
         />
 
         {scaled.map((point, index) => {
-          const fill = showGroups
-            ? point.groupId === 0
-              ? "var(--class-a)"
-              : point.groupId === 1
-                ? "var(--class-b)"
-                : "var(--class-c, var(--warn))"
-            : "var(--text-muted)";
+          const colour = showGroups
+            ? (GROUP_COLOUR_TOKENS[point.groupId] ?? UNREVEALED_COLOUR_TOKEN)
+            : UNREVEALED_COLOUR_TOKEN;
+          const fill = `var(${colour.token})`;
 
           // Shape carries the group as well as colour.
           if (!showGroups || point.groupId === 0) {
@@ -113,7 +132,8 @@ export function ShadowPlane2D({
                 cy={point.y}
                 r={2.6}
                 fill={fill}
-                opacity={0.82}
+                // Solid for group A: at 0.82 it measured 2.8:1 on --bg.
+                opacity={showGroups ? 1 : 0.82}
               />
             );
           }

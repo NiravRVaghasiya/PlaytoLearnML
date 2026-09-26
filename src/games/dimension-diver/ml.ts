@@ -127,8 +127,13 @@ export const CLOUDS: readonly CloudSpec[] = [
   {
     id: "needle",
     title: "The loud axis",
+    // The lesson used to say the two quiet axes have "almost exactly the same
+    // spread" and that "the gauge cannot tell those two apart" — left over from
+    // the abandoned attempt two below. Measured, they are 2.63 and 1.07, and the
+    // gauge reads 99.3% against 98.2% for discarding one or the other. Both
+    // numbers this copy now relies on are asserted in the tests.
     lesson:
-      "One direction has enormous spread and carries no group information at all. Two other directions have almost exactly the same modest spread as each other — and only one of them holds the groups. The gauge cannot tell those two apart. You will have to look.",
+      "One direction is enormously loud and pure noise. Of the two quiet ones, the smaller holds the groups — and because the loud axis dominates the total, discarding the other quiet axis instead costs only about a point on the gauge. The gauge measures spread, not groups, so it cannot tell you which quiet axis holds them. You will have to look.",
     build: (random) => {
       const points: Point3D[] = [];
       // Offsets along the third axis are what tells the groups apart.
@@ -147,7 +152,7 @@ export const CLOUDS: readonly CloudSpec[] = [
       //
       // What works is a very loud first axis. Retained variance is 1 − λᵢ/Σλ, so
       // when λ₁ dominates the sum, dropping the middle axis instead of the smallest
-      // costs almost nothing as a SHARE of the optimum — measured at 98.7% — while
+      // costs almost nothing as a SHARE of the optimum — measured at 98.9% — while
       // λ₂ still sits three times λ₃, keeping the eigenvectors well separated and
       // the signal firmly in the axis PCA discards. So the plane that reveals the
       // groups is not PCA's answer, and it is still comfortably inside the variance
@@ -572,12 +577,28 @@ export function separation(shadow: readonly Shadow[]): Separation {
     spread.push(Math.hypot(du, dv));
   }
 
+  return { ratio: fisherRatio(bA, bB, bC, wA, wB, wC), spread };
+}
+
+/**
+ * The largest eigenvalue of Sw⁻¹Sb for 2x2 scatter matrices [[a, b], [b, c]].
+ * Shared by `separation` and `separationProbe`, so the readout and the search
+ * can never disagree about what "separation" means.
+ */
+function fisherRatio(
+  bA: number,
+  bB: number,
+  bC: number,
+  wA: number,
+  wB: number,
+  wC: number,
+): number {
   // A ridge keeps Sw invertible when a projection collapses the cloud to a line.
   const ridge = 1e-9 * (wA + wC + 1);
   const sA = wA + ridge;
   const sC = wC + ridge;
   const det = sA * sC - wB * wB;
-  if (Math.abs(det) < 1e-15) return { ratio: 0, spread };
+  if (Math.abs(det) < 1e-15) return 0;
 
   // M = Sw^-1 Sb, then its largest eigenvalue.
   const m11 = (sC * bA - wB * bB) / det;
@@ -590,7 +611,105 @@ export function separation(shadow: readonly Shadow[]): Separation {
   const disc = Math.max(tr * tr - 4 * dt, 0);
   const ratio = (tr + Math.sqrt(disc)) / 2;
 
-  return { ratio: Number.isFinite(ratio) ? Math.max(ratio, 0) : 0, spread };
+  return Number.isFinite(ratio) ? Math.max(ratio, 0) : 0;
+}
+
+/**
+ * `separation(project(points, angles)).ratio`, without building the shadow.
+ *
+ * The plane search evaluates about eleven hundred orientations per sweep, and
+ * `analyse` runs two sweeps. Through `project` + `separation` each evaluation
+ * recomputed the centroid and allocated three hundred shadow objects and three
+ * group arrays, which measured 50–100 ms per cloud on a desktop — and ran at
+ * module load, before first paint. This centres the cloud once, then makes a
+ * single allocation-free pass per orientation, accumulating each group's sums
+ * of u, v, u², uv and v² and turning those into the same scatter matrices in
+ * closed form (Σ(u − ū)² = Σu² − nū²). The tests hold it to the slow path to
+ * nine digits on every cloud.
+ */
+export function separationProbe(
+  points: readonly Point3D[],
+): (angles: Angles) => number {
+  const [mx, my, mz] = centroid(points);
+  const n = points.length;
+  const xs = new Float64Array(n);
+  const ys = new Float64Array(n);
+  const zs = new Float64Array(n);
+  const groupOf = new Int32Array(n);
+  points.forEach((point, index) => {
+    xs[index] = point.x - mx;
+    ys[index] = point.y - my;
+    zs[index] = point.z - mz;
+    groupOf[index] =
+      point.groupId >= 0 && point.groupId < GROUP_COUNT ? point.groupId : -1;
+  });
+
+  const count = new Float64Array(GROUP_COUNT);
+  const su = new Float64Array(GROUP_COUNT);
+  const sv = new Float64Array(GROUP_COUNT);
+  const suu = new Float64Array(GROUP_COUNT);
+  const suv = new Float64Array(GROUP_COUNT);
+  const svv = new Float64Array(GROUP_COUNT);
+
+  return (angles) => {
+    if (n === 0) return 0;
+    const frame = frameFor(angles);
+    const [a0, a1, a2] = frame[0];
+    const [b0, b1, b2] = frame[1];
+    count.fill(0);
+    su.fill(0);
+    sv.fill(0);
+    suu.fill(0);
+    suv.fill(0);
+    svv.fill(0);
+
+    let totalU = 0;
+    let totalV = 0;
+    for (let index = 0; index < n; index += 1) {
+      const x = xs[index]!;
+      const y = ys[index]!;
+      const z = zs[index]!;
+      const u = a0 * x + a1 * y + a2 * z;
+      const v = b0 * x + b1 * y + b2 * z;
+      totalU += u;
+      totalV += v;
+      const group = groupOf[index]!;
+      if (group < 0) continue;
+      // Written out rather than `+=`: with `noUncheckedIndexedAccess` a typed
+      // array element reads as possibly undefined on the left-hand side.
+      count[group] = count[group]! + 1;
+      su[group] = su[group]! + u;
+      sv[group] = sv[group]! + v;
+      suu[group] = suu[group]! + u * u;
+      suv[group] = suv[group]! + u * v;
+      svv[group] = svv[group]! + v * v;
+    }
+
+    const meanU = totalU / n;
+    const meanV = totalV / n;
+    let bA = 0;
+    let bB = 0;
+    let bC = 0;
+    let wA = 0;
+    let wB = 0;
+    let wC = 0;
+    for (let group = 0; group < GROUP_COUNT; group += 1) {
+      const c = count[group]!;
+      if (c === 0) continue;
+      const gu = su[group]! / c;
+      const gv = sv[group]! / c;
+      const weight = c / n;
+      const du = gu - meanU;
+      const dv = gv - meanV;
+      bA += weight * du * du;
+      bB += weight * du * dv;
+      bC += weight * dv * dv;
+      wA += (suu[group]! - c * gu * gu) / n;
+      wB += (suv[group]! - c * gu * gv) / n;
+      wC += (svv[group]! - c * gv * gv) / n;
+    }
+    return fisherRatio(bA, bB, bC, wA, wB, wC);
+  };
 }
 
 /**
@@ -600,8 +719,14 @@ export function separation(shadow: readonly Shadow[]): Separation {
  * analytic optimum for a single discriminant direction, but the quantity here is
  * over a PLANE and the ranking is not a plain eigenproblem — and a coarse-to-fine
  * sweep over the sphere of discarded axes is both exact enough for a target and
- * something the player can be told the shape of. 1° resolution over a hemisphere is
- * a few thousand evaluations, which is milliseconds.
+ * something the player can be told the shape of: a 6° grid over the hemisphere,
+ * then 1° around the best cell — about eleven hundred evaluations.
+ *
+ * That was described here as "milliseconds", and through `project` + `separation`
+ * it measured 45 ms per sweep on a desktop, two sweeps per cloud, at module load.
+ * The sweep now goes through `separationProbe`, which gives the same numbers
+ * without allocating, and the store caches each cloud's analysis so a retry
+ * costs nothing at all.
  */
 export function bestSeparation(
   points: readonly Point3D[],
@@ -623,6 +748,7 @@ export function bestSeparation(
 } {
   let best = { ratio: -1, angles: DEFAULT_ANGLES };
   const matrix = minimumRetained === undefined ? null : covariance(points);
+  const separationAt = separationProbe(points);
 
   const evaluate = (yaw: number, pitch: number) => {
     const angles: Angles = { yaw, pitch, roll: 0 };
@@ -633,7 +759,7 @@ export function bestSeparation(
     ) {
       return;
     }
-    const ratio = separation(project(points, angles)).ratio;
+    const ratio = separationAt(angles);
     if (ratio > best.ratio) best = { ratio, angles };
   };
 
@@ -654,6 +780,25 @@ export function bestSeparation(
 
 /** Fraction of the PCA optimum the player has to reach. */
 export const VARIANCE_TARGET = 0.98;
+/**
+ * Largest over smallest eigenvalue below which a cloud is treated as round: its
+ * principal axes exist, but barely. The same line the tests draw for the shells.
+ */
+export const NEAR_ISOTROPIC = 1.5;
+
+export const isNearIsotropic = (eigen: Eigen): boolean =>
+  eigen.values[2] > 1e-12 && eigen.values[0] / eigen.values[2] < NEAR_ISOTROPIC;
+
+/**
+ * The whole range the gauge can show for a cloud: discard the loudest axis and
+ * you keep the least, discard the quietest and you keep the most.
+ */
+export function gaugeSpan(eigen: Eigen): [number, number] {
+  const [l1, l2, l3] = eigen.values;
+  const total = l1 + l2 + l3;
+  if (total <= 1e-12) return [1, 1];
+  return [(l2 + l3) / total, (l1 + l2) / total];
+}
 /** Below this share of the optimum, the projection has thrown away real structure. */
 export const LOST_VARIANCE = 0.85;
 /** A separation this far below the achievable best counts as groups still mixed. */
@@ -700,7 +845,16 @@ export interface Evaluation {
   /** False when no flat shadow of this cloud separates the groups at all. */
   separable: boolean;
   score: number;
-  stars: number;
+  /**
+   * A 0–3 quality grade for this one dive: surfaced, on the optimum, and showing
+   * the groups as well as a reachable plane can.
+   *
+   * NOT the mastery stars, and named so nobody mistakes it for them. Those come
+   * from the progression service (a clear, a best score of 0.8, a code-lane
+   * clear), and this used to be called `stars` while the star criteria on screen
+   * described it — so the tooltip promised a third star the engine never gave.
+   */
+  grade: number;
   failure: NamedFailure | null;
 }
 
@@ -742,7 +896,7 @@ export function evaluate({
   };
 
   if (!submitted) {
-    return { ...base, outcome: "diving", score: 0, stars: 0, failure: null };
+    return { ...base, outcome: "diving", score: 0, grade: 0, failure: null };
   }
 
   const hitVariance = share >= VARIANCE_TARGET;
@@ -762,11 +916,64 @@ export function evaluate({
 
   if (!hitVariance) {
     const wasted = analysis.best - retained;
+
+    /**
+     * A round cloud still has a best plane, but not much of one — and the copy
+     * below this branch was written for clouds that do.
+     *
+     * Measured on the nested shells: the variances are 4.39, 4.27 and 3.86, the
+     * sampling noise of 300 points on spheres, and EVERY possible shadow keeps
+     * between 64.9% and 69.2%. The variance target still applies, so committing
+     * at the default angles (65.4%) is still genuinely short of it — but "3.8% of
+     * the structure has been flattened out of existence… a direction with real
+     * spread in it" was describing structure this cloud does not have. So on a
+     * near-isotropic spectrum the verdict says what is actually true: the whole
+     * gauge spans four points, and which axis is thinnest is barely decided.
+     */
+    if (isNearIsotropic(analysis.eigen)) {
+      const [floor, ceiling] = gaugeSpan(analysis.eigen);
+      // How much of the whole gauge the shortfall is, stated as the number it
+      // is. The first version said "most of the range there is" to every miss,
+      // and about a quarter of them are short by less than half of it.
+      const span = ceiling - floor;
+      const gapShare = span > 1e-12 ? clamp(wasted / span, 0, 1) : 1;
+      return {
+        ...base,
+        outcome: "lost-variance",
+        score: clamp(share * 0.5, 0, 1),
+        grade: 0,
+        failure: {
+          name: "Lost variance",
+          detail: `This shadow keeps ${percent(
+            retained,
+          )} of the cloud's spread, and the best any flat shadow of it can keep is ${percent(
+            analysis.best,
+          )} — ${(wasted * 100).toFixed(
+            1,
+          )} points short, against a target of ${Math.round(
+            VARIANCE_TARGET * 100,
+          )}% of the best. On this cloud that gap is ${Math.round(
+            gapShare * 100,
+          )}% of the whole range there is: every possible shadow keeps between ${percent(
+            floor,
+          )} and ${percent(
+            ceiling,
+          )}, because the three variances are ${analysis.eigen.values
+            .map((value) => value.toFixed(2))
+            .join(
+              ", ",
+            )} — nearly equal. A round cloud has no real long or short axis, and differences this small are mostly the sampling noise of ${
+            points.length
+          } points rather than structure. PCA still has a best plane, barely, and it is the one that discards the direction the data is thinnest along, however slightly thinner that is. Turn the cloud a little at a time and watch the gauge, which is still an exact reading of it.`,
+        },
+      };
+    }
+
     return {
       ...base,
       outcome: "lost-variance",
       score: clamp(share * 0.5, 0, 1),
-      stars: 0,
+      grade: 0,
       failure: {
         name: "Lost variance",
         detail: `This shadow keeps ${percent(
@@ -789,7 +996,7 @@ export function evaluate({
       ...base,
       outcome: "mixed",
       score: clamp(0.45 + 0.15 * share, 0, 1),
-      stars: 1,
+      grade: 1,
       failure: {
         name: "High variance, mixed groups",
         detail: `You found a variance-optimal plane — ${percent(
@@ -814,15 +1021,16 @@ export function evaluate({
     };
   }
 
-  // Both. The extra stars are for landing on the optimum rather than near it, and
-  // for a shadow that actually shows the structure.
+  // Both. The extra grades are for landing on the optimum rather than near it,
+  // and for a shadow that actually shows the structure.
   //
-  // 0.85 rather than a rounder number because it was measured: on the pancake the
-  // best-separating plane retains only 59% of the variance, so the most any
-  // variance-optimal projection achieves there is a 90% separation share. A higher
-  // bar would have made three stars unreachable on the cloud that is supposed to
-  // be the gentle one.
-  const stars =
+  // 0.85 was set against an earlier pancake, on which the best a variance-optimal
+  // plane managed was a 90% separation share. Re-measured on the cloud that ships
+  // (seed 2029), the bar has room to spare: the best-separating plane retains 83%
+  // of the variance and the PCA plane itself reaches a 99.8% separation share, so
+  // on the gentle cloud the top grade is simply "find the optimum". The tests hold
+  // the PCA-plane figure.
+  const grade =
     1 +
     (share >= 0.995 ? 1 : 0) +
     (!separable || separationShare >= 0.85 ? 1 : 0);
@@ -831,7 +1039,7 @@ export function evaluate({
     outcome: "surfaced",
     separable,
     score: clamp(0.5 + 0.3 * share + 0.2 * (separable ? separationShare : 1), 0, 1),
-    stars: Math.min(stars, 3),
+    grade: Math.min(grade, 3),
     failure: null,
   };
 }
@@ -863,6 +1071,6 @@ export const MATH_NOTES = `Every projection onto a plane keeps v₁ᵀCv₁ + v�
 
 PCA is then not a search at all. Once you accept that you are picking one direction to discard, you want the direction the data is thinnest along, and that is the eigenvector of the covariance matrix with the smallest eigenvalue. Eigendecompose a 3×3 symmetric matrix and you are done — no gradient descent, no learning rate, no epochs. It is one of the few things in this whole site with a closed-form answer, and the eigenvalues even tell you what the answer is worth before you look at it.
 
-Which brings up what PCA does not do. It maximises variance, and nobody has ever actually wanted variance. What people want is to see the structure, and variance is a stand-in for that which happens to work most of the time. One of these clouds is built to break the correspondence: its loudest direction is pure noise with enormous spread, and the direction that separates the groups is the quietest of the three. PCA will confidently hand you a plane that retains 96% of the spread and shows you nothing, and it will not warn you, because it was never looking at the labels. Nothing in the algorithm knows the groups exist.
+Which brings up what PCA does not do. It maximises variance, and nobody has ever actually wanted variance. What people want is to see the structure, and variance is a stand-in for that which happens to work most of the time. One of these clouds is built to break the correspondence: its loudest direction is pure noise with enormous spread, and the direction that separates the groups is the quietest of the three. PCA will confidently hand you a plane that retains over 99% of the spread and shows you nothing, and it will not warn you, because it was never looking at the labels. Nothing in the algorithm knows the groups exist.
 
 And there is a harder limit than that. Take the nested shells: one group inside another. Turn it however you like — no flat shadow of that arrangement pulls them apart, because a linear projection can only ever take weighted sums of coordinates, and no weighted sum of coordinates distinguishes "near the centre" from "far from it". This is precisely the gap t-SNE and UMAP exist to fill: they abandon the requirement that the map be a linear projection, keep local neighbourhoods instead of global variance, and can therefore unroll structure that PCA has no vocabulary for. They also give up what PCA has — an exact answer, a meaning for each axis, and the ability to project a new point without refitting.`;

@@ -19,7 +19,7 @@ import { createCodeApi } from "./store";
  * which is what turns "variance is not separation" from an assertion into a table.
  */
 
-const STARTER_CODE = `// Two claims to check, both by brute force.
+export const STARTER_CODE = `// Two claims to check, both by brute force.
 
 const pca = api.pca();
 log('cloud:', api.cloud().title);

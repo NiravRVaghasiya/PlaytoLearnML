@@ -2,7 +2,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
+import { isWebGLAvailable } from "@/lib/utils";
 import { GROUP_LABELS, frameFor, type Angles, type Point3D } from "./ml";
+import { GROUP_COLOUR_TOKENS, UNREVEALED_COLOUR_TOKEN } from "./ShadowPlane2D";
 
 export interface PointCloud3DProps {
   points: readonly Point3D[];
@@ -12,7 +14,32 @@ export interface PointCloud3DProps {
   discardedLabel: string;
 }
 
-const GROUP_COLOURS = [0x4c78d0, 0xe08b3c, 0x59a14f];
+/**
+ * A design token as a three.js colour, read from the same CSS custom property
+ * the shadow fills with.
+ *
+ * The first version hardcoded three hexes of its own (a softer blue, orange and
+ * green), so a group was one colour in 3D and another in the shadow directly
+ * beneath it. Reading the token means the two views cannot drift apart.
+ */
+export function tokenColour({ token, fallback }: { token: string; fallback: string }) {
+  const value = getComputedStyle(document.documentElement)
+    .getPropertyValue(token)
+    .trim();
+  return new THREE.Color(value === "" ? fallback : value);
+}
+
+/** Free everything the GPU holds for a scene graph: geometry and materials. */
+function disposeTree(root: THREE.Object3D) {
+  root.traverse((object) => {
+    if (object instanceof THREE.Points || object instanceof THREE.LineSegments) {
+      object.geometry.dispose();
+      const material = object.material as THREE.Material | THREE.Material[];
+      if (Array.isArray(material)) material.forEach((entry) => entry.dispose());
+      else material.dispose();
+    }
+  });
+}
 
 /**
  * The cloud in 3D (spec: `<PointCloud3D>`, Three.js).
@@ -34,6 +61,19 @@ const GROUP_COLOURS = [0x4c78d0, 0xe08b3c, 0x59a14f];
  * WebGL is also not guaranteed. If context creation fails the component says so and
  * gets out of the way rather than leaving an empty box, and the rest of the game
  * carries on working.
+ *
+ * ── Rendering and releasing ────────────────────────────────────────────────
+ * There is no render loop: a frame is drawn only when something it shows has
+ * changed — the angles, the points, the grouping, the size — so an idle cloud
+ * costs nothing. The canvas is sized in CSS pixels (`setSize` writes its style)
+ * with the backing store at up to 2× for sharpness, so a high-density screen can
+ * never double its layout width. And on unmount the renderer is disposed AND its
+ * context released with `forceContextLoss()`: `dispose()` alone frees three's
+ * caches but leaves the context alive until GC — the same leak the capability
+ * probe used to have, before it became the shared, self-releasing
+ * `isWebGLAvailable`. The renderer lives as long as the cloud's `points` array,
+ * which the store now reuses across a retry, so "Start this cloud again" no
+ * longer builds a new one.
  */
 export function PointCloud3D({
   points,
@@ -52,19 +92,10 @@ export function PointCloud3D({
    * React's lint rule correctly objects to, because it turns a capability check into
    * a cascading re-render. A read-only probe in a lazy initialiser is the standard
    * shape for this, and it also means the fallback renders on the first pass instead
-   * of flashing an empty box first.
+   * of flashing an empty box first. The probe itself is `isWebGLAvailable`, run
+   * once per page and shared with Gradient Descent Skier's terrain.
    */
-  const [supported] = useState(() => {
-    if (typeof document === "undefined") return false;
-    try {
-      const probe = document.createElement("canvas");
-      return Boolean(
-        probe.getContext("webgl2") ?? probe.getContext("webgl"),
-      );
-    } catch {
-      return false;
-    }
-  });
+  const [supported] = useState(isWebGLAvailable);
 
   // Scene setup, once.
   useEffect(() => {
@@ -125,11 +156,17 @@ export function PointCloud3D({
 
     return () => {
       window.removeEventListener("resize", onResize);
+      disposeTree(cloud);
       renderer.dispose();
+      // After dispose(), which removes three's context-lost listener, so the
+      // deliberate loss is not logged as if it were an accident.
+      renderer.forceContextLoss();
       if (renderer.domElement.parentNode === mount) {
         mount.removeChild(renderer.domElement);
       }
       rendererRef.current = null;
+      sceneRef.current = null;
+      cameraRef.current = null;
       groupRef.current = null;
     };
     // Scene lifetime is tied to the cloud identity; angles are applied separately.
@@ -150,6 +187,10 @@ export function PointCloud3D({
       }
     }
 
+    // Read per rebuild rather than once, so they are always the tokens in force.
+    const groupColours = GROUP_COLOUR_TOKENS.map(tokenColour);
+    const unrevealed = tokenColour(UNREVEALED_COLOUR_TOKEN);
+
     const byGroup: Point3D[][] = GROUP_LABELS.map(() => []);
     for (const point of points) byGroup[point.groupId]?.push(point);
 
@@ -167,7 +208,7 @@ export function PointCloud3D({
         new THREE.BufferAttribute(positions, 3),
       );
       const material = new THREE.PointsMaterial({
-        color: showGroups ? GROUP_COLOURS[groupId] : 0x9aa0a8,
+        color: showGroups ? (groupColours[groupId] ?? unrevealed) : unrevealed,
         size: 0.24,
         sizeAttenuation: true,
         transparent: true,

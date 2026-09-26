@@ -409,8 +409,8 @@ export async function run({ page, check }) {
     /t-SNE and UMAP/.test(shellsCard),
   );
   check(
-    "and noting the cloud has no preferred plane at all",
-    /nearly equal/.test(shellsCard),
+    "and noting the cloud has barely any preferred plane",
+    /nearly equal/.test(shellsCard) && /barely any preferred plane/.test(shellsCard),
   );
 
   // ── two lanes, one store ──
@@ -509,5 +509,40 @@ export async function run({ page, check }) {
   check(
     "and the groups are visible in the shadow",
     /Alpha/.test(await main.innerText()),
+  );
+
+  // ── WebGL contexts are released, not leaked ──
+  // Every lane toggle unmounts the 3D view. It used to leave its probe context
+  // and its renderer's context for GC, and Chrome caps live contexts and kills
+  // the OLDEST when the cap is hit — which can be another game's TF.js backend.
+  console.log("\nWebGL contexts are released on unmount");
+  const contextWarnings = [];
+  const onConsole = (message) => {
+    if (/Too many active WebGL contexts|Oldest context will be lost/i.test(message.text())) {
+      contextWarnings.push(message.text());
+    }
+  };
+  page.on("console", onConsole);
+  for (let round = 0; round < 12; round += 1) {
+    await page.getByRole("radio", { name: "Code", exact: true }).click();
+    await page.waitForTimeout(80);
+    await page.getByRole("radio", { name: "Visual", exact: true }).click();
+    await page.waitForTimeout(200);
+  }
+  for (let round = 0; round < 6; round += 1) {
+    await page.getByRole("button", { name: /Start this cloud again/ }).click();
+    await page.waitForTimeout(120);
+  }
+  await page.waitForTimeout(400);
+  page.off("console", onConsole);
+  check(
+    "twelve lane toggles and six restarts exhaust no WebGL context budget",
+    contextWarnings.length === 0,
+    contextWarnings.length === 0 ? "no context-limit warnings" : contextWarnings[0].slice(0, 120),
+  );
+  check(
+    "and the 3D view is still there afterwards",
+    (await main.locator("canvas").count()) > 0 ||
+      (await page.getByText(/could not start WebGL/).isVisible().catch(() => false)),
   );
 }

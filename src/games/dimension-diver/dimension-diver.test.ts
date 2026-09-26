@@ -4,6 +4,8 @@ import {
   CLOUDS,
   DEFAULT_ANGLES,
   GROUP_COUNT,
+  MATH_NOTES,
+  NEAR_ISOTROPIC,
   POINT_COUNT,
   SEPARATION_FLOOR,
   SEPARATION_TARGET,
@@ -18,18 +20,35 @@ import {
   dot,
   evaluate,
   frameFor,
+  gaugeSpan,
+  isNearIsotropic,
   jacobiEigen,
   project,
   quadratic,
   separation,
+  separationProbe,
   trace,
   varianceRetained,
   type Angles,
   type Mat3,
   type Point3D,
 } from "./ml";
-import { createCodeApi, shadowFor, useDiverStore } from "./store";
+import {
+  SLUG,
+  createCodeApi,
+  diveScore,
+  normalise,
+  shadowFor,
+  useDiverStore,
+} from "./store";
 import { gaugeCaption, separationCaption, whyCardFor } from "./why-cards";
+import { STARTER_CODE } from "./CodeLane";
+import {
+  HIGH_SCORE_THRESHOLD,
+  createMemoryAdapter,
+  useProgression,
+} from "@/engine/progression";
+import { createJsExecutor } from "@/engine/useCodeLane";
 
 /**
  * The claim this game makes is that it scores against real PCA. That is checked by
@@ -424,7 +443,13 @@ describe("the verdict", () => {
     expect(verdict.outcome).toBe("surfaced");
     expect(verdict.failure).toBeNull();
     expect(verdict.share).toBeCloseTo(1, 6);
-    expect(verdict.stars).toBe(3);
+    expect(verdict.grade).toBe(3);
+    // The grade comment's measured figure: the PCA plane itself shows the
+    // groups at a 99.8% separation share, well clear of the 0.85 bar.
+    expect(verdict.separationShare).toBeGreaterThan(0.995);
+    expect(
+      varianceRetained(analysis.covariance, analysis.bestSeparation.angles),
+    ).toBeCloseTo(0.83, 2);
   });
 
   it("names the conflict on the needle: maximum variance, nothing to see", () => {
@@ -457,7 +482,7 @@ describe("the verdict", () => {
     const verdict = judge("shells", analysis.pcaAngles);
     expect(verdict.separable).toBe(false);
     expect(verdict.outcome).toBe("surfaced");
-    expect(verdict.stars).toBe(3);
+    expect(verdict.grade).toBe(3);
   });
 
   it("keeps every failing score below every passing score", () => {
@@ -503,7 +528,7 @@ describe("the verdict", () => {
 
 describe("the store", () => {
   beforeEach(() => {
-    useDiverStore.setState({ surfacedIds: [], cloudIndex: 0 });
+    useDiverStore.setState({ surfacedIds: [], hintedIds: [], cloudIndex: 0 });
     useDiverStore.getState().reset();
   });
 
@@ -602,16 +627,71 @@ describe("the store", () => {
     useDiverStore.getState().submit();
     const hinted = useDiverStore.getState().evaluation.score;
 
-    useDiverStore.setState({ surfacedIds: [] });
+    // A different session, in effect: no hint on record for this cloud.
+    useDiverStore.setState({ surfacedIds: [], hintedIds: [] });
     useDiverStore.getState().reset();
     useDiverStore.getState().setAngles(analysis.pcaAngles);
     useDiverStore.getState().submit();
     const unhinted = useDiverStore.getState().evaluation.score;
 
     // The evaluation score itself is the same; the penalty is applied when the
-    // result is recorded, so check the flag that drives it.
+    // result is recorded, by `diveScore`.
     expect(hinted).toBeCloseTo(unhinted, 6);
     expect(useDiverStore.getState().hintUsed).toBe(false);
+    expect(
+      diveScore({ evaluationScore: hinted, hinted: true, surfacedCount: 1 }),
+    ).toBeLessThan(
+      diveScore({ evaluationScore: unhinted, hinted: false, surfacedCount: 1 }),
+    );
+  });
+
+  it("keeps charging the hint after the cloud is restarted", () => {
+    // The hint prints the exact angles on screen. Restarting used to clear the
+    // flag, so reset + type the angles back in + commit earned the full score.
+    const analysis = useDiverStore.getState().analysis;
+    useDiverStore.getState().usePcaHint();
+    useDiverStore.getState().reset();
+    expect(useDiverStore.getState().hintUsed).toBe(true);
+    useDiverStore.getState().setAngles(analysis.pcaAngles);
+    useDiverStore.getState().submit();
+    expect(useDiverStore.getState().phase).toBe("surfaced");
+    expect(useDiverStore.getState().hintedIds).toEqual([CLOUDS[0]!.id]);
+    // And only that cloud: the next one starts clean.
+    useDiverStore.getState().nextCloud();
+    expect(useDiverStore.getState().hintUsed).toBe(false);
+  });
+
+  it("reuses a cloud's analysis on retry instead of recomputing it", () => {
+    const before = useDiverStore.getState();
+    useDiverStore.getState().setAngles({ yaw: 40 });
+    useDiverStore.getState().reset();
+    const after = useDiverStore.getState();
+    expect(after.analysis).toBe(before.analysis);
+    // Same array, so the 3D view keeps its renderer across a retry.
+    expect(after.points).toBe(before.points);
+  });
+
+  it("wraps an enormous angle in one step instead of looping forever", () => {
+    // 1e20 − 360 is 1e20 in floating point: the old while-loop never finished.
+    useDiverStore.getState().setAngles({ yaw: 1e20, roll: -1e15 });
+    const { yaw, roll } = useDiverStore.getState().angles;
+    expect(yaw).toBeGreaterThanOrEqual(-180);
+    expect(yaw).toBeLessThanOrEqual(180);
+    expect(roll).toBeGreaterThanOrEqual(-180);
+    expect(roll).toBeLessThanOrEqual(180);
+  });
+
+  it("leaves both ends of the slider where the player put them", () => {
+    expect(normalise(180)).toBe(180);
+    expect(normalise(-180)).toBe(-180);
+    expect(normalise(540)).toBe(180);
+    expect(normalise(-190)).toBe(170);
+  });
+
+  it("refuses a NaN at the store as well as at the api", () => {
+    const before = useDiverStore.getState().angles;
+    useDiverStore.getState().setAngles({ yaw: Number.NaN });
+    expect(useDiverStore.getState().angles).toEqual(before);
   });
 
   it("moves to the next cloud and keeps the surfaced record", () => {
@@ -647,7 +727,7 @@ describe("the store", () => {
 
 describe("the code lane api", () => {
   beforeEach(() => {
-    useDiverStore.setState({ surfacedIds: [], cloudIndex: 0 });
+    useDiverStore.setState({ surfacedIds: [], hintedIds: [], cloudIndex: 0 });
     useDiverStore.getState().reset();
   });
 
@@ -805,5 +885,374 @@ describe("the quadratic form", () => {
     expect(quadratic(matrix, [1, 0, 0])).toBe(4);
     expect(quadratic(matrix, [0, 0, 1])).toBe(9);
     expect(trace(matrix)).toBe(14);
+  });
+});
+
+// ── The copy has to agree with the numbers it sits next to ────────────────
+
+describe("cloud copy", () => {
+  it("describes the loud axis's two quiet axes as they actually measure", () => {
+    // The lesson used to call them "almost exactly the same" and say "the gauge
+    // cannot tell those two apart". They are 2.63 and 1.07, and the gauge reads
+    // 99.3% against 98.2% for discarding one or the other.
+    const analysis = analyse(pointsFor("needle"));
+    const [l1, l2, l3] = analysis.eigen.values;
+    const total = l1 + l2 + l3;
+    const dropSmallest = 1 - l3 / total;
+    const dropMiddle = 1 - l2 / total;
+    const lesson = cloudById("needle").lesson;
+
+    expect(lesson).not.toMatch(/almost exactly the same/);
+    expect(lesson).not.toMatch(/cannot tell those two apart/);
+    // "the smaller holds the groups": the separating plane discards the middle.
+    expect(l2 / l3).toBeGreaterThan(2);
+    // "costs only about a point on the gauge".
+    expect(lesson).toMatch(/about a point on the gauge/);
+    const gap = (dropSmallest - dropMiddle) * 100;
+    expect(gap).toBeGreaterThan(0.5);
+    expect(gap).toBeLessThan(1.5);
+  });
+
+  it("quotes PCA's retained variance on the loud axis as it measures", () => {
+    // MATH_NOTES said 96%; measured it is 99.27%.
+    const analysis = analyse(pointsFor("needle"));
+    expect(analysis.best).toBeGreaterThan(0.99);
+    expect(MATH_NOTES).toMatch(/retains over 99% of the spread/);
+    expect(MATH_NOTES).not.toMatch(/96%/);
+  });
+});
+
+describe("a round cloud's lost variance", () => {
+  const shells = () => {
+    const points = pointsFor("shells");
+    const analysis = analyse(points);
+    return { points, analysis };
+  };
+
+  it("is recognised as near-isotropic, and the others are not", () => {
+    expect(isNearIsotropic(shells().analysis.eigen)).toBe(true);
+    expect(isNearIsotropic(analyse(pointsFor("pancake")).eigen)).toBe(false);
+    expect(isNearIsotropic(analyse(pointsFor("needle")).eigen)).toBe(false);
+    expect(NEAR_ISOTROPIC).toBe(1.5);
+  });
+
+  it("still misses the target at the default angles — the gate is kept", () => {
+    const { points, analysis } = shells();
+    const verdict = evaluate({
+      points,
+      analysis,
+      angles: DEFAULT_ANGLES,
+      submitted: true,
+    });
+    expect(verdict.outcome).toBe("lost-variance");
+    expect(verdict.failure?.name).toBe("Lost variance");
+  });
+
+  it("says the gauge spans a few points and the differences are noise", () => {
+    // The generic copy said "structure flattened out of existence… a direction
+    // with real spread in it" about a cloud built to have no principal structure.
+    const { points, analysis } = shells();
+    const verdict = evaluate({
+      points,
+      analysis,
+      angles: DEFAULT_ANGLES,
+      submitted: true,
+    });
+    const detail = verdict.failure!.detail;
+    const [floor, ceiling] = gaugeSpan(analysis.eigen);
+    expect(ceiling).toBeCloseTo(analysis.best, 12);
+    expect(ceiling - floor).toBeLessThan(0.06);
+    expect(detail).toContain(`${(floor * 100).toFixed(1)}%`);
+    expect(detail).toContain(`${(ceiling * 100).toFixed(1)}%`);
+    expect(detail).toMatch(/sampling noise/);
+    expect(detail).toMatch(/thinnest along/);
+    expect(detail).not.toMatch(/flattened out of existence/);
+    expect(detail).not.toMatch(/real spread/);
+  });
+
+  it("states the shortfall as the share of the range it is, not always 'most'", () => {
+    // Every miss used to be told its gap was "most of the range there is",
+    // including misses short by a third of it. Swept, not sampled at one point.
+    const { points, analysis } = shells();
+    const [floor, ceiling] = gaugeSpan(analysis.eigen);
+    let small = 0;
+    for (let yaw = -180; yaw < 180; yaw += 12) {
+      for (let pitch = -90; pitch <= 90; pitch += 6) {
+        const verdict = evaluate({
+          points,
+          analysis,
+          angles: { yaw, pitch, roll: 0 },
+          submitted: true,
+        });
+        if (verdict.outcome !== "lost-variance") continue;
+        const share = (analysis.best - verdict.retained) / (ceiling - floor);
+        const detail = verdict.failure!.detail;
+        expect(detail, `${yaw}/${pitch}`).toContain(
+          `that gap is ${Math.round(share * 100)}% of the whole range there is`,
+        );
+        expect(detail).not.toMatch(/most of the range/);
+        if (share < 0.5) small += 1;
+      }
+    }
+    // The case the old copy got wrong does occur on this cloud.
+    expect(small).toBeGreaterThan(0);
+  });
+
+  it("gives the matching card, which does not send the player to the groups", () => {
+    const { points, analysis } = shells();
+    const evaluation = evaluate({
+      points,
+      analysis,
+      angles: DEFAULT_ANGLES,
+      submitted: true,
+    });
+    const card = whyCardFor({
+      kind: "submitted",
+      cloud: cloudById("shells"),
+      evaluation,
+      analysis,
+      hintUsed: false,
+    });
+    expect(card.title).toMatch(/points short of the ceiling/);
+    expect(card.title).not.toMatch(/thrown away/);
+    expect(card.body).toMatch(/sampling noise of a round cloud/);
+    expect(card.body).not.toMatch(/should tell you which way to go/);
+  });
+
+  it("titles every lost-variance card by the gap to the ceiling", () => {
+    const points = pointsFor("pancake");
+    const analysis = analyse(points);
+    const evaluation = evaluate({
+      points,
+      analysis,
+      angles: anglesForAxis(analysis.eigen.vectors[0]),
+      submitted: true,
+    });
+    const card = whyCardFor({
+      kind: "submitted",
+      cloud: cloudById("pancake"),
+      evaluation,
+      analysis,
+      hintUsed: false,
+    });
+    const gap = ((analysis.best - evaluation.retained) * 100).toFixed(1);
+    expect(card.title).toContain(`${gap} points short of the ceiling`);
+  });
+
+  it("calls the shells' plane barely preferred, not absent", () => {
+    const { points, analysis } = shells();
+    const card = whyCardFor({
+      kind: "submitted",
+      cloud: cloudById("shells"),
+      evaluation: evaluate({
+        points,
+        analysis,
+        angles: analysis.pcaAngles,
+        submitted: true,
+      }),
+      analysis,
+      hintUsed: false,
+    });
+    expect(card.body).toMatch(/nearly equal/);
+    expect(card.body).toMatch(/barely any preferred plane/);
+    expect(card.body).not.toMatch(/no preferred plane/);
+  });
+
+  it("captions the avoidable part of the loss, not all of it", () => {
+    // 0.5 retained of a 0.996 ceiling flattens 50 points in total, 49.6 of them
+    // more than it has to.
+    expect(gaugeCaption(0.5, 0.996, true)).toMatch(
+      /49\.6 points more of the spread is being flattened away than has to be/,
+    );
+  });
+});
+
+describe("the fast separation probe", () => {
+  it("agrees with separation(project()) on every cloud to nine digits", () => {
+    for (const cloud of CLOUDS) {
+      const points = pointsFor(cloud.id);
+      const probe = separationProbe(points);
+      for (let yaw = -180; yaw < 180; yaw += 23) {
+        for (let pitch = -90; pitch <= 90; pitch += 17) {
+          for (const roll of [0, 41]) {
+            const angles = { yaw, pitch, roll };
+            const slow = separation(project(points, angles)).ratio;
+            expect(probe(angles), `${cloud.id} ${yaw}/${pitch}/${roll}`).toBeCloseTo(
+              slow,
+              9,
+            );
+          }
+        }
+      }
+    }
+  });
+
+  it("returns zero for an empty cloud rather than dividing by it", () => {
+    expect(separationProbe([])(DEFAULT_ANGLES)).toBe(0);
+  });
+
+  it("drives the code lane's separationAt", () => {
+    useDiverStore.setState({ surfacedIds: [], hintedIds: [], cloudIndex: 0 });
+    useDiverStore.getState().reset();
+    const api = createCodeApi();
+    const angles = { yaw: 31, pitch: -12, roll: 0 };
+    expect(api.separationAt(angles)).toBeCloseTo(
+      separation(project(useDiverStore.getState().points, angles)).ratio,
+      9,
+    );
+  });
+});
+
+// ── What a dive is worth ─────────────────────────────────────────────────
+
+describe("scoring and progression", () => {
+  beforeEach(() => {
+    useProgression.getState().setAdapter(createMemoryAdapter());
+    useProgression.setState({ xp: 0, games: {}, badges: [], lastGain: null });
+    useDiverStore.setState({ surfacedIds: [], hintedIds: [], cloudIndex: 0 });
+    useDiverStore.getState().reset();
+  });
+
+  const progress = () => useProgression.getState().games[SLUG];
+
+  it("gives an unhinted dive onto the optimum two stars from the sliders", () => {
+    const analysis = useDiverStore.getState().analysis;
+    useDiverStore.getState().setAngles(analysis.pcaAngles);
+    useDiverStore.getState().submit();
+    expect(progress()?.bestScore).toBeGreaterThanOrEqual(HIGH_SCORE_THRESHOLD);
+    expect(progress()?.stars).toBe(2);
+    expect(progress()?.codeLaneCleared).toBe(false);
+  });
+
+  it("gives a code-lane commit the third star", () => {
+    const api = createCodeApi();
+    api.setAngles(useDiverStore.getState().analysis.pcaAngles);
+    api.submit();
+    expect(progress()?.stars).toBe(3);
+    expect(progress()?.codeLaneCleared).toBe(true);
+  });
+
+  it("does not give the code-lane star for a commit made with the button", () => {
+    // Attribution follows the action, not whichever tab is on screen.
+    useDiverStore.getState().setLane("code");
+    useDiverStore.getState().setAngles(useDiverStore.getState().analysis.pcaAngles);
+    useDiverStore.getState().submit();
+    expect(progress()?.codeLaneCleared).toBe(false);
+  });
+
+  it("costs the high-score star when the hint was used", () => {
+    useDiverStore.getState().usePcaHint();
+    useDiverStore.getState().submit();
+    expect(progress()?.completed).toBe(true);
+    expect(progress()?.bestScore).toBeLessThan(HIGH_SCORE_THRESHOLD);
+    expect(progress()?.stars).toBe(1);
+  });
+
+  it("records a commit once, however many times submit is called", () => {
+    const api = createCodeApi();
+    api.setAngles(useDiverStore.getState().analysis.pcaAngles);
+    api.submit();
+    api.submit();
+    useDiverStore.getState().submit();
+    expect(progress()?.playCount).toBe(1);
+  });
+
+  it("gives the third star to a code commit of a projection the sliders surfaced", () => {
+    // A second submit used to be a no-op whatever its source, so committing from
+    // the code lane at the angles the sliders had already surfaced — including
+    // setAngles(pca().angles), which changes nothing — silently earned nothing.
+    const analysis = useDiverStore.getState().analysis;
+    useDiverStore.getState().setAngles(analysis.pcaAngles);
+    useDiverStore.getState().submit();
+    expect(progress()?.stars).toBe(2);
+    expect(progress()?.playCount).toBe(1);
+
+    const api = createCodeApi();
+    api.setAngles(api.pca().angles);
+    api.submit();
+    expect(progress()?.codeLaneCleared).toBe(true);
+    expect(progress()?.stars).toBe(3);
+    expect(progress()?.playCount).toBe(2);
+
+    api.submit();
+    expect(progress()?.playCount).toBe(2);
+  });
+
+  it("does not re-record a failed commit when the code lane repeats it", () => {
+    useDiverStore.getState().submit();
+    expect(useDiverStore.getState().phase).toBe("diving");
+    createCodeApi().submit();
+    expect(progress()).toBeUndefined();
+  });
+
+  it("gives no star for variance alone where a flat shadow can show the groups", () => {
+    // What the first star criterion now says: surfacing needs the groups shown
+    // wherever a plane can show them. The needle at PCA keeps the whole ceiling
+    // and records nothing.
+    useDiverStore.setState({ cloudIndex: 1 });
+    useDiverStore.getState().reset();
+    expect(cloudById("needle")).toBe(CLOUDS[1]);
+    const state = useDiverStore.getState();
+    state.setAngles(state.analysis.pcaAngles);
+    useDiverStore.getState().submit();
+    const { evaluation } = useDiverStore.getState();
+    expect(evaluation.share).toBeGreaterThanOrEqual(VARIANCE_TARGET);
+    expect(evaluation.outcome).toBe("mixed");
+    expect(progress()).toBeUndefined();
+  });
+});
+
+describe("the starter snippet", () => {
+  beforeEach(() => {
+    useProgression.getState().setAdapter(createMemoryAdapter());
+    useProgression.setState({ xp: 0, games: {}, badges: [], lastGain: null });
+    useDiverStore.setState({ surfacedIds: [], hintedIds: [], cloudIndex: 0 });
+    useDiverStore.getState().reset();
+  });
+
+  it("runs against the real api, and leaves the commit to the player", async () => {
+    const logs: string[] = [];
+    await createJsExecutor<ReturnType<typeof createCodeApi>>()(STARTER_CODE, {
+      api: createCodeApi(),
+      log: (...args: unknown[]) => logs.push(args.map(String).join(" ")),
+      checkBudget: () => {},
+    });
+    const output = logs.join("\n");
+    expect(output).toMatch(/max sep within target/);
+    expect(output).toMatch(/api\.submit\(\)/);
+    // It measures; it does not play. Nothing was committed or recorded.
+    expect(useDiverStore.getState().submitted).toBe(false);
+    expect(useProgression.getState().games[SLUG]).toBeUndefined();
+  }, 60000);
+});
+
+describe("the code lane rejects bad angles by name", () => {
+  beforeEach(() => {
+    useDiverStore.setState({ surfacedIds: [], hintedIds: [], cloudIndex: 0 });
+    useDiverStore.getState().reset();
+  });
+
+  it("rejects something that is not an angles object", () => {
+    const api = createCodeApi();
+    expect(() => api.setAngles(30 as unknown as { yaw: number })).toThrow(
+      /Angles are an object/,
+    );
+    expect(() => api.retainedAt(null as unknown as { yaw: number })).toThrow(
+      /Angles are an object/,
+    );
+  });
+
+  it("rejects a misspelt axis instead of silently ignoring it", () => {
+    const api = createCodeApi();
+    expect(() =>
+      api.setAngles({ yaw: 10, pich: 5 } as unknown as { yaw: number }),
+    ).toThrow(/Unknown angle "pich"/);
+  });
+
+  it("rejects a non-number by name", () => {
+    const api = createCodeApi();
+    expect(() => api.setAngles({ yaw: "30" as unknown as number })).toThrow(
+      /yaw must be a finite number/,
+    );
   });
 });

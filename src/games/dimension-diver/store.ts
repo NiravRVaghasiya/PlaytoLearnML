@@ -12,7 +12,7 @@ import {
   buildCloud,
   evaluate,
   project,
-  separation,
+  separationProbe,
   varianceRetained,
   type Analysis,
   type Angles,
@@ -44,10 +44,11 @@ export type AxisName = "yaw" | "pitch" | "roll";
  * it comes from, because it is a property of the cloud rather than of the game.
  *
  * `analysis` IS cached, and that is a deliberate exception to deriving everything.
- * It contains a sweep over a thousand candidate planes to find the best reachable
- * separation, which is milliseconds but is also completely independent of the player
- * — recomputing it on every slider tick would be work done to produce the same
- * answer. It is invalidated by exactly one thing: changing cloud.
+ * It contains two sweeps over a thousand candidate planes to find the best
+ * reachable separation — tens of milliseconds, measured, not the "milliseconds"
+ * this comment used to claim — and it is completely independent of the player.
+ * It is computed once per cloud per page (see `cloudData`), so turning the cloud,
+ * retrying it and coming back to it all reuse the same answer.
  */
 export interface DiverState {
   cloudIndex: number;
@@ -57,10 +58,26 @@ export interface DiverState {
   angles: Angles;
   /** True once the player has committed, which is when a verdict may be named. */
   submitted: boolean;
-  /** Whether the PCA hint was used on this cloud. Costs the third star. */
+  /**
+   * Whether the PCA hint has been used on this cloud. Multiplies the recorded
+   * score by `HINT_FACTOR`, which costs the high-score star, not the third one
+   * (that is the code-lane star, and the hint has nothing to do with it).
+   */
   hintUsed: boolean;
+  /**
+   * Cloud ids the hint has been used on this session. Survives "Start this cloud
+   * again" on purpose: the hint prints the exact angles on screen, so a restart
+   * followed by typing them back in used to earn the unpenalised score.
+   */
+  hintedIds: string[];
   /** Cloud ids surfaced this session. */
   surfacedIds: string[];
+  /**
+   * This round has already sent progression a code-lane surfacing. Lets a code
+   * commit of a projection the sliders already surfaced record once as code —
+   * the third star — instead of being swallowed as "the same verdict again".
+   */
+  codeRecorded: boolean;
 
   evaluation: Evaluation;
   phase: Phase;
@@ -74,7 +91,13 @@ export interface DiverState {
   setAngle: (axis: AxisName, degrees: number) => void;
   setAngles: (angles: Partial<Angles>) => void;
   nudge: (axis: AxisName, delta: number) => void;
-  submit: () => void;
+  /**
+   * Commit the current projection. `source` is where the commit came from, so XP
+   * and the code-lane star follow the action rather than the visible tab.
+   * A second commit of the same projection is a no-op: it is the same verdict —
+   * unless it is the code lane's first commit of a surfaced one (`codeRecorded`).
+   */
+  submit: (source?: Lane) => void;
   /** Snap to the PCA plane and say what it is. */
   usePcaHint: () => void;
   toggleGroups: () => void;
@@ -103,38 +126,108 @@ export function shadowFor(state: DiverState): Shadow[] {
   return project(state.points, state.angles);
 }
 
-function freshCloud(cloudIndex: number) {
+/**
+ * A cloud, its analysis, and its untouched verdict — built once per page.
+ *
+ * All three are pure functions of the cloud id and the fixed seed, so rebuilding
+ * them on every retry and every return to a cloud was the same work producing the
+ * same answer. Reusing the same `points` array also means the 3D view keeps its
+ * WebGL renderer across a retry instead of building a new one.
+ */
+const cloudCache = new Map<
+  number,
+  { points: Point3D[]; analysis: Analysis; evaluation: Evaluation }
+>();
+
+function cloudData(cloudIndex: number) {
+  const cached = cloudCache.get(cloudIndex);
+  if (cached !== undefined) return cached;
   const points = buildCloud(CLOUDS[cloudIndex]!.id, CLOUD_SEED);
   const analysis = analyse(points);
-  return {
-    cloudIndex,
+  const entry = {
     points,
     analysis,
-    angles: { ...DEFAULT_ANGLES },
-    submitted: false,
-    hintUsed: false,
-    showGroups: false,
     evaluation: evaluate({
       points,
       analysis,
       angles: DEFAULT_ANGLES,
       submitted: false,
     }),
+  };
+  cloudCache.set(cloudIndex, entry);
+  return entry;
+}
+
+/** The api's `separationAt`, one allocation-free probe per cloud. */
+const probes = new WeakMap<readonly Point3D[], ReturnType<typeof separationProbe>>();
+function probeFor(points: readonly Point3D[]) {
+  let probe = probes.get(points);
+  if (probe === undefined) {
+    probe = separationProbe(points);
+    probes.set(points, probe);
+  }
+  return probe;
+}
+
+function freshCloud(cloudIndex: number, hintedIds: readonly string[] = []) {
+  const { points, analysis, evaluation } = cloudData(cloudIndex);
+  return {
+    cloudIndex,
+    points,
+    analysis,
+    angles: { ...DEFAULT_ANGLES },
+    submitted: false,
+    hintUsed: hintedIds.includes(CLOUDS[cloudIndex]!.id),
+    showGroups: false,
+    evaluation,
     phase: "diving" as Phase,
     failure: null,
+    codeRecorded: false,
   };
 }
 
-const normalise = (degrees: number): number => {
-  // Wrap into -180..180 so the sliders never wander off into multiples of a turn.
-  let value = degrees;
-  while (value > 180) value -= 360;
-  while (value < -180) value += 360;
-  return value;
+/**
+ * Wrap into -180..180 so the sliders never wander off into multiples of a turn.
+ *
+ * One modulo, not a loop. The first version subtracted 360 until the value was in
+ * range, and a code-lane angle of 1e20 never got there — 1e20 − 360 is 1e20 in
+ * floating point — so the tab hung inside the api where `checkBudget` cannot
+ * reach. In-range values pass through untouched, so both ends of the slider stay
+ * where the player put them.
+ */
+export const normalise = (degrees: number): number => {
+  if (degrees >= -180 && degrees <= 180) return degrees;
+  const wrapped = ((degrees % 360) + 360) % 360;
+  return wrapped > 180 ? wrapped - 360 : wrapped;
 };
+
+/** The hint's price: the same 0.7 Backprop Blitz charges for its trace. */
+export const HINT_FACTOR = 0.7;
+
+/**
+ * What a surfaced dive is worth to progression, 0–1: the verdict's own score,
+ * the hint's price, and a campaign term so surfacing more clouds is worth more.
+ * Rounded to six places so a formula that lands on 0.8 lands on it exactly.
+ */
+export function diveScore({
+  evaluationScore,
+  hinted,
+  surfacedCount,
+}: {
+  evaluationScore: number;
+  hinted: boolean;
+  surfacedCount: number;
+}): number {
+  const raw =
+    evaluationScore *
+    (hinted ? HINT_FACTOR : 1) *
+    (0.75 + 0.25 * (clamp(surfacedCount, 0, CLOUDS.length) / CLOUDS.length));
+  return Math.round(clamp(raw, 0, 1) * 1e6) / 1e6;
+}
 
 export const useDiverStore = create<DiverState>((set, get) => ({
   ...freshCloud(0),
+  hintedIds: [],
   surfacedIds: [],
   whyCard: whyCardFor({ kind: "briefing", cloud: CLOUDS[0]! }),
   lane: "visual" as Lane,
@@ -152,6 +245,9 @@ export const useDiverStore = create<DiverState>((set, get) => ({
       pitch: clamp(partial.pitch ?? state.angles.pitch, -90, 90),
       roll: normalise(partial.roll ?? state.angles.roll),
     };
+    // A NaN would poison every derived number on screen. The code lane refuses
+    // one by name before it gets here; this is the store refusing it too.
+    if (![angles.yaw, angles.pitch, angles.roll].every(Number.isFinite)) return;
     if (
       angles.yaw === state.angles.yaw &&
       angles.pitch === state.angles.pitch &&
@@ -197,8 +293,15 @@ export const useDiverStore = create<DiverState>((set, get) => ({
     get().setAngles({ [axis]: state.angles[axis] + delta });
   },
 
-  submit: () => {
+  submit: (source = "visual") => {
     const state = get();
+    // Already judged, and nothing has moved since: the same verdict again, so it
+    // must not be recorded again (running a snippet twice, say). Except once: a
+    // code commit of a projection the sliders surfaced is the round's first
+    // code-lane surfacing, and dropping it would silently withhold the third star.
+    const firstCodeSurfacing =
+      source === "code" && state.phase === "surfaced" && !state.codeRecorded;
+    if (state.submitted && !firstCodeSurfacing) return;
     const evaluation = evaluate({
       points: state.points,
       analysis: state.analysis,
@@ -216,6 +319,7 @@ export const useDiverStore = create<DiverState>((set, get) => ({
       showGroups: true,
       phase: surfaced ? "surfaced" : "diving",
       failure: evaluation.failure,
+      codeRecorded: state.codeRecorded || (surfaced && source === "code"),
       surfacedIds:
         surfaced && !state.surfacedIds.includes(cloud.id)
           ? [...state.surfacedIds, cloud.id]
@@ -235,16 +339,14 @@ export const useDiverStore = create<DiverState>((set, get) => ({
         : state.surfacedIds.length + 1;
       useProgression.getState().recordResult({
         slug: SLUG,
-        score: clamp(
-          evaluation.score *
-            (state.hintUsed ? 0.7 : 1) *
-            (0.75 + 0.25 * (surfacedCount / CLOUDS.length)),
-          0,
-          1,
-        ),
-        lane: state.lane,
+        score: diveScore({
+          evaluationScore: evaluation.score,
+          hinted: state.hintUsed,
+          surfacedCount,
+        }),
+        lane: source,
         completed: true,
-        codeLaneCleared: state.lane === "code",
+        codeLaneCleared: source === "code",
       });
     }
   },
@@ -258,9 +360,13 @@ export const useDiverStore = create<DiverState>((set, get) => ({
       angles,
       submitted: false,
     });
+    const cloud = cloudSpec(state);
     set({
       angles,
       hintUsed: true,
+      hintedIds: state.hintedIds.includes(cloud.id)
+        ? state.hintedIds
+        : [...state.hintedIds, cloud.id],
       submitted: false,
       phase: "diving",
       failure: null,
@@ -279,7 +385,7 @@ export const useDiverStore = create<DiverState>((set, get) => ({
     const state = get();
     const next = (state.cloudIndex + 1) % CLOUDS.length;
     set({
-      ...freshCloud(next),
+      ...freshCloud(next, state.hintedIds),
       surfacedIds: state.surfacedIds,
       whyCard: whyCardFor({ kind: "briefing", cloud: CLOUDS[next]! }),
     });
@@ -288,7 +394,7 @@ export const useDiverStore = create<DiverState>((set, get) => ({
   reset: () => {
     const state = get();
     set({
-      ...freshCloud(state.cloudIndex),
+      ...freshCloud(state.cloudIndex, state.hintedIds),
       surfacedIds: state.surfacedIds,
       whyCard: whyCardFor({ kind: "briefing", cloud: CLOUDS[state.cloudIndex]! }),
     });
@@ -339,6 +445,16 @@ export function createCodeApi(): DiverCodeApi {
   const store = useDiverStore;
 
   const anglesFrom = (partial: Partial<Angles>): Angles => {
+    if (partial === null || typeof partial !== "object" || Array.isArray(partial)) {
+      throw new Error(
+        "Angles are an object of degrees, like { yaw: 30, pitch: -15, roll: 0 }.",
+      );
+    }
+    for (const key of Object.keys(partial)) {
+      if (key !== "yaw" && key !== "pitch" && key !== "roll") {
+        throw new Error(`Unknown angle "${key}". Use yaw, pitch and roll.`);
+      }
+    }
     const current = store.getState().angles;
     const merged = {
       yaw: partial.yaw ?? current.yaw,
@@ -355,7 +471,7 @@ export function createCodeApi(): DiverCodeApi {
 
   return {
     setAngles: (angles) => store.getState().setAngles(anglesFrom(angles)),
-    submit: () => store.getState().submit(),
+    submit: () => store.getState().submit("code"),
     nextCloud: () => store.getState().nextCloud(),
     reset: () => store.getState().reset(),
 
@@ -385,7 +501,9 @@ export function createCodeApi(): DiverCodeApi {
 
     separationAt: (angles) => {
       const state = store.getState();
-      return separation(project(state.points, anglesFrom(angles))).ratio;
+      // Same number as `separation(project(...)).ratio`, held to it by the tests,
+      // without building a shadow — the starter snippet asks for 3,660 of these.
+      return probeFor(state.points)(anglesFrom(angles));
     },
 
     pca: () => {
