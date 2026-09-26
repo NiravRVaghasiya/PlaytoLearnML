@@ -4,8 +4,7 @@ import { useMemo } from "react";
 import { Play, RotateCcw } from "lucide-react";
 import { Button, CodeEditor } from "@/components";
 import { useCodeLane } from "@/engine/useCodeLane";
-import { GLOBAL_MINIMUM, gradientAt, gradientNorm, lossAt } from "./ml";
-import { useGradientSkierStore } from "./store";
+import { createCodeApi } from "./store";
 
 /**
  * Gradient Descent Skier — the code lane.
@@ -45,60 +44,9 @@ log('verdict', api.check().outcome);
 // Then try setLearningRate(1.0) and watch it leave the mountain.`;
 
 export function CodeLane() {
-  const store = useGradientSkierStore;
-
-  const api = useMemo(
-    () => ({
-      /** One gradient step. Same action as the Step button. */
-      step: () => store.getState().step(),
-      /** Step until settled, diverged, or out of budget. */
-      runToEnd: () => store.getState().runToEnd(),
-
-      /** THE dial: α in the update rule. */
-      setLearningRate: (rate: number) => {
-        if (!Number.isFinite(rate)) {
-          throw new Error("setLearningRate needs a finite number");
-        }
-        store.getState().setLearningRate(rate);
-      },
-      /** β in the update rule. */
-      setMomentum: (momentum: number) => {
-        if (!Number.isFinite(momentum)) {
-          throw new Error("setMomentum needs a finite number");
-        }
-        store.getState().setMomentum(momentum);
-      },
-
-      learningRate: () => store.getState().skier.learningRate,
-      momentum: () => store.getState().skier.momentum,
-
-      position: () => ({ ...store.getState().skier.pos }),
-      velocity: () => ({ ...store.getState().skier.velocity }),
-      /** Live loss — the same number the metric shows. */
-      loss: () => store.getState().currentLoss,
-      /** The exact gradient at the skier's feet. */
-      gradient: () => ({ ...store.getState().gradient }),
-      slope: () => gradientNorm(store.getState().gradient),
-
-      /** Loss anywhere on the surface, without moving. */
-      lossAt: (x: number, y: number) => lossAt(x, y),
-      /** Gradient anywhere on the surface, without moving. */
-      gradientAt: (x: number, y: number) => gradientAt(x, y),
-      globalMinimum: () => ({ ...GLOBAL_MINIMUM }),
-
-      steps: () => store.getState().stepsTaken,
-      stepsRemaining: () => store.getState().stepsRemaining,
-      overshoots: () => store.getState().overshoots,
-      settled: () => store.getState().settled,
-      diverged: () => store.getState().diverged,
-      trail: () => store.getState().trail.map((point) => ({ ...point })),
-
-      check: () => store.getState().check(),
-      /** Back to the top of the mountain, keeping the dials. */
-      reset: () => store.getState().reset(),
-    }),
-    [store],
-  );
+  // Built in the store module so its argument checking is unit-tested; the
+  // verbs are the same store actions the rail's buttons call (two-lane rule).
+  const api = useMemo(() => createCodeApi(), []);
 
   const lane = useCodeLane({ initialCode: STARTER_CODE, api, maxRunMs: 8000 });
 

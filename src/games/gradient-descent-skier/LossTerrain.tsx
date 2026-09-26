@@ -14,6 +14,12 @@ export interface LossTerrainProps {
   trail: readonly Vec2[];
   position: Vec2;
   diverged: boolean;
+  /**
+   * WebGL turned out not to work after all — the renderer could not be built,
+   * or the browser took the context away (a GPU reset, a backgrounded tab on
+   * iOS). The lane falls back to the contour view rather than a dead canvas.
+   */
+  onUnavailable?: () => void;
 }
 
 /**
@@ -26,24 +32,24 @@ export interface LossTerrainProps {
  * different read of the surface get the contour view, which is a full equal and
  * not a fallback.
  *
- * `isWebGLAvailable` is exported so the lane can choose the contour view *before*
- * mounting this, rather than showing a broken canvas.
+ * The lane asks the shared `isWebGLAvailable()` in `@/lib/utils` so it can
+ * choose the contour view *before* mounting this, rather than showing a broken
+ * canvas.
+ *
+ * ── GPU etiquette ────────────────────────────────────────────────────────────
+ * Nothing in this scene moves on its own — the camera is fixed and the skier
+ * only moves when the store does — so it renders on demand: after setup, after
+ * a resize, and after each change to the skier or the trail. It used to redraw
+ * a 9,216-vertex mesh twice over, 60 times a second, for as long as the lane
+ * was open: battery and heat on a phone, for a picture that wasn't changing.
+ *
+ * Browsers cap live WebGL contexts (Chrome: 16) and silently kill the oldest
+ * when the cap is hit — which in a single-page session can be the TF.js
+ * backend of another game. So the capability probe runs once per page and
+ * releases its context (the shared helper does both), and unmount forces the
+ * renderer's context loss rather than waiting for garbage collection.
+ * `renderer.dispose()` alone frees buffers, not the context.
  */
-
-/** Can this browser actually give us a WebGL context? */
-export function isWebGLAvailable(): boolean {
-  if (typeof document === "undefined") return false;
-  try {
-    const canvas = document.createElement("canvas");
-    return Boolean(
-      canvas.getContext("webgl2") ??
-        canvas.getContext("webgl") ??
-        canvas.getContext("experimental-webgl"),
-    );
-  } catch {
-    return false;
-  }
-}
 
 const GRID = 96;
 /** World units the domain maps onto. */
@@ -61,12 +67,21 @@ function toWorld(x: number, y: number): THREE.Vector3 {
   );
 }
 
-export function LossTerrain({ trail, position, diverged }: LossTerrainProps) {
+export function LossTerrain({
+  trail,
+  position,
+  diverged,
+  onUnavailable,
+}: LossTerrainProps) {
   const mountRef = useRef<HTMLDivElement>(null);
   const skierRef = useRef<THREE.Mesh | null>(null);
   const trailRef = useRef<THREE.Line | null>(null);
-  const sceneRef = useRef<THREE.Scene | null>(null);
-  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  /** Draw one frame. Null until the scene exists, and again after unmount. */
+  const renderRef = useRef<(() => void) | null>(null);
+  const onUnavailableRef = useRef(onUnavailable);
+  useEffect(() => {
+    onUnavailableRef.current = onUnavailable;
+  });
 
   // Scene setup, once.
   useEffect(() => {
@@ -77,7 +92,9 @@ export function LossTerrain({ trail, position, diverged }: LossTerrainProps) {
     try {
       renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     } catch {
-      // The lane checks isWebGLAvailable() first, so this is belt-and-braces.
+      // The lane checks isWebGLAvailable() first, but a context can still be
+      // refused here (too many live contexts, a blocklisted GPU). Fall back.
+      onUnavailableRef.current?.();
       return;
     }
 
@@ -89,6 +106,17 @@ export function LossTerrain({ trail, position, diverged }: LossTerrainProps) {
     renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
     mount.appendChild(renderer.domElement);
     renderer.domElement.setAttribute("aria-hidden", "true");
+    // Sized in CSS pixels here, not by the drawing buffer: the buffer is
+    // width × devicePixelRatio, and letting it size the element made the
+    // canvas twice the lane's width on a phone.
+    renderer.domElement.style.display = "block";
+    renderer.domElement.style.width = "100%";
+
+    const onContextLost = (event: Event) => {
+      event.preventDefault();
+      onUnavailableRef.current?.();
+    };
+    renderer.domElement.addEventListener("webglcontextlost", onContextLost);
 
     // Terrain mesh: a plane whose vertices are displaced by the real loss.
     const geometry = new THREE.PlaneGeometry(
@@ -196,32 +224,30 @@ export function LossTerrain({ trail, position, diverged }: LossTerrainProps) {
     scene.add(line);
     trailRef.current = line;
 
-    sceneRef.current = scene;
-    rendererRef.current = renderer;
+    const render = () => renderer.render(scene, camera);
+    renderRef.current = render;
 
     const resize = () => {
       const width = mount.clientWidth;
+      if (width === 0) return;
       const height = Math.max(220, Math.round(width * 0.62));
+      // updateStyle false: the buffer follows the pixel ratio, while the
+      // element stays at 100% of the lane (above) and this CSS height.
       renderer.setSize(width, height, false);
+      renderer.domElement.style.height = `${height}px`;
       camera.aspect = width / height;
       camera.updateProjectionMatrix();
-      renderer.render(scene, camera);
+      render();
     };
 
     resize();
     const observer = new ResizeObserver(resize);
     observer.observe(mount);
 
-    let frame = 0;
-    const loop = () => {
-      renderer.render(scene, camera);
-      frame = requestAnimationFrame(loop);
-    };
-    frame = requestAnimationFrame(loop);
-
     return () => {
-      cancelAnimationFrame(frame);
+      renderRef.current = null;
       observer.disconnect();
+      renderer.domElement.removeEventListener("webglcontextlost", onContextLost);
       // Three.js holds GPU buffers that survive garbage collection, so dispose
       // explicitly — the same discipline useModel applies to tensors.
       scene.traverse((object) => {
@@ -233,11 +259,12 @@ export function LossTerrain({ trail, position, diverged }: LossTerrainProps) {
         }
       });
       renderer.dispose();
+      // dispose() frees buffers but leaves the context alive until GC; give
+      // it back now, so lane toggles and Retries don't stack up contexts.
+      renderer.forceContextLoss();
       if (renderer.domElement.parentNode === mount) {
         mount.removeChild(renderer.domElement);
       }
-      sceneRef.current = null;
-      rendererRef.current = null;
       skierRef.current = null;
       trailRef.current = null;
     };
@@ -270,6 +297,9 @@ export function LossTerrain({ trail, position, diverged }: LossTerrainProps) {
       line.geometry.dispose();
       line.geometry = new THREE.BufferGeometry().setFromPoints(points);
     }
+
+    // The one frame this change needs.
+    renderRef.current?.();
   }, [trail, position, diverged]);
 
   return <div ref={mountRef} className="w-full" />;

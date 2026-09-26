@@ -1,13 +1,13 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Box, Map as MapIcon } from "lucide-react";
 import { Button } from "@/components";
-import { cx } from "@/lib/utils";
+import { cx, isWebGLAvailable } from "@/lib/utils";
 import { GLOBAL_MINIMUM, STEP_BUDGET, gradientNorm } from "./ml";
 import { useGradientSkierStore } from "./store";
 import { ContourView } from "./ContourView";
-import { LossTerrain, isWebGLAvailable } from "./LossTerrain";
+import { LossTerrain } from "./LossTerrain";
 
 /**
  * Gradient Descent Skier — the no-code lane.
@@ -39,10 +39,17 @@ export function VisualLane() {
    * means the first paint already knows which view to show, instead of rendering
    * the contour map and then swapping.
    */
-  const webgl = useMemo(() => isWebGLAvailable(), []);
+  const probed = useMemo(() => isWebGLAvailable(), []);
+  /** Flips to false if the renderer fails or loses its context after mounting. */
+  const [rendererOk, setRendererOk] = useState(true);
+  const webgl = probed && rendererOk;
   const [view, setView] = useState<"terrain" | "contour">(
-    webgl ? "terrain" : "contour",
+    probed ? "terrain" : "contour",
   );
+  const onTerrainUnavailable = useCallback(() => {
+    setRendererOk(false);
+    setView("contour");
+  }, []);
 
   /** Loss sparkline — the spec's "loss drops as you descend, spikes red". */
   const sparkline = useMemo(() => {
@@ -102,15 +109,22 @@ export function VisualLane() {
 
       {!webgl ? (
         <p className="rounded-md border border-warn/40 bg-warn/10 p-2 text-xs text-warn">
-          This browser has no WebGL, so the 3-D mountain is unavailable. The
-          contour map below shows the same surface, the same path, and the same
-          numbers.
+          {probed
+            ? "The 3-D mountain couldn't get or keep a WebGL context in this browser, so it has switched to the contour map."
+            : "This browser has no WebGL, so the 3-D mountain is unavailable."}{" "}
+          The contour map below shows the same surface, the same path, and the
+          same numbers.
         </p>
       ) : null}
 
       <div className="min-h-0 flex-1">
         {view === "terrain" && webgl ? (
-          <LossTerrain trail={trail} position={skier.pos} diverged={diverged} />
+          <LossTerrain
+            trail={trail}
+            position={skier.pos}
+            diverged={diverged}
+            onUnavailable={onTerrainUnavailable}
+          />
         ) : (
           <ContourView
             trail={trail}
@@ -129,10 +143,11 @@ export function VisualLane() {
           <h2 className="text-xs font-semibold tracking-wide text-text-muted uppercase">
             Loss so far
           </h2>
+          {/* Static, not the shared blink: at the bottom of each pulse this
+              label measured 1.8:1. The sparkline and the metric turning amber
+              already draw the eye. */}
           {lastStepOvershot ? (
-            <span className="flash-wrong font-mono text-xs text-wrong">
-              overshoot
-            </span>
+            <span className="font-mono text-xs text-wrong">overshoot</span>
           ) : null}
         </div>
         <svg

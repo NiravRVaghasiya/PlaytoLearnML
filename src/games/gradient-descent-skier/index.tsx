@@ -4,7 +4,11 @@ import { useEffect } from "react";
 import { FastForward, RotateCcw, Sparkles, StepForward } from "lucide-react";
 import { Button, Dial, Slider, type MetricSpec } from "@/components";
 import { GameShell } from "@/engine/GameShell";
-import { levelFromXp, useProgression } from "@/engine/progression";
+import {
+  HIGH_SCORE_THRESHOLD,
+  levelFromXp,
+  useProgression,
+} from "@/engine/progression";
 import { getGameMeta } from "@/lib/catalog";
 import {
   GLOBAL_MINIMUM,
@@ -17,15 +21,21 @@ import {
   STEP_BUDGET,
   WIN_SCORE,
   gradientNorm,
+  nextStepLength,
 } from "./ml";
 import { SLUG, useGradientSkierStore } from "./store";
 import { VisualLane } from "./VisualLane";
 import { CodeLane } from "./CodeLane";
 
+/**
+ * The engine's star rule, stated exactly: ★ reached the deepest valley (a slow
+ * arrival counts), ★★ best score at least HIGH_SCORE_THRESHOLD, ★★★ that plus a
+ * run scored from the code lane.
+ */
 const STAR_CRITERIA = [
   "Reach the deepest valley",
-  `Score ${Math.round(WIN_SCORE * 100)}% or better`,
-  "Reach it from the code lane",
+  `Score ${Math.round(HIGH_SCORE_THRESHOLD * 100)}% or better`,
+  `Score ${Math.round(HIGH_SCORE_THRESHOLD * 100)}% with a run checked from the code lane`,
 ];
 
 function Controls() {
@@ -45,6 +55,10 @@ function Controls() {
 
   const finished = diverged || settled || stepsRemaining <= 0;
   const slope = gradientNorm(gradient);
+  // The step the update rule will actually take next — momentum included.
+  const nextStep = nextStepLength(skier);
+  const carrying =
+    skier.momentum > 0 && Math.hypot(skier.velocity.x, skier.velocity.y) > 0;
 
   return (
     <div className="flex flex-col gap-4">
@@ -59,14 +73,19 @@ function Controls() {
           scale="log"
           onChange={setLearningRate}
           format={(value) => value.toPrecision(2)}
-          hint="Multiplier on the slope. Arrow keys, or drag up and down."
+          hint="Multiplier on the slope. Arrow keys, the − and + buttons, or drag up and down."
         />
         <p className="text-center text-xs text-text-muted">
-          slope {slope.toFixed(2)} × rate {skier.learningRate.toPrecision(2)} ≈{" "}
-          <span className="font-mono">
-            {(slope * skier.learningRate).toFixed(3)}
-          </span>{" "}
-          of travel next step
+          {finished ? (
+            "Run over — Back to the top to use this rate."
+          ) : (
+            <>
+              slope {slope.toFixed(2)} × rate {skier.learningRate.toPrecision(2)}
+              {carrying ? ` + ${skier.momentum.toFixed(2)} × last step` : ""} ≈{" "}
+              <span className="font-mono">{nextStep.toFixed(3)}</span> of travel
+              next step
+            </>
+          )}
         </p>
       </div>
 
@@ -78,7 +97,7 @@ function Controls() {
         step={0.01}
         onChange={setMomentum}
         format={(value) => value.toFixed(2)}
-        hint="How much of the previous step carries over. Needed to cross a ridge."
+        hint="How much of the previous step carries over. Can carry you across a ridge — or past a valley."
       />
 
       <fieldset className="border-t border-border pt-4">
@@ -121,7 +140,9 @@ function Controls() {
         <Button
           variant="primary"
           className="w-full"
-          onClick={check}
+          // The rail is visible from both lanes, so a press here is credited
+          // to the visual lane; api.check() is the code-lane route.
+          onClick={() => check("visual")}
           icon={<Sparkles className="size-4" />}
         >
           Score this run

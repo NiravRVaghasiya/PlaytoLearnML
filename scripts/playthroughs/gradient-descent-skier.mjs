@@ -38,7 +38,11 @@ export async function run({ page, check, metricText }) {
   const webglAvailable = await page.evaluate(() => {
     try {
       const canvas = document.createElement("canvas");
-      return Boolean(canvas.getContext("webgl2") ?? canvas.getContext("webgl"));
+      const context = canvas.getContext("webgl2") ?? canvas.getContext("webgl");
+      // Release the probe's context rather than leaving it to count against
+      // the browser's cap of live WebGL contexts.
+      context?.getExtension("WEBGL_lose_context")?.loseContext();
+      return Boolean(context);
     } catch {
       return false;
     }
@@ -56,6 +60,21 @@ export async function run({ page, check, metricText }) {
       "the terrain canvas is hidden from assistive tech",
       (await page.locator("canvas").first().getAttribute("aria-hidden")) ===
         "true",
+    );
+    // The drawing buffer is width × devicePixelRatio; the element must still
+    // be exactly as wide as the lane, or a phone's layout doubles in width.
+    const sizes = await page.evaluate(() => {
+      const canvas = document.querySelector("canvas");
+      if (!canvas || !canvas.parentElement) return null;
+      return {
+        canvas: canvas.getBoundingClientRect().width,
+        lane: canvas.parentElement.getBoundingClientRect().width,
+      };
+    });
+    check(
+      "the terrain canvas is sized to its lane in CSS pixels",
+      sizes !== null && Math.abs(sizes.canvas - sizes.lane) <= 1,
+      sizes ? `${sizes.canvas}px in ${sizes.lane}px` : "no canvas",
     );
     // Now switch to the fallback and confirm it stands alone.
     await page.getByRole("button", { name: "Contour" }).click();
@@ -158,6 +177,11 @@ export async function run({ page, check, metricText }) {
       "failure detail carries real numbers",
       /\d+\.\d+/.test(text),
       text.replace(/\n/g, " ").slice(0, 120),
+    );
+    check(
+      "and names a change that was actually run and reaches the bottom",
+      /momentum 0\.85 reaches the deepest valley/.test(text),
+      text.replace(/\n/g, " ").slice(-120),
     );
     check(
       "retry is one click away inside the alert",

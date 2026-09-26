@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   EMPTY_PROGRESSION,
+  HIGH_SCORE_THRESHOLD,
   createMemoryAdapter,
   useProgression,
 } from "@/engine/progression";
@@ -19,10 +20,14 @@ import {
   MIN_LEARNING_RATE,
   OVERSHOOT_DELTA,
   REACH_TOLERANCE,
+  RIDGE_X,
+  STABLE_RATE,
   START,
   START_LOSS,
   STEP_BUDGET,
+  UPHILL_DELTA,
   WIN_SCORE,
+  curvatureX,
   descend,
   distanceTo,
   evaluate,
@@ -31,9 +36,11 @@ import {
   lossAt,
   makeSkier,
   nearestMinimum,
+  nextStepLength,
   step,
+  type Outcome,
 } from "./ml";
-import { useGradientSkierStore } from "./store";
+import { createCodeApi, useGradientSkierStore } from "./store";
 import { whyCardFor } from "./why-cards";
 
 /** Central difference, for checking the analytic gradient. */
@@ -57,9 +64,14 @@ const run = (learningRate: number, momentum = 0) => {
       learningRate,
       momentum,
       overshoots: result.overshoots,
+      rises: result.rises,
+      minX: result.minX,
     }),
   };
 };
+
+const reachesBottom = (outcome: Outcome) =>
+  outcome === "win" || outcome === "near-miss";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // THE LESSON
@@ -504,7 +516,10 @@ describe("store", () => {
       lossAt(state.skier.pos.x, state.skier.pos.y),
       12,
     );
-    expect(state.gradient).toEqual(
+    // The slope at the skier's feet — where the NEXT step starts — not the
+    // one the last step used, which is where the skier used to be.
+    expect(state.gradient).toEqual(gradientAt(state.skier.pos.x, state.skier.pos.y));
+    expect(state.gradient).not.toEqual(
       gradientAt(state.trail.at(-2)!.x, state.trail.at(-2)!.y),
     );
   });
@@ -623,12 +638,11 @@ describe("store", () => {
     );
   });
 
-  it("credits the code lane for the third star", () => {
-    useGradientSkierStore.getState().setLane("code");
+  it("credits the code lane for the third star when the check comes from api.check()", () => {
     useGradientSkierStore.getState().setLearningRate(0.1);
     useGradientSkierStore.getState().setMomentum(0.85);
     useGradientSkierStore.getState().runToEnd();
-    useGradientSkierStore.getState().check();
+    useGradientSkierStore.getState().check("code");
 
     const record = useProgression.getState().games["gradient-descent-skier"];
     expect(record?.codeLaneCleared).toBe(true);
@@ -687,6 +701,8 @@ describe("why-cards", () => {
       learningRate: 0.2,
       previous: 0.05,
       gradient: gradientAt(START.x, START.y),
+      skier: makeSkier(0.2, 0),
+      finished: false,
     });
     expect(card.body).toMatch(/multiplier on the slope/i);
     expect(card.body).toMatch(/not a speed/i);
@@ -750,6 +766,7 @@ describe("why-cards", () => {
       pos: { x: 1.4, y: 0.3 },
       learningRate: 0.5,
       momentum: 0,
+      minX: 1.4,
     });
     expect(card.title).toMatch(/overshot/i);
     expect(card.body).toMatch(/past the valley floor/i);
@@ -768,6 +785,7 @@ describe("why-cards", () => {
       pos: { x: GLOBAL_MINIMUM.x, y: 0 },
       learningRate: 0.1,
       momentum: 0.85,
+      minX: GLOBAL_MINIMUM.x - 0.4,
     });
     const inLocal = whyCardFor({
       kind: "stepped",
@@ -780,10 +798,551 @@ describe("why-cards", () => {
       pos: { x: LOCAL_MINIMA[0]!.x, y: 0 },
       learningRate: 0.1,
       momentum: 0,
+      minX: LOCAL_MINIMA[0]!.x,
     });
 
     expect(inGlobal.tone).toBe("good");
     expect(inLocal.tone).toBe("warn");
     expect(inLocal.body).toMatch(/shallow/i);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Honest diagnosis when momentum is involved
+//
+// The first version of the verdict copy was written as if β were always 0. It
+// blamed the learning rate for divergence that momentum caused, told a skier
+// who had overshot the deep valley and rolled back that it lacked momentum,
+// and promised "halve it and the same descent settles" for oscillation where
+// halving doesn't help. These pin the replacement to what actually happens.
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("the surface's landmarks", () => {
+  it("puts the ridge between the valleys, at the top of the slope", () => {
+    expect(RIDGE_X).toBeGreaterThan(GLOBAL_MINIMUM.x);
+    expect(RIDGE_X).toBeLessThan(LOCAL_MINIMA[0]!.x);
+    expect(Math.abs(gradientAt(RIDGE_X, 0).x)).toBeLessThan(1e-9);
+    expect(lossAt(RIDGE_X - 0.05, 0)).toBeLessThan(lossAt(RIDGE_X, 0));
+    expect(lossAt(RIDGE_X + 0.05, 0)).toBeLessThan(lossAt(RIDGE_X, 0));
+  });
+
+  it("derives the stability bound from the deep valley's curvature, and it holds", () => {
+    expect(STABLE_RATE).toBeCloseTo(2 / curvatureX(GLOBAL_MINIMUM.x), 12);
+    const settleFrom = (rate: number) => {
+      let skier = {
+        pos: { x: GLOBAL_MINIMUM.x + 0.01, y: 0 },
+        velocity: { x: 0, y: 0 },
+        learningRate: rate,
+        momentum: 0,
+      };
+      for (let index = 0; index < 500; index += 1) skier = step(skier).skier;
+      return Math.abs(skier.pos.x - GLOBAL_MINIMUM.x);
+    };
+    expect(settleFrom(STABLE_RATE * 0.95)).toBeLessThan(1e-6);
+    expect(settleFrom(STABLE_RATE * 1.05)).toBeGreaterThan(0.01);
+  });
+});
+
+describe("nextStepLength", () => {
+  it("is exactly the length of the step the update rule takes next, momentum included", () => {
+    for (const [rate, momentum] of [
+      [0.05, 0],
+      [0.05, 0.85],
+      [0.2, 0.6],
+    ] as const) {
+      let skier = makeSkier(rate, momentum);
+      for (let index = 0; index < 3; index += 1) skier = step(skier).skier;
+      expect(nextStepLength(skier)).toBeCloseTo(step(skier).stepLength, 12);
+    }
+  });
+
+  it("differs from slope × rate once momentum carries speed", () => {
+    let skier = makeSkier(0.05, 0.85);
+    skier = step(skier).skier;
+    const naive = gradientNorm(gradientAt(skier.pos.x, skier.pos.y)) * 0.05;
+    expect(Math.abs(nextStepLength(skier) - naive)).toBeGreaterThan(0.05);
+  });
+});
+
+describe("verdicts with momentum", () => {
+  const landsAt = (remedy: { learningRate: number; momentum: number }) =>
+    run(remedy.learningRate, remedy.momentum).evaluation.outcome;
+
+  it("(0.05, 0.95): calls high-momentum bouncing oscillation, and offers a fix that works", () => {
+    const { evaluation } = run(0.05, 0.95);
+    expect(evaluation.outcome).toBe("oscillating");
+    expect(evaluation.failure!.detail).not.toMatch(
+      /Halve it and the same descent settles/,
+    );
+    expect(evaluation.remedy).not.toBeNull();
+    expect(reachesBottom(landsAt(evaluation.remedy!))).toBe(true);
+    expect(evaluation.remedy!.momentum).toBeLessThan(0.95);
+    expect(evaluation.failure!.detail).toContain(evaluation.remedy!.sentence);
+  });
+
+  it("(0.1, 0.95): no longer calls this rate 'just below the one that would diverge'", () => {
+    // Divergence with no momentum starts near 0.675; 0.1 is nowhere near it.
+    const { evaluation } = run(0.1, 0.95);
+    expect(evaluation.outcome).toBe("oscillating");
+    expect(evaluation.failure!.detail).not.toMatch(
+      /just below the one that would diverge/,
+    );
+    expect(evaluation.failure!.detail).toMatch(/momentum 0\.95/);
+  });
+
+  it("(0.2, 0.9): a skier that overshot the deep valley and rolled back had too MUCH momentum", () => {
+    const result = run(0.2, 0.9);
+    const { evaluation } = result;
+    expect(evaluation.outcome).toBe("local-minimum");
+    expect(result.minX).toBeLessThan(GLOBAL_MINIMUM.x);
+    expect(evaluation.crossedRidge).toBe(true);
+    expect(evaluation.passedDeepValley).toBe(true);
+    expect(evaluation.failure!.detail).toMatch(/too much momentum, not too little/);
+    expect(evaluation.failure!.detail).not.toMatch(/wasn't enough/);
+    // And the fix it names eases momentum, and genuinely lands.
+    expect(evaluation.remedy!.momentum).toBeLessThan(0.9);
+    expect(reachesBottom(landsAt(evaluation.remedy!))).toBe(true);
+
+    const card = whyCardFor({ kind: "checked", evaluation });
+    expect(card.body).toMatch(/Too much momentum, not too little/);
+  });
+
+  it("(0.05, 0.3): a skier that never reached the ridge is told momentum wasn't enough", () => {
+    const { evaluation, minX } = run(0.05, 0.3);
+    expect(evaluation.outcome).toBe("local-minimum");
+    expect(minX).toBeGreaterThan(RIDGE_X);
+    expect(evaluation.crossedRidge).toBe(false);
+    expect(evaluation.failure!.detail).toMatch(
+      /wasn't enough to carry you over the ridge/,
+    );
+    expect(evaluation.remedy!.momentum).toBeGreaterThan(0.3);
+  });
+
+  it("(0.3, 0.85): divergence under momentum names the effective step, not a 0.4 rule", () => {
+    const { evaluation } = run(0.3, 0.85);
+    expect(evaluation.outcome).toBe("diverged");
+    // α/(1−β) = 0.3 / 0.15 = 2.
+    expect(evaluation.failure!.detail).toMatch(/α\/\(1−β\) ≈ 2\.00/);
+    const card = whyCardFor({ kind: "checked", evaluation });
+    expect(card.body).not.toMatch(/Below roughly 0\.4/);
+    expect(card.body).toMatch(/step size/i);
+  });
+
+  it("(0.005, 0.95): a tiny rate at high momentum is told to RAISE the rate, not lower it", () => {
+    // Easing β shrinks the effective step α/(1−β), so the rate has to rise.
+    // The fallback used to list only lowering and then say "change both" —
+    // read as "lower both", the wrong way on this corner of the dials.
+    const { evaluation } = run(0.005, 0.95);
+    expect(evaluation.outcome).toBe("oscillating");
+    expect(evaluation.remedy).not.toBeNull();
+    expect(evaluation.remedy!.learningRate).toBeGreaterThan(0.005);
+    expect(evaluation.remedy!.momentum).toBeLessThan(0.95);
+    expect(reachesBottom(landsAt(evaluation.remedy!))).toBe(true);
+    expect(evaluation.failure!.detail).toContain(evaluation.remedy!.sentence);
+    expect(evaluation.failure!.detail).not.toMatch(/change both/);
+  });
+
+  it("(0.0081, 0.92): when raising the rate alone settles it, that is the fix it names", () => {
+    const { evaluation } = run(0.0081, 0.92);
+    expect(evaluation.outcome).toBe("oscillating");
+    expect(evaluation.remedy!.momentum).toBe(0.92);
+    expect(evaluation.remedy!.learningRate).toBeGreaterThan(0.0081);
+    expect(evaluation.remedy!.sentence).toMatch(/^Raising the rate to /);
+    expect(reachesBottom(landsAt(evaluation.remedy!))).toBe(true);
+  });
+
+  it("runs every rate it names at exactly the number it prints", () => {
+    // Near the edge of the winning band 0.61717… settles and 0.617 bounces,
+    // so a remedy run at the unrounded value could name a rate that fails.
+    let named = 0;
+    for (const momentum of [0, 0.01, 0.3, 0.9, 0.95]) {
+      for (let rate = MIN_LEARNING_RATE; rate <= MAX_LEARNING_RATE; rate *= 1.3) {
+        const { remedy } = run(rate, momentum).evaluation;
+        const printed = remedy ? /rate to ([0-9.]+)/.exec(remedy.sentence) : null;
+        if (!remedy || !printed) continue;
+        named += 1;
+        expect(remedy.learningRate, remedy.sentence).toBe(Number(printed[1]));
+        expect(reachesBottom(landsAt(remedy)), remedy.sentence).toBe(true);
+      }
+    }
+    expect(named).toBeGreaterThan(20);
+  });
+
+  it("never points a fallback the wrong way: every change it says it tried was run, and failed", () => {
+    // When nothing tried works, the advice lists what was tried and names no
+    // direction for either dial. Re-run each single-dial change it claims.
+    const shown = (value: number) => Number(value.toPrecision(3));
+    const fails = (learningRate: number, momentum: number) =>
+      learningRate < MIN_LEARNING_RATE ||
+      learningRate > MAX_LEARNING_RATE ||
+      !reachesBottom(landsAt({ learningRate, momentum }));
+    const lower = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1];
+    const raise = [1.5, 2, 3, 5, 10, 20];
+
+    let fallbacks = 0;
+    // The corners where fallbacks live: huge rates at (almost) no momentum,
+    // tiny rates at the top of the momentum slider.
+    for (const momentum of [0, 0.01, 0.02, 0.5, 0.9, 0.93, 0.94, 0.95]) {
+      for (let rate = MIN_LEARNING_RATE; rate <= MAX_LEARNING_RATE; rate *= 1.05) {
+        const { advice, remedy } = run(rate, momentum).evaluation;
+        if (remedy || !advice) continue;
+        fallbacks += 1;
+        const at = `(${rate}, ${momentum}): ${advice}`;
+
+        expect(advice, at).not.toMatch(/change both|add momentum as well/);
+        expect(advice, at).toMatch(
+          /try other combinations of both dials\.$|change the rate too\.$/,
+        );
+        if (/lower(ing)? (the )?rate|No lower rate|No other rate|Lowering or raising/i.test(advice)) {
+          for (const factor of lower) {
+            expect(fails(shown(rate * factor), momentum), `${at} ×${factor}`).toBe(true);
+          }
+        }
+        if (/higher rate|No other rate|Lowering or raising/.test(advice)) {
+          for (const factor of raise) {
+            expect(fails(shown(rate * factor), momentum), `${at} ×${factor}`).toBe(true);
+          }
+        }
+        const eased = /easing momentum by up to (\d\.\d\d)/.exec(advice);
+        if (eased) {
+          for (const drop of [0.1, 0.2, 0.3].filter((d) => d <= Number(eased[1]) + 1e-9)) {
+            const value = Math.round((momentum - drop) * 100) / 100;
+            expect(fails(rate, value), `${at} β ${value}`).toBe(true);
+          }
+        }
+        const between = /between (\d\.\d\d) and (\d\.\d\d)/.exec(advice);
+        if (between) {
+          for (let step = Math.round(Number(between[1]) * 100) + 1; step <= Math.round(Number(between[2]) * 100); step += 1) {
+            expect(fails(rate, step / 100), `${at} β ${step / 100}`).toBe(true);
+          }
+        }
+        if (/No momentum setting on the dial/.test(advice)) {
+          for (let step = 1; step <= Math.round(MAX_MOMENTUM * 100); step += 1) {
+            expect(fails(rate, step / 100), `${at} β ${step / 100}`).toBe(true);
+          }
+        }
+        expect(advice, at).not.toMatch(/between (\d\.\d\d) and \1/);
+        if (/already at the top of the dial/.test(advice)) {
+          expect(momentum).toBe(MAX_MOMENTUM);
+        }
+      }
+    }
+    expect(fallbacks).toBeGreaterThan(0);
+  });
+
+  it("(0.0029, 0.95): an oscillation that never left the right-hand basin says which valley it rocked in", () => {
+    const { evaluation } = run(0.0029, 0.95);
+    expect(evaluation.outcome).toBe("oscillating");
+    expect(evaluation.crossedRidge).toBe(false);
+    expect(evaluation.failure!.detail).toMatch(/past the shallow valley's floor and back/);
+    const card = whyCardFor({ kind: "checked", evaluation });
+    expect(card.body).toMatch(/past the shallow valley's floor and back/);
+  });
+
+  it("at the top of the momentum slider, says so instead of 'between 0.95 and 0.95'", () => {
+    // α = 0.00279 at β = 0.95 stops short of the ridge, and no higher rate at
+    // that momentum lands either (the property test above re-runs them).
+    const { evaluation } = run(0.00279, 0.95);
+    expect(evaluation.outcome).toBe("local-minimum");
+    expect(evaluation.crossedRidge).toBe(false);
+    expect(evaluation.remedy).toBeNull();
+    expect(evaluation.failure!.detail).not.toMatch(/between 0\.95 and 0\.95/);
+    expect(evaluation.advice).toMatch(/^Momentum is already at the top of the dial/);
+    expect(evaluation.advice).toMatch(/try other combinations of both dials\.$/);
+  });
+
+  it("only ever offers a remedy that was run and reaches the deepest valley", () => {
+    // The property behind every "… reaches the deepest valley" sentence.
+    for (const momentum of [0, 0.3, 0.6, 0.85, 0.9, 0.95]) {
+      for (const rate of [0.005, 0.02, 0.05, 0.1, 0.2, 0.3, 0.44, 0.6, 1.0, 1.5]) {
+        const { evaluation } = run(rate, momentum);
+        if (!evaluation.remedy) continue;
+        expect(
+          reachesBottom(landsAt(evaluation.remedy)),
+          `remedy for (${rate}, ${momentum})`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  it("never tells a bouncing descent that every step went downhill", () => {
+    // α = 0.44 with no momentum settles into a two-step bounce whose uphill
+    // steps (0.041) sit under the red-spike threshold; it used to be called
+    // slow convergence — "the rate is too small" — which is backwards.
+    const bounce = run(0.44, 0);
+    expect(bounce.rises).toBeGreaterThan(0);
+    expect(bounce.evaluation.outcome).toBe("oscillating");
+
+    for (const momentum of [0, 0.5, 0.9, 0.95]) {
+      for (const rate of [0.001, 0.002, 0.005, 0.01, 0.02, 0.43, 0.44, 0.45]) {
+        const result = run(rate, momentum);
+        if (result.evaluation.outcome !== "slow-convergence") continue;
+        for (let index = 1; index < result.losses.length; index += 1) {
+          expect(
+            result.losses[index]! - result.losses[index - 1]!,
+            `(${rate}, ${momentum}) step ${index}`,
+          ).toBeLessThanOrEqual(UPHILL_DELTA);
+        }
+      }
+    }
+  });
+
+  it("gives no what-if advice for a run whose dials moved part-way", () => {
+    const result = descend(0.2, 0.9);
+    const evaluation = evaluate({
+      pos: result.final.pos,
+      finalLoss: result.finalLoss,
+      steps: result.steps,
+      diverged: result.diverged,
+      settled: result.settled,
+      learningRate: 0.2,
+      momentum: 0.9,
+      overshoots: result.overshoots,
+      rises: result.rises,
+      minX: result.minX,
+      constantDials: false,
+    });
+    expect(evaluation.outcome).toBe("local-minimum");
+    expect(evaluation.advice).toBeNull();
+    expect(evaluation.remedy).toBeNull();
+  });
+});
+
+describe("verdicts without momentum", () => {
+  it("a plain step big enough to hop the shallow basin wins, and the copy doesn't credit momentum", () => {
+    const { evaluation } = run(0.3, 0);
+    expect(evaluation.outcome).toBe("win");
+    const card = whyCardFor({ kind: "checked", evaluation });
+    expect(card.body).not.toMatch(/enough momentum/i);
+    expect(card.body).toMatch(/No momentum at all/);
+  });
+
+  it("the plain local minimum says a bigger step would also get out, and names a momentum that does", () => {
+    const { evaluation } = run(0.1, 0);
+    expect(evaluation.failure!.detail).toMatch(
+      /momentum, or a step large enough to hop it, can/,
+    );
+    expect(evaluation.remedy).toEqual(
+      expect.objectContaining({ learningRate: 0.1, momentum: 0.85 }),
+    );
+  });
+
+  it("a plain step that hopped the basin and bounced back was too BIG, and the copy says so", () => {
+    // α ≈ 0.63–0.67 at β = 0 clears the ridge, overshoots the deep valley
+    // and rolls back. "Small steps can't leave this basin" was backwards.
+    const result = run(0.6421, 0);
+    const { evaluation } = result;
+    expect(evaluation.outcome).toBe("local-minimum");
+    expect(evaluation.crossedRidge).toBe(true);
+    expect(evaluation.passedDeepValley).toBe(true);
+    expect(evaluation.failure!.detail).toMatch(/Too big a step, not too small/);
+    expect(evaluation.failure!.detail).not.toMatch(/Small steps with no momentum/);
+    // The fix it names is a smaller step, and it lands.
+    expect(evaluation.remedy!.learningRate).toBeLessThan(0.6421);
+    expect(evaluation.remedy!.momentum).toBe(0);
+    expect(reachesBottom(run(evaluation.remedy!.learningRate, 0).evaluation.outcome)).toBe(true);
+
+    const checked = whyCardFor({ kind: "checked", evaluation });
+    expect(checked.body).toMatch(/Too big a step, not too small/);
+    expect(checked.body).not.toMatch(/this is the trap momentum exists for/);
+
+    const settled = whyCardFor({
+      kind: "stepped",
+      loss: result.finalLoss,
+      previousLoss: result.losses[result.losses.length - 2]!,
+      gradient: gradientAt(result.final.pos.x, result.final.pos.y),
+      overshot: false,
+      diverged: false,
+      settled: true,
+      pos: result.final.pos,
+      learningRate: 0.6421,
+      momentum: 0,
+      minX: result.minX,
+    });
+    expect(settled.body).toMatch(/did hop the ridge/);
+    expect(settled.body).toMatch(/too big to stop in the deep valley/);
+  });
+
+  it("credits momentum in a win only when the same rate without it gets stuck", () => {
+    const { evaluation } = run(0.1, 0.85);
+    expect(evaluation.outcome).toBe("win");
+    expect(evaluation.withoutMomentum).toBe("local-minimum");
+    const card = whyCardFor({ kind: "checked", evaluation });
+    expect(card.body).toMatch(/with none, this same rate stops in the shallow valley/);
+  });
+
+  it("names a lower rate that settles an oscillating plain descent", () => {
+    const { evaluation } = run(0.6, 0);
+    expect(evaluation.outcome).toBe("oscillating");
+    expect(evaluation.remedy!.learningRate).toBeLessThan(0.6);
+    expect(evaluation.remedy!.momentum).toBe(0);
+  });
+});
+
+describe("store: what the readouts and the verdict describe", () => {
+  const store = () => useGradientSkierStore.getState();
+
+  beforeEach(() => {
+    useProgression.setState({
+      ...EMPTY_PROGRESSION,
+      hydrated: true,
+      syncError: null,
+      lastGain: null,
+    });
+    useProgression.getState().setAdapter(createMemoryAdapter());
+    store().fullReset();
+    store().setLane("visual");
+  });
+
+  it("previews the next step the rule will actually take", () => {
+    store().setMomentum(0.85);
+    store().step();
+    const before = store().skier;
+    const preview = nextStepLength(before);
+    store().step();
+    const after = store().skier;
+    expect(
+      Math.hypot(after.pos.x - before.pos.x, after.pos.y - before.pos.y),
+    ).toBeCloseTo(preview, 12);
+  });
+
+  it("tracks how far left the path got", () => {
+    store().setLearningRate(0.2);
+    store().setMomentum(0.9);
+    store().runToEnd();
+    expect(store().minX).toBeCloseTo(descend(0.2, 0.9).minX, 12);
+    expect(store().minX).toBeLessThan(RIDGE_X);
+  });
+
+  it("quotes the rate that ran, not the dial turned after the run ended", () => {
+    store().setLearningRate(1.0);
+    store().runToEnd();
+    expect(store().diverged).toBe(true);
+    store().setLearningRate(0.05);
+    const evaluation = store().check();
+    expect(evaluation.learningRate).toBe(1.0);
+    expect(evaluation.failure!.detail).toMatch(/learning rate of 1\.00/);
+    expect(evaluation.failure!.detail).not.toMatch(/0\.0500/);
+  });
+
+  it("tells the player a dial turned after the run applies from the top", () => {
+    store().setLearningRate(1.0);
+    store().runToEnd();
+    store().setLearningRate(0.2);
+    expect(store().whyCard!.body).toMatch(/applies from the top/);
+  });
+
+  it("withholds advice when a dial moved mid-run", () => {
+    store().setLearningRate(0.2);
+    store().setMomentum(0.9);
+    for (let index = 0; index < 5; index += 1) store().step();
+    store().setMomentum(0.91);
+    store().runToEnd();
+    expect(store().dialsChangedMidRun).toBe(true);
+    expect(store().check().advice).toBeNull();
+  });
+
+  it("records a slow arrival at the bottom as a clear with one star", () => {
+    // Spec: "Reach the global minimum before the timer." Taking most of the
+    // budget costs score (so the second star), not the clear itself.
+    store().setLearningRate(0.05);
+    store().setMomentum(0.9);
+    store().runToEnd();
+    const evaluation = store().check();
+    expect(evaluation.outcome).toBe("near-miss");
+    expect(evaluation.score).toBeLessThan(HIGH_SCORE_THRESHOLD);
+    const record = useProgression.getState().games["gradient-descent-skier"];
+    expect(record?.completed).toBe(true);
+    expect(record?.stars).toBe(1);
+    expect(store().won).toBe(false);
+  });
+
+  it("counts a run once however many times it is scored", () => {
+    store().setLearningRate(0.1);
+    store().setMomentum(0.85);
+    store().runToEnd();
+    store().check();
+    store().check();
+    store().check();
+    expect(
+      useProgression.getState().games["gradient-descent-skier"]?.playCount,
+    ).toBe(1);
+  });
+
+  it("credits the lane the check came from, not the tab that happens to be open", () => {
+    store().setLane("code");
+    store().setLearningRate(0.1);
+    store().setMomentum(0.85);
+    store().runToEnd();
+    store().check("visual");
+    const record = useProgression.getState().games["gradient-descent-skier"];
+    expect(record?.codeLaneCleared).toBe(false);
+    expect(record?.stars).toBe(2);
+  });
+});
+
+describe("code lane api", () => {
+  const store = () => useGradientSkierStore.getState();
+
+  beforeEach(() => {
+    useProgression.setState({
+      ...EMPTY_PROGRESSION,
+      hydrated: true,
+      syncError: null,
+      lastGain: null,
+    });
+    useProgression.getState().setAdapter(createMemoryAdapter());
+    store().fullReset();
+  });
+
+  it("drives the same store as the rail", () => {
+    const api = createCodeApi();
+    api.setLearningRate(0.1);
+    api.setMomentum(0.85);
+    api.runToEnd();
+    expect(api.check().outcome).toBe("win");
+    expect(
+      useProgression.getState().games["gradient-descent-skier"]?.codeLaneCleared,
+    ).toBe(true);
+    expect(api.gradient()).toEqual(
+      gradientAt(api.position().x, api.position().y),
+    );
+  });
+
+  it("rejects a rate or momentum that isn't a finite number, by name", () => {
+    const api = createCodeApi();
+    expect(() => api.setLearningRate(Number.NaN)).toThrow(
+      /setLearningRate: the rate must be a finite number/,
+    );
+    expect(() => api.setLearningRate("0.1" as unknown as number)).toThrow(
+      TypeError,
+    );
+    expect(() => api.setMomentum(Number.POSITIVE_INFINITY)).toThrow(/setMomentum/);
+    expect(store().skier.learningRate).toBe(DEFAULT_LEARNING_RATE);
+  });
+
+  it("rejects values off the dial instead of silently clamping them", () => {
+    const api = createCodeApi();
+    expect(() => api.setLearningRate(2)).toThrow(RangeError);
+    expect(() => api.setLearningRate(MIN_LEARNING_RATE / 2)).toThrow(
+      /outside the dial's range/,
+    );
+    expect(() => api.setMomentum(1)).toThrow(RangeError);
+    expect(() => api.setMomentum(-0.1)).toThrow(RangeError);
+    api.setLearningRate(MAX_LEARNING_RATE);
+    api.setMomentum(MAX_MOMENTUM);
+    expect(store().skier.learningRate).toBe(MAX_LEARNING_RATE);
+    expect(store().skier.momentum).toBe(MAX_MOMENTUM);
+  });
+
+  it("rejects non-numeric coordinates in the surface probes", () => {
+    const api = createCodeApi();
+    expect(() => api.lossAt(Number.NaN, 0)).toThrow(
+      /lossAt: x must be a finite number/,
+    );
+    expect(() => api.gradientAt(0, "1" as unknown as number)).toThrow(
+      /gradientAt: y/,
+    );
+    expect(api.lossAt(1, 0)).toBeCloseTo(lossAt(1, 0), 12);
   });
 });
