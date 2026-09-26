@@ -43,8 +43,34 @@ export async function run({ page, check, metricText }) {
     `showed "${initial.trim()}"`,
   );
 
+  // ── the number keys are scoped to the lane (WCAG 2.1.4) ──
+  console.log("\nKeyboard shortcuts only act with focus in the lane");
+  const rowNumber = async () => {
+    const text = await page.getByText(/^Row \d+ of \d+\./).first().innerText();
+    return Number(/^Row (\d+)/.exec(text)?.[1] ?? Number.NaN);
+  };
+  const rowBefore = await rowNumber();
+  // Focus nowhere in particular: key events land on the document body.
+  await page.evaluate(() => {
+    const active = document.activeElement;
+    if (active && typeof active.blur === "function") active.blur();
+  });
+  await page.keyboard.press("2");
+  await page.waitForTimeout(250);
+  check(
+    "a 2 pressed outside the lane sorts nothing",
+    (await rowNumber()) === rowBefore,
+    `row ${rowBefore} -> ${await rowNumber()}`,
+  );
+
   // ── contract #2: sorting rows IS the pipeline ──
   console.log("\nSorting rows (pedagogy contract #2)");
+  const belt = page.getByRole("region", { name: "Conveyor belt" });
+  await belt.focus();
+  check(
+    "the belt itself takes keyboard focus",
+    await belt.evaluate((el) => el === document.activeElement),
+  );
   await page.keyboard.press("2"); // Impute
   await page.waitForTimeout(250);
   const afterOne = await whyRegion.innerText();
@@ -52,6 +78,11 @@ export async function run({ page, check, metricText }) {
     "sorting a row explains the tradeoff it just made",
     afterOne.length > 40,
     afterOne.split("\n").slice(0, 2).join(" / "),
+  );
+  check(
+    "with focus on the belt, the key sorted exactly one row",
+    (await rowNumber()) === rowBefore + 1,
+    `row ${rowBefore} -> ${await rowNumber()}`,
   );
 
   // Sort a full batch by keyboard alone, which should trigger a retrain.
@@ -120,6 +151,40 @@ export async function run({ page, check, metricText }) {
     await page
       .getByRole("progressbar", { name: "Experience points" })
       .isVisible(),
+  );
+
+  // ── leaving the sensor spikes in: named, and it genuinely costs accuracy ──
+  console.log("\nNamed failure: Outlier contamination, backed by the meter");
+  const accuracyIn = (text) =>
+    Number(/accuracy\s+([0-9.]+)/.exec(text)?.[1] ?? Number.NaN);
+  await editor.fill(
+    [
+      "api.reset();",
+      "api.forEachRow((row) => (row.isNull ? 'impute' : 'keep'));", // spikes kept
+      "const acc = await api.retrain();",
+      "log('extremes left', api.extremesLeft());",
+      "log('accuracy', acc.toFixed(3));",
+      "log('verdict', api.check().outcome);",
+    ].join("\n"),
+  );
+  await runButton.click();
+  await page.waitForTimeout(6000);
+
+  const spikedOutput = await outputText();
+  check(
+    "keeping the spikes is diagnosed as outlier contamination",
+    /verdict\s+outlier-contamination/.test(spikedOutput),
+    spikedOutput.replace(/\n/g, " | "),
+  );
+  check(
+    "and the model trained on them really is worse than the clean pipeline",
+    accuracyIn(spikedOutput) < accuracyIn(goodOutput),
+    `${accuracyIn(spikedOutput)} vs ${accuracyIn(goodOutput)}`,
+  );
+  check(
+    "the failure blames the inputs, not squared error",
+    (await failure.count()) > 0 &&
+      !/squared/i.test(await failure.innerText()),
   );
 
   // ── contract #4: the named failure, driven by dropping blanks ──

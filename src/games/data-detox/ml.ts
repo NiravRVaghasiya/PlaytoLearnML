@@ -16,19 +16,21 @@ import { clamp, gaussian, seededRandom } from "@/lib/utils";
  * instead of a tree. Trees are the subject of Decision Tree Architect (Phase 2),
  * where they're the lesson rather than an implementation detail.
  *
- * ── Why the dirt is recoverable ─────────────────────────────────────────────
+ * ── Why the dirt is worth cleaning ──────────────────────────────────────────
  * Labels are generated from CLEAN features, and only then are values corrupted.
- * So the dirt is genuinely noise obscuring a real signal, and median-imputing a
- * null or capping an outlier actually recovers information. If labels were
- * derived from the dirty values, cleaning would destroy signal rather than
- * restore it, and the game would teach the opposite of its lesson.
+ * So the dirt is genuinely noise obscuring a real signal: median-imputing a null
+ * puts a plausible value back, and capping a spike stops one impossible input
+ * from swamping the rest of its row. If labels were derived from the dirty
+ * values, cleaning would destroy signal rather than restore it, and the game
+ * would teach the opposite of its lesson.
  *
  * ── The four actions are orthogonal on purpose ───────────────────────────────
  *   Keep   — use the row as-is. A null becomes 0, which is not "unknown", it's a
  *            specific wrong number. This is the mistake the game is built to show.
  *   Impute — fill nulls with the column median. Does nothing about outliers.
- *   Cap    — clamp every value into the [p5, p95] range. Does nothing about nulls
- *            (you cannot clamp a missing value), so nulls still become 0.
+ *   Cap    — clamp every value into the column's Tukey fences (see
+ *            `columnStats`). Does nothing about nulls (you cannot clamp a
+ *            missing value), so nulls still become 0.
  *   Drop   — exclude the row. Costs you data.
  *
  * Each dirt type therefore has one best answer, and rows that are BOTH null and
@@ -102,8 +104,47 @@ export const TEST_ROWS = 400;
 export const NULL_RATE_HEALTHY = 0.62;
 export const NULL_RATE_BLIGHTED = 0.12;
 export const OUTLIER_RATE = 0.28;
-/** How far an outlier is thrown out of range. */
-export const OUTLIER_FACTOR = 7;
+
+/** The physical range every sensor reads in. Anything outside it is impossible. */
+export const SENSOR_MIN = 0;
+export const SENSOR_MAX = 1;
+
+/**
+ * ── Outliers are sensor spikes, and spikes carry no signal ───────────────────
+ *
+ * A spiked reading is drawn uniformly from [OUTLIER_MIN, OUTLIER_MAX], with no
+ * trace of the true value — a glitch, not an exaggeration.
+ *
+ * The first design got this wrong, measurably. An outlier was a stretched copy
+ * of the true reading (7x + 2), and Cap clamped to the 5th/95th percentile. With
+ * roughly one reading in ten corrupted, the 95th percentile landed INSIDE the
+ * outliers — 3.5 to 6.5 on a 0–1 sensor — so capping left 65 of 67 capped rows
+ * still out of range. And because 7x + 2 preserves the ordering, a ReLU network
+ * simply read through it: keeping the outliers scored the same as capping them
+ * (0.848 against 0.843 on seed 4102), so "Outlier contamination" was a named
+ * failure that the accuracy meter contradicted.
+ *
+ * Spikes this far out do real damage to this model, and for a reason that has
+ * nothing to do with squared error (the loss is cross-entropy, and the targets
+ * are clean): every neuron sums weight × input, so one input of 60 swamps the
+ * rest of its row, and the gradient on that weight scales with the input too.
+ * Smaller spikes (2–9) were tried first and did not hurt this model at all. On
+ * the shipped seeds, keeping these costs 5–12 points of held-out accuracy
+ * against capping them — see ROUND_SEEDS, and the lesson test that holds every
+ * round to it.
+ */
+export const OUTLIER_MIN = 20;
+export const OUTLIER_MAX = 100;
+
+/**
+ * Tukey's fence multiplier. Cap clamps a column into [Q1 − k·IQR, Q3 + k·IQR].
+ *
+ * Quartiles, not the 5th/95th percentiles, because the bound has to survive the
+ * contamination it exists to remove: with about one reading in ten spiked, the
+ * 95th percentile sits among the spikes, while a quartile can't be moved by
+ * anything short of a quarter of the column.
+ */
+export const FENCE_K = 1.5;
 /** Irreducible label noise, so no pipeline can reach 100%. */
 export const LABEL_NOISE = 0.06;
 
@@ -125,10 +166,11 @@ export const UNCAPPED_OUTLIER_SHARE = 0.15;
  * detectable share of dirt or bends the class balance — so by the time a pipeline
  * reaches this bar it is a good pipeline. The bar exists to catch the remainder.
  *
- * Set at 0.70 for real headroom. A strong pipeline scores 0.787–0.875 across the
- * shipped seeds, and `score` is accuracy MINUS a time penalty of up to 0.04: at
- * 0.75 the weakest seed became unwinnable the moment the clock moved, and at 0.80
- * two of them did.
+ * Set at 0.70 for real headroom. A strong pipeline scores 0.860–0.885 across the
+ * shipped seeds, and `score` is accuracy MINUS a time penalty of up to 0.04, so
+ * even a player who takes as long as they like to read the cards scores at least
+ * 0.82 — past the bar, and past HIGH_SCORE_THRESHOLD for the second star. The
+ * lesson test asserts both with the penalty at its cap.
  */
 export const WIN_ACCURACY = 0.7;
 
@@ -140,10 +182,6 @@ export const WIN_ACCURACY = 0.7;
  */
 export const TIME_PENALTY_PER_SECOND = 0.0004;
 export const MAX_TIME_PENALTY = 0.04;
-
-/** Percentile bounds used by Cap. */
-export const CAP_LOW = 0.05;
-export const CAP_HIGH = 0.95;
 
 /** What a Keep does with a missing value. Not "unknown" — just wrong. */
 export const NAIVE_FILL = 0;
@@ -189,6 +227,11 @@ export interface Dataset {
 
 export function generateDataset(seed: number): Dataset {
   const random = seededRandom(seed);
+  // Spike magnitudes come from their own stream, drawn once per row. Taking
+  // them from `random` would shift every later draw, and with it every label,
+  // blank and outlier position — including the round-1 class balance the
+  // Concept Library quotes (39 rows, 33% healthy against 53%).
+  const spikeRandom = seededRandom(seed + 3301);
 
   const train: Row[] = [];
   for (let index = 0; index < TRAIN_ROWS; index += 1) {
@@ -214,6 +257,7 @@ export function generateDataset(seed: number): Dataset {
     const nullVictim = FEATURES[Math.floor(random() * FEATURES.length)]!;
     const outlierDraw = random();
     const outlierVictim = FEATURES[Math.floor(random() * FEATURES.length)]!;
+    const spikeDraw = spikeRandom();
 
     // Missing not at random: blanks favour the healthy class. Dropping them
     // therefore drops mostly one class — see the NULL_RATE_* docblock.
@@ -223,9 +267,9 @@ export function generateDataset(seed: number): Dataset {
       isNull = true;
     }
     if (outlierDraw < OUTLIER_RATE && observed[outlierVictim] !== null) {
-      // +2 guarantees the value lands unambiguously outside the 0–1 range even
-      // when the clean reading is near zero.
-      observed[outlierVictim] = clean[outlierVictim] * OUTLIER_FACTOR + 2;
+      // A glitch: independent of the true reading, and far outside 0–1.
+      observed[outlierVictim] =
+        OUTLIER_MIN + spikeDraw * (OUTLIER_MAX - OUTLIER_MIN);
       isOutlier = true;
     }
 
@@ -272,8 +316,14 @@ function quantile(sorted: number[], q: number): number {
 
 /**
  * Medians and cap bounds, computed from the DIRTY training rows with nulls
- * skipped — which is what an analyst actually has to work with. Outliers drag
- * these statistics around a little, and that's part of the lesson.
+ * skipped — which is what an analyst actually has to work with.
+ *
+ * The cap bounds are Tukey's fences, Q1 − 1.5·IQR and Q3 + 1.5·IQR. Rank-based
+ * statistics are what make that honest: the spikes can't drag a quartile, so a
+ * capped spike lands just past the top of the real readings (about 1.1–1.5 on a
+ * 0–1 sensor) — still high, no longer absurd — and on every shipped seed the
+ * fences contain the whole 0–1 range, so capping a clean reading changes
+ * nothing. The tests hold every round to both.
  */
 export function columnStats(rows: Row[]): ColumnStats {
   const median = {} as Record<FeatureName, number>;
@@ -286,12 +336,26 @@ export function columnStats(rows: Row[]): ColumnStats {
       .filter((value): value is number => value !== null)
       .sort((a, b) => a - b);
 
+    const q1 = quantile(values, 0.25);
+    const q3 = quantile(values, 0.75);
+    const spread = q3 - q1;
+
     median[feature] = quantile(values, 0.5);
-    low[feature] = quantile(values, CAP_LOW);
-    high[feature] = quantile(values, CAP_HIGH);
+    low[feature] = q1 - FENCE_K * spread;
+    high[feature] = q3 + FENCE_K * spread;
   }
 
   return { median, low, high };
+}
+
+/**
+ * Is this reading physically impossible for the sensor? Exact rather than
+ * statistical: clean readings are clamped to 0–1 and a spike is at least
+ * OUTLIER_MIN, so this flags every spike and nothing else. It is what the belt
+ * highlights, and what "out of range" means everywhere in the copy.
+ */
+export function isOutOfRange(value: number | null): boolean {
+  return value !== null && (value < SENSOR_MIN || value > SENSOR_MAX);
 }
 
 // ── The pipeline ───────────────────────────────────────────────────────────
@@ -417,19 +481,29 @@ export function applyPipeline(rows: Row[], stats: ColumnStats): PipelineResult {
 /**
  * A strong pipeline: impute blanks, cap outliers, keep clean rows, and never drop.
  *
- * "Never drop" is a measured conclusion, not a stylistic preference. An earlier
- * version dropped the doubly-corrupted rows on the grounds that no single action
- * repairs them — and it scored WORSE on every seed (0.745/0.813/0.830) than simply
- * imputing them (0.840/0.843/0.868). Because blanks are class-skewed, dropping even
- * a handful of rows starts bending the class balance, and that costs more than the
- * outlier you failed to cap.
+ * "Never drop" is a measured conclusion, not a stylistic preference. Dropping the
+ * doubly-corrupted rows, on the grounds that no single action repairs them,
+ * scores WORSE on every shipped seed (0.792/0.858/0.860/0.825/0.813) than simply
+ * imputing them (0.860/0.865/0.885/0.875/0.868). Those rows carry a blank, and
+ * blanks are class-skewed, so dropping even a handful starts bending the class
+ * balance — which costs more than the spike you failed to cap.
+ *
+ * (Dropping rows whose ONLY problem is a spike is a different matter: it lands
+ * either side of capping them, from 0.795 to 0.905. Spikes themselves hit both
+ * classes at close to the same rate, but a spike-only row is one with no blank,
+ * and blanks cluster on healthy rows — so spike-only rows lean blighted (21
+ * healthy against 45 blighted across the shipped seeds, a majority on every
+ * one). Dropping them all costs sample size AND tips the balance toward healthy,
+ * by 2–8 points on the shipped seeds — under MAX_BALANCE_DRIFT, so it is never
+ * called selection bias, but it is not free either. That is the honest version
+ * of "remove what is physically impossible".)
  *
  * For a row that is both blank AND out of range there genuinely is no right
- * answer: imputing fixes the blank and keeps the outlier, capping fixes the
- * outlier and leaves a 0 where the blank was. Across seeds the two swap places
- * (impute-both 0.840/0.843/0.868 against cap-both 0.813/0.828/0.890). That is the
- * spec's "no single right answer — only tradeoffs", as a number rather than a
- * slogan.
+ * answer: imputing fixes the blank and keeps the spike, capping fixes the spike
+ * and leaves a 0 where the blank was. Across seeds the two swap places
+ * (impute-both 0.860/0.865/0.885/0.875/0.868 against cap-both
+ * 0.830/0.895/0.917/0.880/0.828). That is the spec's "no single right answer —
+ * only tradeoffs", as a number rather than a slogan.
  */
 export function idealAction(row: Row): CleaningAction {
   // Blanks first: they're the biased ones, so repairing them matters most.
@@ -510,12 +584,19 @@ export type Outcome =
   | "unhandled-nulls"
   | "outlier-contamination"
   | "incomplete"
+  /** Every row decided, nothing structurally wrong, but no model has been
+   *  trained on THIS pipeline yet — so there is no accuracy to judge. */
+  | "untrained"
   | "near-miss";
 
 export interface Evaluation {
-  accuracy: number;
+  /** Held-out accuracy of a model trained on this exact pipeline; null if none. */
+  accuracy: number | null;
   timePenalty: number;
-  score: number;
+  /** Accuracy minus the time penalty; null when there is no accuracy. */
+  score: number | null;
+  /** The clock the time penalty was charged against, in seconds. */
+  secondsElapsed: number;
   kept: number;
   dropped: number;
   keptWithNaiveFill: number;
@@ -549,18 +630,26 @@ export function timePenaltyFor(secondsElapsed: number): number {
  * accuracy number is not measuring the player's cleaning at all, it's measuring
  * sample size. Only once the model has enough data do the "you left dirt in"
  * diagnoses mean anything.
+ *
+ * `accuracy` is null when no model has been trained on this exact pipeline. The
+ * structural failures above don't need one — class balance and leftover dirt are
+ * measured from the pipeline itself — so they still fire, and their copy simply
+ * omits the accuracy. A win or a near-miss is a claim ABOUT the accuracy, so
+ * without one the verdict is "untrained" rather than a guess.
  */
 export function evaluate(
   pipeline: PipelineResult,
-  accuracy: number,
+  accuracy: number | null,
   secondsElapsed: number,
 ): Evaluation {
   const timePenalty = timePenaltyFor(secondsElapsed);
-  const score = clamp(accuracy - timePenalty, 0, 1);
+  const score = accuracy === null ? null : clamp(accuracy - timePenalty, 0, 1);
 
   const nullShare = pipeline.kept > 0 ? pipeline.keptWithNaiveFill / pipeline.kept : 0;
   const outlierShare = pipeline.kept > 0 ? pipeline.keptWithOutlier / pipeline.kept : 0;
   const percent = (value: number) => `${Math.round(value * 100)}%`;
+  const measured =
+    accuracy === null ? "" : ` Held-out accuracy ${percent(accuracy)}.`;
 
   let outcome: Outcome;
   let failure: NamedFailure | null = null;
@@ -573,39 +662,40 @@ export function evaluate(
       name: "Data starvation",
       detail: `You dropped ${pipeline.dropped} of ${
         pipeline.kept + pipeline.dropped
-      } rows, leaving ${pipeline.kept} to train on. Held-out accuracy ${percent(
-        accuracy,
-      )}. Below about ${MIN_ROWS} rows the model has too few examples to learn the pattern, no matter how clean they are — dropping is the most expensive way to fix a row.`,
+      } rows, leaving ${pipeline.kept} to train on.${measured} Below about ${MIN_ROWS} rows the model has too few examples to learn the pattern, no matter how clean they are — dropping is the most expensive way to fix a row.`,
     };
   } else if (Math.abs(pipeline.balanceDrift) > MAX_BALANCE_DRIFT) {
     outcome = "selection-bias";
-    const lost = pipeline.balanceDrift < 0 ? "healthy" : "blighted";
+    // Blanks explain only a drift AWAY from healthy. A drift toward healthy
+    // came from drops that took blighted rows out of proportion (a code-lane
+    // rule like "drop moisture < 0.45" does it), and blaming blanks on
+    // blighted plots there would state the generator backwards.
+    const why =
+      pipeline.balanceDrift < 0
+        ? "Blank readings are far more common on healthy plots, so dropping them threw away that class specifically."
+        : "The rows you dropped were blighted out of proportion, so healthy plots are now over-represented.";
     failure = {
       name: "Selection bias",
       detail: `Your ${pipeline.kept} surviving rows are ${percent(
         pipeline.keptPositiveShare,
       )} healthy, but the data you started from was ${percent(
         pipeline.sourcePositiveShare,
-      )} healthy. Blank readings are far more common on ${lost} plots, so dropping them threw away that class specifically. The model learned a world that doesn't exist. Held-out accuracy ${percent(
-        accuracy,
-      )}.`,
+      )} healthy. ${why} The model learned a world that doesn't exist.${measured}`,
     };
   } else if (nullShare > UNHANDLED_NULL_SHARE) {
     outcome = "unhandled-nulls";
     failure = {
       name: "Unhandled missing values",
-      detail: `${pipeline.keptWithNaiveFill} of your ${pipeline.kept} training rows still had a blank cell, and the model read every blank as 0. Zero is not "unknown" — it's a specific wrong measurement, and it pulled the boundary toward it. Held-out accuracy ${percent(
-        accuracy,
-      )}.`,
+      detail: `${pipeline.keptWithNaiveFill} of your ${pipeline.kept} training rows still had a blank cell, and the model read every blank as 0. Zero is not "unknown" — it's a specific wrong measurement, and it pulled the boundary toward it.${measured}`,
     };
   } else if (outlierShare > UNCAPPED_OUTLIER_SHARE) {
     outcome = "outlier-contamination";
     failure = {
       name: "Outlier contamination",
-      detail: `${pipeline.keptWithOutlier} of your ${pipeline.kept} training rows carried a value ${OUTLIER_FACTOR}× out of range. A handful of extreme rows drags the fit further than dozens of ordinary ones. Held-out accuracy ${percent(
-        accuracy,
-      )}.`,
+      detail: `${pipeline.keptWithOutlier} of your ${pipeline.kept} training rows still carried an impossible reading, somewhere between ${OUTLIER_MIN} and ${OUTLIER_MAX} on a sensor that reads ${SENSOR_MIN} to ${SENSOR_MAX}. Every neuron sums weight × input, so one spike swamps the rest of its row, and the gradient it sends back scales with it — a handful of glitches pulls the weights further than dozens of ordinary rows. Cap clamps them to the column's fence instead.${measured}`,
     };
+  } else if (accuracy === null || score === null) {
+    outcome = "untrained";
   } else if (score >= WIN_ACCURACY) {
     outcome = "win";
   } else {
@@ -616,6 +706,7 @@ export function evaluate(
     accuracy,
     timePenalty,
     score,
+    secondsElapsed: Math.max(0, secondsElapsed),
     kept: pipeline.kept,
     dropped: pipeline.dropped,
     keptWithNaiveFill: pipeline.keptWithNaiveFill,
@@ -632,15 +723,28 @@ export function evaluate(
 /**
  * Rounds this game ships — curated, not arbitrary.
  *
- * Screened so that on every one: a strong pipeline clears the bar, keeping
- * everything is caught as unhandled blanks, dropping the blank rows is caught as
- * selection bias, and dropping everything starves the model.
+ * Screened so that on every one: a strong pipeline clears the bar even with the
+ * time penalty at its cap, keeping everything is caught as unhandled blanks,
+ * dropping the blank rows is caught as selection bias, dropping everything
+ * starves the model, and keeping the spikes is caught as outlier contamination
+ * AND genuinely costs held-out accuracy (5–12 points against capping them). The
+ * fences also contain the whole 0–1 sensor range on every one, so Cap never
+ * alters a clean reading. `data-detox.test.ts` re-checks all of it.
  *
  * Seed 4101 was cut. Its strongest pipeline reached only 0.745, and — worse —
  * dropping every dirty row happened to leave a barely-balanced sample that WON,
  * which would have taught the opposite of the lesson on one round in six.
+ *
+ * Seeds 4103 and 4104 were cut when outliers became spikes. On 4103 keeping the
+ * spikes scored the same as capping them (0.845 against 0.843), which would have
+ * made "Outlier contamination" a verdict the meter contradicts; on 4104 the
+ * strong pipeline fell to 0.733, under the bar once the clock ran. 4108 and 4100
+ * replace them — 4100 rather than 4115, which passed everything else but has so
+ * many blanks (79% of its healthy rows) that the pooled blank rate across the
+ * rotation drifted off the configured one. 4102 stays first on purpose: the Concept Library quotes its
+ * class balance.
  */
-export const ROUND_SEEDS = [4102, 4103, 4104, 4105, 4106] as const;
+export const ROUND_SEEDS = [4102, 4105, 4106, 4108, 4100] as const;
 
 export function seedForRound(round: number): number {
   return ROUND_SEEDS[(Math.max(1, Math.floor(round)) - 1) % ROUND_SEEDS.length]!;
@@ -650,13 +754,19 @@ export function seedForRound(round: number): number {
 
 export const MATH_EQUATION = String.raw`\textbf{impute:}\quad x_{ij} \leftarrow \mathrm{median}_i\!\left(\{x_{ik} : x_{ik} \ne \varnothing\}\right)
 \qquad
-\textbf{cap:}\quad x_{ij} \leftarrow \min\!\left(\max\left(x_{ij},\, q_{0.05}\right),\, q_{0.95}\right)
+\textbf{drop:}\quad \text{row removed from } X
 \\[1.2em]
-\textbf{keep:}\quad x_{ij} \leftarrow \begin{cases} 0 & x_{ij} = \varnothing \\ x_{ij} & \text{otherwise} \end{cases}
-\qquad
-\textbf{drop:}\quad \text{row removed from } X`;
+\textbf{cap:}\quad x_{ij} \leftarrow \min\!\left(\max\left(x_{ij},\, Q_{1,i} - ${FENCE_K}\,\mathrm{IQR}_i\right),\, Q_{3,i} + ${FENCE_K}\,\mathrm{IQR}_i\right),
+\quad \mathrm{IQR}_i = Q_{3,i} - Q_{1,i}
+\\[1.2em]
+\textbf{keep:}\quad x_{ij} \leftarrow \begin{cases} 0 & x_{ij} = \varnothing \\ x_{ij} & \text{otherwise} \end{cases}`;
 
-export const MATH_CODE = `// Your four bins are these four transformations. Nothing else.
+export const MATH_CODE = `// The cap bounds are Tukey's fences, fitted once per column on the
+// dirty data (blanks skipped):
+//   low  = Q1 - ${FENCE_K} * (Q3 - Q1)
+//   high = Q3 + ${FENCE_K} * (Q3 - Q1)
+
+// Your four bins are these four transformations. Nothing else.
 const vector = FEATURES.map((feature) => {
   const raw = row.features[feature];
 
@@ -678,7 +788,7 @@ const vector = FEATURES.map((feature) => {
 
 // 'drop' never reaches here: the row is excluded from X entirely.`;
 
-export const MATH_NOTES = `x_ij is feature i of row j, and ∅ is a missing value. The medians and the 5th/95th percentiles are computed from the dirty data with blanks skipped — the same limited view you'd have in real life, which is why a few extreme values nudge those statistics around. Labels come from the clean measurements, so imputing and capping genuinely recover signal rather than inventing it. About ${Math.round(
+export const MATH_NOTES = `x_ij is feature i of row j, and ∅ is a missing value. The medians and the quartiles Q1 and Q3 are computed from the dirty data with blanks skipped — the same limited view you'd have in real life. Quartiles rather than the 5th and 95th percentiles on purpose: about one reading in ten is a spike, so the 95th percentile would sit among the spikes and a cap there would clamp almost nothing, while a quartile can't be dragged by anything short of a quarter of the column. Labels come from the clean measurements, so the dirt genuinely hides signal: imputing puts a plausible value back, and capping stops an impossible reading from swamping the rest of its row. About ${Math.round(
   LABEL_NOISE * 100,
 )}% of labels are wrong on purpose, so roughly ${Math.round(
   (1 - LABEL_NOISE) * 100,

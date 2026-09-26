@@ -4,8 +4,7 @@ import { useMemo } from "react";
 import { Play, RotateCcw } from "lucide-react";
 import { Button, CodeEditor } from "@/components";
 import { useCodeLane } from "@/engine/useCodeLane";
-import { CLEANING_ACTIONS, type CleaningAction } from "./ml";
-import { useDataDetoxStore } from "./store";
+import { createCodeApi } from "./store";
 
 /**
  * Data Detox — the code lane.
@@ -25,9 +24,9 @@ const STARTER_CODE = `// A preprocessing pipeline is a function from row to deci
 
 api.forEachRow((row) => {
   // row.isNull     — a cell is blank
-  // row.isOutlier  — a value is ~7x out of range
+  // row.isOutlier  — a sensor spiked far outside its 0-1 range
   if (row.isNull) return 'impute';   // fill with the column median
-  if (row.isOutlier) return 'cap';   // clamp into the 5th-95th range
+  if (row.isOutlier) return 'cap';   // clamp to the column's fences (api.stats())
   return 'keep';
 });
 
@@ -47,74 +46,17 @@ log('verdict', api.check().outcome);
 // plots, so dropping them deletes one class in particular.`;
 
 export interface CodeLaneProps {
-  /** Retrains the model and resolves with held-out accuracy. */
-  retrain: () => Promise<number>;
+  /**
+   * Retrains the model on the current pipeline and resolves with held-out
+   * accuracy, or null if the fit was superseded or cancelled before it finished.
+   */
+  retrain: () => Promise<number | null>;
 }
 
 export function CodeLane({ retrain }: CodeLaneProps) {
-  const store = useDataDetoxStore;
-
-  const api = useMemo(
-    () => ({
-      /** Apply a decision function to every row. The pipeline, as code. */
-      forEachRow: (decide: (row: unknown) => CleaningAction) => {
-        const rows = store.getState().rows;
-        for (const row of rows) {
-          const action = decide({
-            id: row.id,
-            features: { ...row.features },
-            isNull: row.isNull,
-            isOutlier: row.isOutlier,
-          });
-          if (!CLEANING_ACTIONS.includes(action)) {
-            throw new Error(
-              `Row ${row.id}: expected 'keep', 'impute', 'cap' or 'drop', got ${JSON.stringify(action)}`,
-            );
-          }
-          store.getState().setRowAction(row.id, action);
-        }
-      },
-
-      /** Decide one row by id. Same action the bins call. */
-      setAction: (rowId: string, action: CleaningAction) =>
-        store.getState().setRowAction(rowId, action),
-
-      /** The rows, as plain data. */
-      rows: () =>
-        store.getState().rows.map((row) => ({
-          id: row.id,
-          features: { ...row.features },
-          isNull: row.isNull,
-          isOutlier: row.isOutlier,
-          action: row.playerAction,
-        })),
-
-      kept: () => store.getState().pipeline.kept,
-      dropped: () => store.getState().pipeline.dropped,
-      blanksLeft: () => store.getState().pipeline.keptWithNaiveFill,
-      extremesLeft: () => store.getState().pipeline.keptWithOutlier,
-      balanceDrift: () => store.getState().pipeline.balanceDrift,
-      binCounts: () => ({ ...store.getState().pipeline.binCounts }),
-
-      /** Column medians and cap bounds, as the pipeline computes them. */
-      stats: () => {
-        const { stats } = store.getState();
-        return {
-          median: { ...stats.median },
-          low: { ...stats.low },
-          high: { ...stats.high },
-        };
-      },
-
-      /** Retrain and return held-out accuracy. Real TF.js, awaited. */
-      retrain,
-
-      accuracy: () => store.getState().modelAccuracy,
-      check: () => store.getState().check(),
-      reset: () => store.getState().reset(),
-    }),
-    [store, retrain],
-  );
+  // Built in the store module so its argument checking is unit-tested; the
+  // verbs are the same store actions the bins call (two-lane rule).
+  const api = useMemo(() => createCodeApi(retrain), [retrain]);
 
   const lane = useCodeLane({ initialCode: STARTER_CODE, api, maxRunMs: 20000 });
 
