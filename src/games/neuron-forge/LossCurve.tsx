@@ -110,7 +110,7 @@ export function LossCurve({ history, totalEpochs, training }: LossCurveProps) {
         {view === null
           ? "Binary cross-entropy on the training points, one value per epoch."
           : view.flattened && !training
-            ? "Flat and level: this architecture has learned everything it can. More epochs will not move it — only a different architecture will."
+            ? "Flat and level: more epochs will not move this curve — only a different architecture will."
             : training
               ? "Falling means the weights are still improving."
               : `Fell from ${view.first.toFixed(3)} to ${view.last.toFixed(3)} over ${history.length} epochs.`}

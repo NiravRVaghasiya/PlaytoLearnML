@@ -20,6 +20,7 @@ import {
   MIN_NEURONS_PER_LAYER,
   PATTERNS,
   architectureOf,
+  isScored,
   type Activation,
   type PatternId,
 } from "./ml";
@@ -35,10 +36,18 @@ import { VisualLane } from "./VisualLane";
 import { CodeLane } from "./CodeLane";
 import { useNeuronTrainer, type TrainerApi } from "./useTrainer";
 
+/**
+ * The engine's rule, stated for this game: ★1 any solve, ★2 a best score of at
+ * least HIGH_SCORE_THRESHOLD, ★3 that plus a solve started from the code lane.
+ * The score is held-out accuracy × the efficiency bonus, so the second star is
+ * earned by solving lean, not by solving at all.
+ */
 const STAR_CRITERIA = [
   "Solve a pattern",
-  `Score ${Math.round(HIGH_SCORE_THRESHOLD * 100)}% or better by solving it lean`,
-  "Solve one from the code lane",
+  `Score ${Math.round(
+    HIGH_SCORE_THRESHOLD * 100,
+  )}% or better — held-out accuracy × efficiency, so solve it lean`,
+  "Solve one with api.train() in the code lane",
 ];
 
 function PatternPicker() {
@@ -59,7 +68,7 @@ function PatternPicker() {
         value={patternId}
         disabled={training}
         onChange={(event) => setPattern(event.target.value as PatternId)}
-        className="mt-1 w-full rounded-md border border-border bg-surface-2 px-2 py-1.5 text-sm disabled:opacity-60"
+        className="mt-1 min-h-11 w-full rounded-md border border-border bg-surface-2 px-2 py-1.5 text-sm disabled:opacity-60"
       >
         {PATTERNS.map((spec) => (
           <option key={spec.id} value={spec.id}>
@@ -119,24 +128,27 @@ function LayerEditor() {
               >
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-xs font-medium">Layer {index + 1}</span>
+                  {/* 44×44 (DESIGN.md §9) around the same 14px icon. */}
                   <button
                     type="button"
                     onClick={() => removeLayer(index)}
                     disabled={training}
                     aria-label={`Remove layer ${index + 1}`}
-                    className="rounded p-1 text-text-muted hover:bg-surface hover:text-wrong focus-visible:ring-2 focus-visible:ring-primary focus-visible:outline-none disabled:opacity-50"
+                    className="inline-flex min-h-11 min-w-11 items-center justify-center rounded text-text-muted hover:bg-surface hover:text-wrong focus-visible:ring-2 focus-visible:ring-primary focus-visible:outline-none disabled:opacity-50"
                   >
                     <Trash2 aria-hidden="true" className="size-3.5" />
                   </button>
                 </div>
 
-                <div className="mt-1.5 flex items-center gap-1.5">
+                {/* Wraps rather than overflowing: at 44px the steppers, the
+                    count and the select can outgrow the 320px rail. */}
+                <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
                   <button
                     type="button"
                     onClick={() => setNeurons(index, layer.neurons - 1)}
                     disabled={training || layer.neurons <= MIN_NEURONS_PER_LAYER}
                     aria-label={`Remove a neuron from layer ${index + 1}, currently ${layer.neurons}`}
-                    className="rounded border border-border p-1 hover:bg-surface focus-visible:ring-2 focus-visible:ring-primary focus-visible:outline-none disabled:opacity-40"
+                    className="inline-flex min-h-11 min-w-11 items-center justify-center rounded border border-border hover:bg-surface focus-visible:ring-2 focus-visible:ring-primary focus-visible:outline-none disabled:opacity-40"
                   >
                     <Minus aria-hidden="true" className="size-3.5" />
                   </button>
@@ -153,7 +165,7 @@ function LayerEditor() {
                     onClick={() => setNeurons(index, layer.neurons + 1)}
                     disabled={!canGrow}
                     aria-label={`Add a neuron to layer ${index + 1}, currently ${layer.neurons}`}
-                    className="rounded border border-border p-1 hover:bg-surface focus-visible:ring-2 focus-visible:ring-primary focus-visible:outline-none disabled:opacity-40"
+                    className="inline-flex min-h-11 min-w-11 items-center justify-center rounded border border-border hover:bg-surface focus-visible:ring-2 focus-visible:ring-primary focus-visible:outline-none disabled:opacity-40"
                   >
                     <Plus aria-hidden="true" className="size-3.5" />
                   </button>
@@ -168,7 +180,7 @@ function LayerEditor() {
                     onChange={(event) =>
                       setActivation(index, event.target.value as Activation)
                     }
-                    className="ml-auto rounded border border-border bg-surface px-1.5 py-1 font-mono text-xs disabled:opacity-60"
+                    className="ml-auto min-h-11 rounded border border-border bg-surface px-1.5 py-1 font-mono text-xs disabled:opacity-60"
                   >
                     {ACTIVATIONS.map((activation) => (
                       <option key={activation} value={activation}>
@@ -279,7 +291,7 @@ export default function NeuronForge() {
   const lane = useNeuronForgeStore((s) => s.lane);
   const setLane = useNeuronForgeStore((s) => s.setLane);
   const setPattern = useNeuronForgeStore((s) => s.setPattern);
-  const reset = useNeuronForgeStore((s) => s.reset);
+  const retry = useNeuronForgeStore((s) => s.retry);
 
   const totalNeurons = useMemo(
     () => architectureOf(layers).totalNeurons,
@@ -299,8 +311,14 @@ export default function NeuronForge() {
 
   /**
    * The live metric (pedagogy contract #3): training loss, updated every epoch
-   * from real `model.fit` logs. The spec's win condition is stated in loss, and
-   * the loss curve beside it is what makes "converged but still wrong" visible.
+   * from real `model.fit` logs, with the loss curve beside it making "converged
+   * but still wrong" visible.
+   *
+   * Deliberate deviation: the spec states the win as "loss below threshold", but
+   * the win here is held-out accuracy (the readout below). Training loss says
+   * how well the network fits the points it has seen; only held-out accuracy can
+   * support a claim about what the architecture can represent, and a threshold
+   * on loss would also reward memorising the 2% of flipped labels.
    */
   const metric: MetricSpec = {
     label: "Loss",
@@ -323,7 +341,9 @@ export default function NeuronForge() {
       format: "percent",
       goodDirection: "up",
       caption: `need ${Math.round(spec.target * 100)}%`,
-      state: won ? "good" : accuracy !== null && !won ? "bad" : undefined,
+      // Red only for a judged miss. A stopped run's accuracy is real but was
+      // never scored, so it gets no verdict colour either way.
+      state: won ? "good" : failure ? "bad" : undefined,
     },
     {
       label: "Neurons",
@@ -334,13 +354,17 @@ export default function NeuronForge() {
     },
     {
       label: "Score",
-      value: lastEvaluation?.score ?? Number.NaN,
+      // A stopped or unfinished run is not scored, so it shows "—", not a
+      // "0%" that reads as a measured result.
+      value: isScored(lastEvaluation) ? lastEvaluation.score : Number.NaN,
       format: "percent",
       goodDirection: "up",
       caption:
         lastEvaluation === null
           ? "accuracy × efficiency"
-          : `${Math.round(lastEvaluation.efficiency * 100)}% efficiency bonus`,
+          : isScored(lastEvaluation)
+            ? `${Math.round(lastEvaluation.efficiency * 100)}% efficiency bonus`
+            : "not scored",
       state: won ? "good" : undefined,
     },
   ];
@@ -376,7 +400,10 @@ export default function NeuronForge() {
         recentGain: lastGain,
         starCriteria: STAR_CRITERIA,
       }}
-      onRetry={reset}
+      // Keep the architecture: the failure copy names the control to change, and
+      // the network it refers to has to still be there to change it. A fit in
+      // flight is stopped and waited out first, so it cannot land afterwards.
+      onRetry={() => void trainer.stopAndWait().then(retry)}
       onNext={
         won && nextPattern ? () => setPattern(nextPattern.id) : undefined
       }

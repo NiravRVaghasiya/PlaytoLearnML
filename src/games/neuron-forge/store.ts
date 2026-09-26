@@ -16,6 +16,7 @@ import {
   patternById,
   type Activation,
   type Architecture,
+  type Collapse,
   type Dataset,
   type Evaluation,
   type Layer,
@@ -74,6 +75,15 @@ export interface NeuronForgeState {
   whyCard: WhyCardContent | null;
   won: boolean;
   lane: Lane;
+  /**
+   * Which training run is current. Bumped by `beginTraining`, and handed back by
+   * the trainer when the fit resolves, so a result can only land on the run that
+   * asked for it. Every edit is already locked while `training`, so no second
+   * run can start under a first; the token makes "a stale fit never writes into
+   * a fresh run" a property of the store rather than of every caller remembering
+   * to check.
+   */
+  attempt: number;
 
   // ── actions ──────────────────────────────────────────────────────────
   setLane: (lane: Lane) => void;
@@ -86,17 +96,57 @@ export interface NeuronForgeState {
   /** Replace the whole architecture — the code lane's entry point. */
   applyArchitecture: (layers: Layer[]) => void;
 
-  beginTraining: () => void;
+  /** Returns the run's `attempt` token, for `finishTraining`. */
+  beginTraining: () => number;
   recordEpoch: (epoch: number, loss: number) => void;
   setSurface: (surface: Float32Array) => void;
-  /** Training finished: score it, name any failure, bank progress. */
-  finishTraining: (result: {
-    accuracy: number | null;
-    surface: Float32Array | null;
-  }) => Evaluation;
+  /**
+   * Training finished: score it, name any failure, bank progress.
+   *
+   * Returns null — and changes nothing — when `attempt` names a run that is no
+   * longer current.
+   */
+  finishTraining: (
+    result: TrainingResult,
+    attempt?: number,
+  ) => Evaluation | null;
 
+  /**
+   * Clear the last result but keep the architecture — the named failure's
+   * Retry. The failure copy tells the player which control to change; wiping
+   * the network they were told to adjust would throw that advice away.
+   */
+  retry: () => void;
   /** Clear the architecture, keep the puzzle. */
   reset: () => void;
+}
+
+export interface TrainingResult {
+  /** Held-out accuracy, or null when the network could not be measured. */
+  accuracy: number | null;
+  surface: Float32Array | null;
+  /** From `diagnoseCollapse`, when the output came out flat. */
+  collapse?: Collapse | null;
+  /** Epochs the fit ran. Omitted means all of them. */
+  epochsRun?: number;
+  /**
+   * True when a code-lane `api.train()` started this run. Mastery's third star
+   * and the code-lane XP multiplier go to the path that did the work, not to
+   * whichever tab happened to be open when the rail's Train button was pressed.
+   */
+  fromCode?: boolean;
+}
+
+/** What an edit did, for the why-card's opening clause. */
+function changeBetween(
+  before: Layer[],
+  after: Layer[],
+): "layer-added" | "layer-removed" | "neurons" | "activation" {
+  if (after.length > before.length) return "layer-added";
+  if (after.length < before.length) return "layer-removed";
+  return after.some((layer, index) => layer.activation !== before[index]?.activation)
+    ? "activation"
+    : "neurons";
 }
 
 /**
@@ -162,6 +212,7 @@ export const useNeuronForgeStore = create<NeuronForgeState>((set, get) => ({
   ...untrained(),
   whyCard: whyCardFor({ kind: "reset" }),
   lane: "visual" as Lane,
+  attempt: 0,
 
   setLane: (lane) => set({ lane }),
 
@@ -298,14 +349,18 @@ export const useNeuronForgeStore = create<NeuronForgeState>((set, get) => ({
         kind: "architecture-changed",
         architecture: architectureOf(layers),
         pattern: spec,
-        change: "neurons",
+        // Derived from the diff: a script that swaps an activation or adds a
+        // layer should not be told "Width changed".
+        change: changeBetween(state.layers, layers),
       }),
     });
   },
 
   beginTraining: () => {
     const state = get();
+    const attempt = state.attempt + 1;
     set({
+      attempt,
       training: true,
       epoch: 0,
       loss: Number.NaN,
@@ -320,6 +375,7 @@ export const useNeuronForgeStore = create<NeuronForgeState>((set, get) => ({
         pattern: patternById(state.patternId),
       }),
     });
+    return attempt;
   },
 
   recordEpoch: (epoch, loss) => {
@@ -332,14 +388,22 @@ export const useNeuronForgeStore = create<NeuronForgeState>((set, get) => ({
 
   setSurface: (surface) => set({ surface }),
 
-  finishTraining: ({ accuracy, surface }) => {
+  finishTraining: (
+    { accuracy, surface, collapse = null, epochsRun, fromCode = false },
+    attempt,
+  ) => {
     const state = get();
+    if (attempt !== undefined && attempt !== state.attempt) return null;
+
     const spec = patternById(state.patternId);
+    const architecture = architectureOf(state.layers);
     const evaluation = evaluate({
       pattern: spec,
-      architecture: architectureOf(state.layers),
+      architecture,
       accuracy,
       loss: state.loss,
+      collapse,
+      epochsRun,
     });
 
     set({
@@ -349,20 +413,39 @@ export const useNeuronForgeStore = create<NeuronForgeState>((set, get) => ({
       lastEvaluation: evaluation,
       failure: evaluation.failure,
       won: evaluation.outcome === "win",
-      whyCard: whyCardFor({ kind: "trained", evaluation, pattern: spec }),
+      whyCard: whyCardFor({
+        kind: "trained",
+        evaluation,
+        pattern: spec,
+        architecture,
+        collapse,
+      }),
     });
 
     if (evaluation.outcome === "win") {
       useProgression.getState().recordResult({
         slug: SLUG,
         score: evaluation.score,
-        lane: state.lane,
+        lane: fromCode ? "code" : "visual",
         completed: true,
-        codeLaneCleared: state.lane === "code",
+        codeLaneCleared: fromCode,
       });
     }
 
     return evaluation;
+  },
+
+  retry: () => {
+    const state = get();
+    if (state.training) return;
+    set({
+      ...untrained(),
+      whyCard: whyCardFor({
+        kind: "retry",
+        architecture: architectureOf(state.layers),
+        pattern: patternById(state.patternId),
+      }),
+    });
   },
 
   reset: () => {

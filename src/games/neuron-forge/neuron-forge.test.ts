@@ -1,8 +1,22 @@
 import * as tf from "@tensorflow/tfjs";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
+  HIGH_SCORE_THRESHOLD,
+  createMemoryAdapter,
+  useProgression,
+} from "@/engine/progression";
+import {
   ACTIVATIONS,
   EFFICIENCY_WEIGHT,
+  FLAT_OUTPUT_SPREAD,
+  containsMinimalSolution,
+  cutsBeforeFirstBend,
+  diagnoseCollapse,
+  isScored,
+  isSingleCut,
+  outputSpread,
+  scoreOf,
+  shortOf,
   MAX_NEURONS_PER_LAYER,
   MODEL_SEED,
   PATTERNS,
@@ -23,15 +37,18 @@ import {
   toMatrix,
   MAX_LAYERS,
   type Activation,
+  type Collapse,
   type Layer,
   type PatternId,
 } from "./ml";
 import {
+  SLUG,
   budgetRemaining,
   canAddLayer,
   canGrowLayer,
   useNeuronForgeStore,
 } from "./store";
+import { whyCardFor } from "./why-cards";
 
 beforeAll(async () => {
   await tf.ready();
@@ -40,16 +57,45 @@ beforeAll(async () => {
 const hidden = (spec: Array<[number, Activation]>): Layer[] =>
   spec.map(([neurons, activation]) => ({ neurons, activation }));
 
-/** Train the architecture on the puzzle exactly as the game does. */
-async function trainAndScore(
+interface Diagnosed {
+  accuracy: number;
+  collapse: Collapse | null;
+  spread: number;
+}
+
+/**
+ * Fits are deterministic (seeded data, seeded weights, no shuffling), so each
+ * architecture is trained once per file however many tests ask about it.
+ */
+const diagnosed = new Map<string, Promise<Diagnosed>>();
+
+/**
+ * Train the architecture on the puzzle exactly as the game does, then run the
+ * same post-training check the trainer runs.
+ */
+function trainAndDiagnose(
+  pattern: PatternId,
+  layers: readonly Layer[],
+): Promise<Diagnosed> {
+  const key = `${pattern}|${JSON.stringify(layers)}`;
+  let pending = diagnosed.get(key);
+  if (!pending) {
+    pending = fitAndDiagnose(pattern, [...layers]);
+    diagnosed.set(key, pending);
+  }
+  return pending;
+}
+
+async function fitAndDiagnose(
   pattern: PatternId,
   layers: Layer[],
-): Promise<number> {
+): Promise<Diagnosed> {
   const dataset = generateDataset(pattern, 7001);
   const train = toMatrix(dataset.train);
   const test = toMatrix(dataset.test);
 
-  const model = buildModel(architectureOf(layers), MODEL_SEED);
+  const architecture = architectureOf(layers);
+  const model = buildModel(architecture, MODEL_SEED);
   const xs = tf.tensor2d(train.xs);
   const ys = tf.tensor2d(train.ys.map((y) => [y]));
   await model.fit(xs, ys, {
@@ -64,14 +110,33 @@ async function trainAndScore(
     return (model.predict(input) as tf.Tensor).dataSync();
   });
   const accuracy = accuracyFromPredictions(predictions, test.ys);
+  const collapse = diagnoseCollapse(model, architecture, train.xs, predictions);
 
   xs.dispose();
   ys.dispose();
   const optimizer = model.optimizer;
   model.dispose();
   optimizer?.dispose();
-  return accuracy;
+  return { accuracy, collapse, spread: outputSpread(predictions) };
 }
+
+async function trainAndScore(
+  pattern: PatternId,
+  layers: readonly Layer[],
+): Promise<number> {
+  return (await trainAndDiagnose(pattern, layers)).accuracy;
+}
+
+/**
+ * How far each rung of the ladder must sit from its puzzle's target.
+ *
+ * The same code measured 1–3 points apart across TF.js backends (WebGL vs CPU,
+ * Chromium vs Node). A target within a point of a rung decides the lesson by
+ * float rounding on the player's GPU, so the targets are placed with room on
+ * both sides and this holds them there. 2.5 points is 12–13 of the 500
+ * held-out points.
+ */
+const LADDER_MARGIN = 0.025;
 
 describe("datasets", () => {
   it("is deterministic for a given seed", () => {
@@ -297,7 +362,8 @@ describe("the capacity ladder", () => {
 
   it("solves a linear puzzle with no hidden layer at all", async () => {
     const pattern = patternById("linear");
-    const accuracy = await trainAndScore("linear", []);
+    expect(pattern.minimalLayers).toEqual([]);
+    const accuracy = await trainAndScore("linear", pattern.minimalLayers);
     expect(accuracy).toBeGreaterThanOrEqual(pattern.target);
   }, 120000);
 
@@ -316,29 +382,427 @@ describe("the capacity ladder", () => {
 
   it("needs four relu neurons for a circle, and three is not enough", async () => {
     const pattern = patternById("circle");
-    const enough = await trainAndScore("circle", hidden([[4, "relu"]]));
+    // The stated minimal solution itself, so the copy and the check agree.
+    expect(pattern.minimalLayers).toEqual(hidden([[4, "relu"]]));
+    const enough = await trainAndScore("circle", pattern.minimalLayers);
     const tooFew = await trainAndScore("circle", hidden([[3, "relu"]]));
-    expect(enough).toBeGreaterThanOrEqual(pattern.target);
-    expect(tooFew).toBeLessThan(pattern.target);
+    expect(enough).toBeGreaterThanOrEqual(pattern.target + LADDER_MARGIN);
+    expect(tooFew).toBeLessThanOrEqual(pattern.target - LADDER_MARGIN);
   }, 240000);
 
   it("needs four relu neurons for XOR, and three is not enough", async () => {
     const pattern = patternById("xor");
-    const enough = await trainAndScore("xor", hidden([[4, "relu"]]));
+    expect(pattern.minimalLayers).toEqual(hidden([[4, "relu"]]));
+    const enough = await trainAndScore("xor", pattern.minimalLayers);
     const tooFew = await trainAndScore("xor", hidden([[3, "relu"]]));
-    expect(enough).toBeGreaterThanOrEqual(pattern.target);
-    expect(tooFew).toBeLessThan(pattern.target);
+    expect(enough).toBeGreaterThanOrEqual(pattern.target + LADDER_MARGIN);
+    expect(tooFew).toBeLessThanOrEqual(pattern.target - LADDER_MARGIN);
   }, 240000);
 
   it("needs depth for a spiral: one wide layer plateaus, two stacked clear it", async () => {
     const pattern = patternById("spiral");
-    const deep = await trainAndScore("spiral", hidden([[8, "relu"], [8, "relu"]]));
+    expect(pattern.minimalLayers).toEqual(hidden([[8, "relu"], [8, "relu"]]));
+    const deep = await trainAndScore("spiral", pattern.minimalLayers);
     const wide = await trainAndScore("spiral", hidden([[8, "relu"]]));
-    expect(deep).toBeGreaterThanOrEqual(pattern.target);
-    expect(wide).toBeLessThan(pattern.target);
+    expect(deep).toBeGreaterThanOrEqual(pattern.target + LADDER_MARGIN);
+    expect(wide).toBeLessThanOrEqual(pattern.target - LADDER_MARGIN);
     // Same activation, same width, only depth differs.
     expect(deep).toBeGreaterThan(wide);
   }, 240000);
+});
+
+describe("a network that stopped learning", () => {
+  // The misdiagnosis this guards against: a deep narrow relu stack collapses to
+  // a constant and used to be called "Insufficient capacity", sending the player
+  // to add neurons to a network whose neurons were never the problem.
+
+  it("names Dying ReLU when a relu layer dies, not Insufficient capacity", async () => {
+    // The whole spiral budget in three layers: strictly more expressive than
+    // the 8→8 that solves it, measured to end with layer 3 dead.
+    const layers = hidden([[8, "relu"], [8, "relu"], [4, "relu"]]);
+    const { accuracy, collapse, spread } = await trainAndDiagnose("spiral", layers);
+
+    expect(spread).toBeLessThan(FLAT_OUTPUT_SPREAD);
+    expect(collapse?.kind).toBe("dead-relu");
+    expect(collapse?.layer).toBe(2);
+
+    const result = evaluate({
+      pattern: patternById("spiral"),
+      architecture: architectureOf(layers),
+      accuracy,
+      loss: 0.6932,
+      collapse,
+    });
+    expect(result.outcome).toBe("dead-network");
+    expect(result.failure?.name).toBe("Dying ReLU");
+    expect(result.failure?.detail).toMatch(/hidden layer 3/);
+    // The false claim the old diagnosis made about this network.
+    expect(result.failure?.detail).not.toMatch(/can bend the boundary/i);
+    // It holds 8→8, so "not a lack of capacity" is a promise it can keep.
+    expect(result.failure?.detail).toMatch(/not a lack of capacity/);
+
+    // Worded as measured. The check covers the training and held-out points;
+    // the heatmap covers the whole square, and this network's surface still
+    // varies in the spiral's empty corners.
+    expect(result.failure?.detail).toMatch(/every training and held-out point/);
+    expect(result.failure?.detail).not.toMatch(/whole plane/i);
+    const card = whyCardFor({
+      kind: "trained",
+      evaluation: result,
+      pattern: patternById("spiral"),
+      architecture: architectureOf(layers),
+      collapse,
+    });
+    expect(card.body).toMatch(/every training and held-out point/);
+    expect(card.body).not.toMatch(/single colou?r/i);
+  }, 240000);
+
+  it("names saturation, not a dead relu, when a tanh stack pins at its limits", async () => {
+    const layers = hidden([[8, "tanh"], [8, "tanh"], [4, "tanh"]]);
+    const { accuracy, collapse } = await trainAndDiagnose("spiral", layers);
+    expect(collapse?.kind).toBe("saturated");
+    expect(collapse?.activation).toBe("tanh");
+
+    const result = evaluate({
+      pattern: patternById("spiral"),
+      architecture: architectureOf(layers),
+      accuracy,
+      loss: 0.6932,
+      collapse,
+    });
+    expect(result.failure?.name).toBe("Saturated activations");
+    expect(result.failure?.detail).toMatch(/Every tanh unit in hidden layer 3/);
+    expect(result.failure?.detail).not.toMatch(/relu unit/i);
+  }, 240000);
+
+  it("finds nothing wrong with a network that learned", async () => {
+    const { collapse, spread } = await trainAndDiagnose(
+      "circle",
+      hidden([[4, "relu"]]),
+    );
+    expect(spread).toBeGreaterThan(FLAT_OUTPUT_SPREAD);
+    expect(collapse).toBeNull();
+  }, 240000);
+
+  it("measures spread as the range of the predictions", () => {
+    expect(outputSpread([0.2, 0.9, 0.5])).toBeCloseTo(0.7, 10);
+    expect(outputSpread([0.47, 0.47, 0.47])).toBe(0);
+  });
+
+  it("still calls an all-linear stack 'No non-linearity' first", () => {
+    // The linear diagnosis has the more actionable fix, so it outranks a flat
+    // output on a puzzle that needs a bend.
+    const result = evaluate({
+      pattern: patternById("circle"),
+      architecture: architectureOf(hidden([[4, "linear"], [4, "linear"]])),
+      accuracy: 0.44,
+      loss: 0.69,
+      collapse: { kind: "flat", layer: null, activation: null, output: 0.5 },
+    });
+    expect(result.outcome).toBe("no-nonlinearity");
+  });
+});
+
+describe("a network that holds the minimal solution", () => {
+  // The misdiagnosis this guards against: from the winning 8→8, "Add a layer"
+  // and + give 8→8→3 — measured at 0.654 with the output still varying, so no
+  // collapse is found — and it was called "Insufficient capacity", for a
+  // network that strictly contains the one that solves the puzzle.
+
+  it("knows which networks contain the minimal solution", () => {
+    const holds = (pattern: PatternId, spec: Array<[number, Activation]>) =>
+      containsMinimalSolution(architectureOf(hidden(spec)), patternById(pattern));
+
+    // Minimal solution, wider, or deeper behind it: all contain it.
+    expect(holds("xor", [[4, "relu"]])).toBe(true);
+    expect(holds("circle", [[8, "relu"]])).toBe(true);
+    expect(holds("xor", [[4, "relu"], [2, "relu"]])).toBe(true);
+    expect(holds("xor", [[4, "relu"], [4, "relu"], [2, "relu"]])).toBe(true);
+    expect(holds("spiral", [[8, "relu"], [8, "relu"], [3, "relu"]])).toBe(true);
+    expect(holds("spiral", [[8, "relu"], [8, "relu"], [4, "tanh"]])).toBe(true);
+    // Logistic regression is inside every network.
+    expect(holds("linear", [])).toBe(true);
+    expect(holds("linear", [[1, "relu"]])).toBe(true);
+
+    // Too narrow, too shallow, the wrong activation, or a narrow layer in front.
+    expect(holds("circle", [[1, "relu"]])).toBe(false);
+    expect(holds("circle", [[3, "relu"]])).toBe(false);
+    expect(holds("spiral", [[8, "relu"]])).toBe(false);
+    expect(holds("spiral", [[8, "relu"], [4, "relu"], [8, "relu"]])).toBe(false);
+    expect(holds("circle", [[4, "tanh"]])).toBe(false);
+    expect(holds("circle", [[4, "linear"], [4, "relu"]])).toBe(false);
+    expect(holds("circle", [])).toBe(false);
+  });
+
+  it.each<[PatternId, Array<[number, Activation]>]>([
+    ["xor", [[4, "relu"], [2, "relu"]]],
+    ["xor", [[4, "relu"], [4, "relu"], [2, "relu"]]],
+    ["spiral", [[8, "relu"], [8, "relu"], [3, "relu"]]],
+  ])(
+    "names %s %j an optimisation failure, not insufficient capacity",
+    async (id, spec) => {
+      const pattern = patternById(id);
+      const layers = hidden(spec);
+      const architecture = architectureOf(layers);
+      const { accuracy, collapse } = await trainAndDiagnose(id, layers);
+
+      // Measured to miss without collapsing — the case the old code misnamed.
+      expect(accuracy).toBeLessThan(pattern.target);
+      expect(collapse).toBeNull();
+
+      const result = evaluate({ pattern, architecture, accuracy, loss: 0.5, collapse });
+      expect(result.outcome).toBe("optimisation-failure");
+      expect(result.failure?.name).toBe("Optimisation failure");
+      expect(result.failure?.detail).toMatch(/capacity is not what is missing/);
+      expect(result.failure?.detail).toMatch(/Drop back to/);
+      expect(result.failure?.detail).not.toMatch(/budget to spend|can bend the boundary/i);
+
+      const card = whyCardFor({
+        kind: "trained",
+        evaluation: result,
+        pattern,
+        architecture,
+        collapse,
+      });
+      expect(card.title).toMatch(/^Optimisation failure — \d+(\.\d)?% of the \d+% needed/);
+      // Not dead, so none of the flat-output copy.
+      expect(card.body).not.toMatch(/same answer|P\(class B\)/);
+      expect(card.conceptHref).toBe("/concepts/gradient-descent");
+      expect(card.conceptLabel).toBe("Local versus global minima");
+    },
+    240000,
+  );
+
+  it.each<[PatternId, Array<[number, Activation]>]>([
+    ["circle", [[1, "relu"]]],
+    ["circle", [[3, "relu"]]],
+    ["spiral", [[8, "relu"]]],
+  ])(
+    "still names %s %j insufficient capacity",
+    async (id, spec) => {
+      const pattern = patternById(id);
+      const architecture = architectureOf(hidden(spec));
+      const { accuracy, collapse } = await trainAndDiagnose(id, hidden(spec));
+      expect(accuracy).toBeLessThan(pattern.target);
+      expect(collapse).toBeNull();
+      const result = evaluate({ pattern, architecture, accuracy, loss: 0.5, collapse });
+      expect(result.outcome).toBe("insufficient-capacity");
+      expect(result.failure?.name).toBe("Insufficient capacity");
+    },
+    240000,
+  );
+
+  it("does not tell the minimal solution itself to drop back to itself", () => {
+    // Not measured to happen on any backend, but the copy must still be true if
+    // a device's rounding ever lands the circle's 4 relu under the bar.
+    const result = evaluate({
+      pattern: patternById("circle"),
+      architecture: architectureOf(hidden([[4, "relu"]])),
+      accuracy: 0.8,
+      loss: 0.4,
+    });
+    expect(result.outcome).toBe("optimisation-failure");
+    expect(result.failure?.detail).not.toMatch(/Drop back/);
+    expect(result.failure?.detail).toMatch(/change the arrangement/);
+  });
+
+  it("only promises 'not a lack of capacity' for a dead network that has it", () => {
+    const flat = { kind: "dead-relu" as const, layer: 1, activation: "relu" as const, output: 0.5 };
+    const small = evaluate({
+      pattern: patternById("circle"),
+      architecture: architectureOf(hidden([[2, "relu"], [2, "relu"]])),
+      accuracy: 0.502,
+      loss: 0.69,
+      collapse: flat,
+    });
+    expect(small.failure?.name).toBe("Dying ReLU");
+    expect(small.failure?.detail).not.toMatch(/not a lack of capacity/);
+  });
+});
+
+describe("the Score readout", () => {
+  it("shows a score only for a run that was judged", () => {
+    const pattern = patternById("circle");
+    const architecture = architectureOf(hidden([[4, "relu"]]));
+    const judged = (input: { accuracy: number | null; epochsRun?: number }) =>
+      isScored(evaluate({ pattern, architecture, loss: 0.3, ...input }));
+
+    expect(isScored(null)).toBe(false);
+    // Stopped, or the fit never produced a measurement: "not scored".
+    expect(judged({ accuracy: 0.9, epochsRun: 51 })).toBe(false);
+    expect(judged({ accuracy: null })).toBe(false);
+    // A win and a named failure both carry a real score.
+    expect(judged({ accuracy: 0.91 })).toBe(true);
+    expect(
+      isScored(
+        evaluate({
+          pattern,
+          architecture: architectureOf(hidden([[2, "relu"]])),
+          accuracy: 0.676,
+          loss: 0.55,
+        }),
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("one neuron is one straight cut", () => {
+  it("counts the cuts in front of the first bend", () => {
+    expect(cutsBeforeFirstBend(architectureOf(hidden([[4, "relu"]])))).toBe(4);
+    expect(
+      cutsBeforeFirstBend(architectureOf(hidden([[1, "relu"], [8, "relu"]]))),
+    ).toBe(1);
+    // A narrow linear layer in front narrows every cut after it.
+    expect(
+      cutsBeforeFirstBend(architectureOf(hidden([[1, "linear"], [8, "relu"]]))),
+    ).toBe(1);
+    expect(
+      cutsBeforeFirstBend(architectureOf(hidden([[2, "linear"], [8, "relu"]]))),
+    ).toBe(2);
+    expect(isSingleCut(architectureOf([]))).toBe(false);
+    expect(isSingleCut(architectureOf(hidden([[1, "linear"]])))).toBe(false);
+  });
+
+  it("does not claim a single-neuron layer bends the boundary", () => {
+    // The default "Add a layer" state: one relu neuron on the circle, measured
+    // at 0.608 with a single straight edge on the surface.
+    const architecture = architectureOf(hidden([[1, "relu"]]));
+    const result = evaluate({
+      pattern: patternById("circle"),
+      architecture,
+      accuracy: 0.608,
+      loss: 0.588,
+    });
+    expect(result.outcome).toBe("insufficient-capacity");
+    expect(result.failure?.detail).not.toMatch(/can bend the boundary/i);
+    expect(result.failure?.detail).toMatch(/straight lines/i);
+
+    const card = whyCardFor({
+      kind: "trained",
+      evaluation: result,
+      pattern: patternById("circle"),
+      architecture,
+      collapse: null,
+    });
+    expect(card.body).not.toMatch(/bending|curve in the surface/i);
+  });
+
+  it("says so as soon as the one-neuron layer is added, before training", () => {
+    const card = whyCardFor({
+      kind: "architecture-changed",
+      architecture: architectureOf(hidden([[1, "relu"]])),
+      pattern: patternById("circle"),
+      change: "layer-added",
+    });
+    expect(card.body).toMatch(/still a straight line/i);
+  });
+});
+
+describe("a stopped run", () => {
+  it("is measured but not judged, and scores nothing", () => {
+    // Stopping the circle's known solution half way used to be called
+    // "Insufficient capacity" — for the architecture that solves it.
+    const result = evaluate({
+      pattern: patternById("circle"),
+      architecture: architectureOf(hidden([[4, "relu"]])),
+      accuracy: 0.9,
+      loss: 0.3,
+      epochsRun: 51,
+    });
+    expect(result.outcome).toBe("stopped");
+    expect(result.failure).toBeNull();
+    expect(result.solved).toBe(false);
+    expect(result.score).toBe(0);
+    expect(result.epochsRun).toBe(51);
+  });
+
+  it("is scored normally once every epoch has run", () => {
+    const result = evaluate({
+      pattern: patternById("circle"),
+      architecture: architectureOf(hidden([[4, "relu"]])),
+      accuracy: 0.9,
+      loss: 0.2,
+      epochsRun: TRAIN_EPOCHS,
+    });
+    expect(result.outcome).toBe("win");
+  });
+});
+
+describe("numbers in the copy", () => {
+  it("never writes a miss as reaching the bar", () => {
+    expect(shortOf(0.848, 0.85)).toBe("84.8%");
+    expect(shortOf(0.849, 0.85)).toBe("84.9%");
+    expect(shortOf(0.8, 0.85)).toBe("80%");
+
+    const result = evaluate({
+      pattern: patternById("circle"),
+      architecture: architectureOf(hidden([[2, "relu"]])),
+      accuracy: 0.848,
+      loss: 0.4,
+    });
+    expect(result.failure?.detail).toMatch(
+      /^84\.8% on held-out points, short of the 85%/,
+    );
+  });
+
+  it("scores at the precision the Score readout shows", () => {
+    // The circle's measured minimal solution: 0.912 held-out at 4 of 8 neurons.
+    // Unrounded that is 0.798 — displayed as "80%" and denied the 80% star.
+    const result = evaluate({
+      pattern: patternById("circle"),
+      architecture: architectureOf(hidden([[4, "relu"]])),
+      accuracy: 0.912,
+      loss: 0.18,
+    });
+    expect(result.score).toBe(0.8);
+    expect(result.score).toBeGreaterThanOrEqual(HIGH_SCORE_THRESHOLD);
+    // Rounding is to the displayed whole percent, never a free bump past it.
+    expect(scoreOf(0.79, 1)).toBe(0.79);
+    expect(scoreOf(0.7949, 1)).toBe(0.79);
+  });
+
+  it("leads every result card with the outcome and its number", () => {
+    // The title is what screen readers are told. It has to carry the result.
+    const pattern = patternById("circle");
+    const architecture = architectureOf(hidden([[4, "relu"]]));
+    const won = whyCardFor({
+      kind: "trained",
+      evaluation: evaluate({ pattern, architecture, accuracy: 0.912, loss: 0.18 }),
+      pattern,
+      architecture,
+      collapse: null,
+    });
+    expect(won.title).toMatch(/^Solved: 91% held-out/);
+
+    const linear = architectureOf(hidden([[4, "linear"]]));
+    const lost = whyCardFor({
+      kind: "trained",
+      evaluation: evaluate({
+        pattern,
+        architecture: linear,
+        accuracy: 0.44,
+        loss: 0.69,
+      }),
+      pattern,
+      architecture: linear,
+      collapse: null,
+    });
+    expect(lost.title).toMatch(/^No non-linearity — stuck at 44%/);
+  });
+
+  it("links result cards to Concept Library sections that exist", () => {
+    const pattern = patternById("circle");
+    const architecture = architectureOf(hidden([[2, "relu"]]));
+    const card = whyCardFor({
+      kind: "trained",
+      evaluation: evaluate({ pattern, architecture, accuracy: 0.676, loss: 0.55 }),
+      pattern,
+      architecture,
+      collapse: null,
+    });
+    expect(card.conceptHref).toBe("/concepts/decision-boundaries");
+    expect(card.conceptLabel).toBe("Bias and capacity");
+  });
 });
 
 describe("budgets", () => {
@@ -478,5 +942,92 @@ describe("the store's budget invariants", () => {
     store.getState().finishTraining({ accuracy: 0.93, surface: null });
     expect(store.getState().won).toBe(true);
     expect(store.getState().failure).toBeNull();
+  });
+
+  it("drops a result that belongs to a superseded run", () => {
+    store.getState().setPattern("circle");
+    store.getState().addLayer();
+    const current = store.getState().beginTraining();
+    const stale = store
+      .getState()
+      .finishTraining({ accuracy: 0.99, surface: null }, current - 1);
+    expect(stale).toBeNull();
+    expect(store.getState().training).toBe(true);
+    expect(store.getState().accuracy).toBeNull();
+
+    const applied = store
+      .getState()
+      .finishTraining({ accuracy: 0.5, surface: null }, current);
+    expect(applied?.outcome).toBe("insufficient-capacity");
+    expect(store.getState().training).toBe(false);
+  });
+
+  it("retries without wiping the architecture the failure told you to change", () => {
+    store.getState().setPattern("circle");
+    store.getState().addLayer();
+    store.getState().setActivation(0, "linear");
+    store.getState().setNeurons(0, 4);
+    store.getState().finishTraining({ accuracy: 0.44, surface: null });
+    expect(store.getState().failure?.name).toBe("No non-linearity");
+
+    store.getState().retry();
+    expect(store.getState().layers).toEqual([{ neurons: 4, activation: "linear" }]);
+    expect(store.getState().failure).toBeNull();
+    expect(store.getState().accuracy).toBeNull();
+  });
+
+  it("does not score a stopped run or bank progress for it", () => {
+    useProgression.getState().setAdapter(createMemoryAdapter());
+    useProgression.setState({ xp: 0, games: {}, badges: [], lastGain: null });
+    store.getState().setPattern("circle");
+    store.getState().addLayer();
+    store.getState().setNeurons(0, 4);
+    store
+      .getState()
+      .finishTraining({ accuracy: 0.95, surface: null, epochsRun: 51 });
+
+    expect(store.getState().won).toBe(false);
+    expect(store.getState().failure).toBeNull();
+    expect(store.getState().whyCard?.title).toMatch(/^Stopped at epoch 51 of 160/);
+    expect(useProgression.getState().games[SLUG]).toBeUndefined();
+  });
+
+  it("describes a code-lane edit by what it changed", () => {
+    store.getState().setPattern("circle");
+    store.getState().applyArchitecture([{ neurons: 4, activation: "relu" }]);
+    store.getState().applyArchitecture([{ neurons: 4, activation: "tanh" }]);
+    expect(store.getState().whyCard?.body).toMatch(/^New activation/);
+    store.getState().applyArchitecture([
+      { neurons: 4, activation: "tanh" },
+      { neurons: 2, activation: "tanh" },
+    ]);
+    expect(store.getState().whyCard?.body).toMatch(/^Another layer/);
+  });
+});
+
+describe("code-lane credit", () => {
+  const store = useNeuronForgeStore;
+
+  beforeEach(() => {
+    useProgression.getState().setAdapter(createMemoryAdapter());
+    useProgression.setState({ xp: 0, games: {}, badges: [], lastGain: null });
+    store.getState().setPattern("circle");
+    store.getState().addLayer();
+    store.getState().setNeurons(0, 4);
+  });
+
+  it("is not earned by clicking Train while the code tab happens to be open", () => {
+    store.getState().setLane("code");
+    store.getState().finishTraining({ accuracy: 0.93, surface: null });
+    expect(useProgression.getState().games[SLUG]?.completed).toBe(true);
+    expect(useProgression.getState().games[SLUG]?.codeLaneCleared).toBe(false);
+    store.getState().setLane("visual");
+  });
+
+  it("is earned by a solve that api.train() started", () => {
+    store
+      .getState()
+      .finishTraining({ accuracy: 0.93, surface: null, fromCode: true });
+    expect(useProgression.getState().games[SLUG]?.codeLaneCleared).toBe(true);
   });
 });

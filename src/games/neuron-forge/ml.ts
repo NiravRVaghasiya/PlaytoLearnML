@@ -23,6 +23,11 @@ import { clamp, gaussian, seededRandom } from "@/lib/utils";
  *   - No non-linearity       — there is plenty of it, and it's the wrong shape
  *
  * Diagnosing those the same way would send the player to the wrong control.
+ * Two more exist because capacity is not the only thing that can run out: a
+ * network that has enough of the right shape can still fail to train. It is
+ * named after what was measured — a dead or saturated layer ("Dying ReLU",
+ * "Saturated activations"), or, when it holds the minimal solution and still
+ * misses, "Optimisation failure" — never "Insufficient capacity".
  */
 
 export type Activation = "relu" | "tanh" | "sigmoid" | "linear";
@@ -89,9 +94,12 @@ export const EFFICIENCY_WEIGHT = 0.25;
  * distinct local optima, and which one depends entirely on the initial weights:
  * across seeds, XOR with 3–4 neurons returned the same small set of scores
  * (~0.89 / ~0.81 / ~0.72) in different orders. Seed 3 is the one measured to
- * give a non-decreasing capacity ladder on every puzzle, so adding a neuron
- * never *looks* like it made things worse. `capacity-ladder` in the test file
- * pins that down, because a different seed would quietly break the lesson.
+ * put each puzzle's stated minimal solution clearly above its target and the
+ * rung below it clearly under. It is NOT a promise that every extra neuron
+ * helps — XOR with 5 relu scores 0.882, a point below 4's 0.892 — which is why
+ * the targets sit several points clear of both rungs rather than between two
+ * neighbouring widths. `capacity-ladder` in the test file pins the margins down,
+ * because a different seed would quietly break the lesson.
  */
 export const MODEL_SEED = 3;
 
@@ -102,10 +110,32 @@ export interface PatternSpec {
   hint: string;
   /** Neuron budget (spec: "a compute budget caps total neurons"). */
   budget: number;
-  /** Held-out accuracy that counts as solved. */
+  /**
+   * Held-out accuracy that counts as solved.
+   *
+   * Set in the middle of the cliff between the minimal solution and the rung
+   * below it, not just under the minimal solution. These networks are chaotic in
+   * float rounding: the same code measured 1–3 points apart on the WebGL and CPU
+   * backends, and Chromium's CPU backend differs from Node's (spiral 8×8 scored
+   * 0.854 in one and 0.930 in the other). A target a point below the measured
+   * winner is a coin toss on a real player's GPU.
+   *
+   * What is protected is the relu ladder — each puzzle's minimal solution and
+   * the rung below it. The tightest margin measured on any backend is the
+   * spiral's single layer of 8 relu, 0.79 against 0.82; the unit tests hold 2.5
+   * points either side in Node and the playthrough 2 in Chromium. Nothing else
+   * is: tanh, sigmoid and narrow second layers can land within a point or two of
+   * a target (spiral 8 tanh → 8 tanh 0.816 against 0.82, circle 4 relu → 2 relu
+   * 0.854 against 0.85), where backend rounding can decide the result.
+   */
   target: number;
   /** Smallest hidden-layer arrangement known to solve it. For the copy. */
   minimalSolution: string;
+  /**
+   * The same arrangement as layers — the one the capacity-ladder tests train.
+   * `containsMinimalSolution` compares the player's network against it.
+   */
+  minimalLayers: readonly Layer[];
   /** True when no linear model can represent it. */
   needsNonlinearity: boolean;
 }
@@ -123,6 +153,7 @@ export const PATTERNS: readonly PatternSpec[] = [
     budget: 6,
     target: 0.94,
     minimalSolution: "no hidden layers",
+    minimalLayers: [],
     needsNonlinearity: false,
   },
   {
@@ -130,8 +161,10 @@ export const PATTERNS: readonly PatternSpec[] = [
     name: "Circle",
     hint: "No straight line can enclose a disc. This needs a bend.",
     budget: 8,
-    target: 0.9,
+    // 3 relu 0.68–0.70, 4 relu 0.91–0.92 across backends.
+    target: 0.85,
     minimalSolution: "one hidden layer of 4 relu neurons",
+    minimalLayers: [{ neurons: 4, activation: "relu" }],
     needsNonlinearity: true,
   },
   {
@@ -139,8 +172,10 @@ export const PATTERNS: readonly PatternSpec[] = [
     name: "XOR quadrants",
     hint: "Two opposite corners share a class. One line can never do that.",
     budget: 10,
-    target: 0.88,
+    // 3 relu 0.73–0.74, 4 and 5 relu 0.876–0.892 across backends.
+    target: 0.84,
     minimalSolution: "one hidden layer of 4 relu neurons",
+    minimalLayers: [{ neurons: 4, activation: "relu" }],
     needsNonlinearity: true,
   },
   {
@@ -148,8 +183,13 @@ export const PATTERNS: readonly PatternSpec[] = [
     name: "Spiral",
     hint: "Two interleaved arms. This needs real depth, not just width.",
     budget: 20,
-    target: 0.85,
+    // One layer of 8 relu 0.78–0.79; two layers of 8 0.854–0.930.
+    target: 0.82,
     minimalSolution: "two hidden layers of 8 relu neurons",
+    minimalLayers: [
+      { neurons: 8, activation: "relu" },
+      { neurons: 8, activation: "relu" },
+    ],
     needsNonlinearity: true,
   },
 ] as const;
@@ -169,7 +209,7 @@ const CIRCLE_R2 = 2 / Math.PI;
  * Chosen by measurement so that width alone is not enough but depth is — the
  * whole point of the level. At 2.5π, held-out accuracy goes 4 neurons 0.66 →
  * 8 neurons 0.79 → two layers of 8 0.93, so a single wide layer plateaus below
- * the 0.85 target and stacking clears it.
+ * the 0.82 target and stacking clears it.
  *
  * 2π was rejected as too easy (one layer of 8 reached 0.97, so depth was never
  * required) and 3π because the ladder stopped being monotonic there — 8 neurons
@@ -258,6 +298,61 @@ export function isEffectivelyLinear(architecture: Architecture): boolean {
 export function nonlinearLayerCount(architecture: Architecture): number {
   return architecture.layers.filter((layer) => layer.activation !== "linear")
     .length;
+}
+
+/**
+ * How many independent straight cuts the network makes before its first bend.
+ *
+ * Each neuron in the first non-linear layer sees one projection of the input — a
+ * single straight cut through the plane — and linear layers in front of it can
+ * only reduce how many different projections there are. Everything downstream
+ * works with those cuts. So with ONE cut, every later layer sees a single number,
+ * and the decision boundary can only be straight lines parallel to that cut:
+ * one neuron is still a straight line, however deep the stack behind it.
+ *
+ * Infinity when there is no non-linear layer (that case is `isEffectivelyLinear`).
+ */
+export function cutsBeforeFirstBend(architecture: Architecture): number {
+  let cuts = Number.POSITIVE_INFINITY;
+  for (const layer of architecture.layers) {
+    cuts = Math.min(cuts, layer.neurons);
+    if (layer.activation !== "linear") return cuts;
+  }
+  return Number.POSITIVE_INFINITY;
+}
+
+/** True when a bend exists but is fed by a single cut, so no curve can form. */
+export function isSingleCut(architecture: Architecture): boolean {
+  return (
+    !isEffectivelyLinear(architecture) && cutsBeforeFirstBend(architecture) === 1
+  );
+}
+
+/**
+ * True when the network can represent everything the puzzle's minimal solution
+ * can — so a miss is not a lack of capacity, whatever else it is.
+ *
+ * A prefix check, deliberately conservative. The first layers must use the
+ * minimal solution's activation and be at least as wide (extra units can be
+ * zeroed out); every layer after them needs one unit, because on inputs bounded
+ * to [-1, 1]² a single unit can carry the minimal network's answer through
+ * unchanged (relu(z + c) = z + c once the bias c keeps z + c positive). A narrow
+ * layer in front or in the middle — 8→4→8 on the spiral — does not count: it
+ * may well be able to, but that is not something this check can promise.
+ */
+export function containsMinimalSolution(
+  architecture: Architecture,
+  pattern: PatternSpec,
+): boolean {
+  const minimal = pattern.minimalLayers;
+  if (architecture.layers.length < minimal.length) return false;
+  return architecture.layers.every((layer, index) => {
+    const required = minimal[index];
+    if (!required) return layer.neurons >= 1;
+    return (
+      layer.activation === required.activation && layer.neurons >= required.neurons
+    );
+  });
 }
 
 /**
@@ -366,14 +461,138 @@ export function surfaceGrid(): number[][] {
   return grid;
 }
 
+// ── A network that stopped learning ───────────────────────────────────────
+
+/**
+ * Below this spread in P(class B) across the held-out points, the network is
+ * giving every held-out point the same answer.
+ *
+ * Measured, not guessed: every healthy network trained here spreads its
+ * predictions by at least 0.14 (a linear model on the circle, which cannot do
+ * better than the base rate), while every collapsed one spread by under 1e-4 —
+ * exactly 0 for a dead relu layer, 8e-6 for a saturated tanh stack. Three orders
+ * of magnitude separate the two, so the threshold is not a judgement call.
+ */
+export const FLAT_OUTPUT_SPREAD = 1e-3;
+/** A layer whose every unit moves less than this across the training set is flat. */
+const FLAT_UNIT_RANGE = 1e-3;
+/** Past this fraction of the way to its limit, a tanh or sigmoid unit is pinned. */
+const SATURATED = 0.99;
+
+export type CollapseKind = "dead-relu" | "saturated" | "flat";
+
+export interface Collapse {
+  kind: CollapseKind;
+  /** 0-based index of the first hidden layer that went flat, null if none did. */
+  layer: number | null;
+  activation: Activation | null;
+  /**
+   * The one probability the network now outputs, for every training and
+   * held-out point. Measured on those points only: the heatmap covers the whole
+   * square, and a collapsed network can still vary where no data lies (the
+   * spiral's empty corners).
+   */
+  output: number;
+}
+
+export function outputSpread(predictions: ArrayLike<number>): number {
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  for (let index = 0; index < predictions.length; index += 1) {
+    const value = predictions[index] ?? 0;
+    if (value < min) min = value;
+    if (value > max) max = value;
+  }
+  return predictions.length === 0 ? 0 : max - min;
+}
+
+/**
+ * Did training kill the network? And if so, where, and how?
+ *
+ * This is the failure "Insufficient capacity" used to be mistaken for. A deep,
+ * narrow relu stack — 8→8→4 on the spiral, the whole budget — is strictly more
+ * expressive than the 8→8 that solves it, yet it can end up answering the same
+ * probability everywhere. Blaming capacity there sends the player to add neurons
+ * to a network whose neurons are not the problem.
+ *
+ * The check is a direct measurement, not an inference from the score: push the
+ * training points through each hidden layer and find the first one whose every
+ * unit outputs the same value for every point. For relu that value is zero — the
+ * units are dead, and a relu at zero passes back zero gradient, so nothing below
+ * can be trained either. For tanh and sigmoid it is the activation's limit, where
+ * the slope, and so the gradient, is all but zero.
+ *
+ * Returns null when the output still varies: a network that learned something is
+ * judged on its accuracy, never on this.
+ */
+export function diagnoseCollapse(
+  model: tf.LayersModel,
+  architecture: Architecture,
+  xs: number[][],
+  predictions: ArrayLike<number>,
+): Collapse | null {
+  if (predictions.length === 0 || outputSpread(predictions) >= FLAT_OUTPUT_SPREAD) {
+    return null;
+  }
+
+  let sum = 0;
+  for (let index = 0; index < predictions.length; index += 1) {
+    sum += predictions[index] ?? 0;
+  }
+  const output = sum / predictions.length;
+
+  // Assigned from inside tidy() rather than returned, because tidy only returns
+  // tensor containers and this is plain data.
+  let found: Omit<Collapse, "output"> | null = null;
+  tf.tidy(() => {
+    let hidden: tf.Tensor = tf.tensor2d(xs);
+    for (let index = 0; index < architecture.layers.length; index += 1) {
+      const layer = architecture.layers[index]!;
+      const dense = model.layers[index];
+      if (!dense) break;
+      hidden = dense.apply(hidden) as tf.Tensor;
+      // Dying and saturating are things an activation does. A linear layer has
+      // neither failure of its own, so the question is asked of the next bend.
+      if (layer.activation === "linear") continue;
+
+      const range = hidden.max(0).sub(hidden.min(0)).max().dataSync()[0] ?? 0;
+      if (range >= FLAT_UNIT_RANGE) continue;
+
+      let kind: CollapseKind = "flat";
+      if (layer.activation === "relu") {
+        // relu outputs are never negative, so a maximum of zero is all zeros.
+        if ((hidden.max().dataSync()[0] ?? 0) <= 0) kind = "dead-relu";
+      } else {
+        // Distance of the least-saturated unit from its activation's midpoint:
+        // tanh spans ±1 around 0, sigmoid 0–1 around 0.5.
+        const middle = layer.activation === "tanh" ? 0 : 0.5;
+        const half = layer.activation === "tanh" ? 1 : 0.5;
+        const leastPinned = hidden.sub(middle).abs().min().dataSync()[0] ?? 0;
+        if (leastPinned > half * SATURATED) kind = "saturated";
+      }
+      found = { kind, layer: index, activation: layer.activation };
+      return;
+    }
+  });
+
+  // TypeScript cannot see the assignment inside the callback, so it would
+  // otherwise narrow `found` to its initial null.
+  const flat = found as Omit<Collapse, "output"> | null;
+  return flat
+    ? { ...flat, output }
+    : { kind: "flat", layer: null, activation: null, output };
+}
+
 // ── Evaluation ─────────────────────────────────────────────────────────────
 
 export type Outcome =
   | "win"
   | "no-nonlinearity"
+  | "dead-network"
+  | "optimisation-failure"
   | "insufficient-capacity"
-  | "untrained"
-  | "near-miss";
+  | "stopped"
+  | "untrained";
 
 export interface Evaluation {
   pattern: PatternId;
@@ -387,6 +606,8 @@ export interface Evaluation {
   solved: boolean;
   outcome: Outcome;
   failure: NamedFailure | null;
+  /** Epochs the scored fit ran: `TRAIN_EPOCHS` unless it was stopped early. */
+  epochsRun: number;
 }
 
 export interface EvaluateInput {
@@ -395,21 +616,91 @@ export interface EvaluateInput {
   /** Held-out accuracy after training, or null if never trained. */
   accuracy: number | null;
   loss: number;
+  /** From `diagnoseCollapse`: set when the network ended up answering one value. */
+  collapse?: Collapse | null;
+  /**
+   * Epochs the fit actually ran. Fewer than `TRAIN_EPOCHS` means the player
+   * pressed Stop, and a half-trained network is not scored: judging it would
+   * name a capacity failure for an architecture that was never given the chance.
+   */
+  epochsRun?: number;
 }
+
+/**
+ * True when the evaluation carries a real score. A stopped or unfinished run
+ * scores 0 by rule, not by measurement, so the Score readout must not show it
+ * as "0%" beside a card that says "not scored".
+ */
+export function isScored(evaluation: Evaluation | null): evaluation is Evaluation {
+  return (
+    evaluation !== null &&
+    evaluation.outcome !== "stopped" &&
+    evaluation.outcome !== "untrained"
+  );
+}
+
+/** Whole percent, the way the metric readouts show it. */
+const percent = (value: number) => `${Math.round(value * 100)}%`;
+
+/**
+ * A shortfall, written so it can never read as reaching the bar.
+ *
+ * 0.848 against a 0.85 target rounds to "85%, short of the 85% this shape
+ * needs", which contradicts itself. When whole-percent rounding would hide the
+ * miss, show one decimal, rounded down so it stays below the target.
+ */
+export function shortOf(value: number, target: number): string {
+  if (Math.round(value * 100) < Math.round(target * 100)) return percent(value);
+  return `${(Math.floor(value * 1000) / 10).toFixed(1)}%`;
+}
+
+/**
+ * The score, rounded to the whole percent the Score readout displays.
+ *
+ * Mastery's second star is a threshold on this number. Unrounded, the circle's
+ * minimal solution scores 0.798 — shown as "80%" beside a star that asks for 80%
+ * and is then withheld. Scoring at the precision the player reads keeps the star
+ * and the readout in agreement.
+ */
+export function scoreOf(accuracy: number, efficiency: number): number {
+  return clamp(Math.round(accuracy * efficiency * 100) / 100, 0, 1);
+}
+
+const plural = (count: number, word: string) =>
+  `${count} ${word}${count === 1 ? "" : "s"}`;
+
+/** `minimalSolution` is written lower-case, to sit mid-sentence. */
+const capitalise = (text: string) => text.charAt(0).toUpperCase() + text.slice(1);
 
 /**
  * Score the architecture and name the failure — honestly.
  *
- * "No non-linearity" is checked before "Insufficient capacity" and only for
- * patterns that genuinely require a bend. On a linearly-separable puzzle a linear
- * model is the *right* answer, so calling it a failure there would teach the
- * opposite of the lesson.
+ * The diagnoses are checked most-specific first, because each one points at a
+ * different control and a wrong name sends the player to the wrong one:
+ *
+ *   1. No non-linearity — only for patterns that genuinely require a bend. On a
+ *      linearly-separable puzzle a linear model is the *right* answer, so calling
+ *      it a failure there would teach the opposite of the lesson.
+ *   2. A collapsed network (Dying ReLU, saturation) — the architecture could
+ *      represent more; training killed it. Measured by `diagnoseCollapse`.
+ *   3. Optimisation failure — it did not collapse, and it contains the minimal
+ *      solution (`containsMinimalSolution`), so it has the capacity; training
+ *      ended somewhere worse. From the winning 8→8, "Add a layer" and + give
+ *      8→8→3, measured at 0.654 with the output still varying: calling that
+ *      "Insufficient capacity" would send the player to add neurons to a network
+ *      that already holds the answer.
+ *   4. Insufficient capacity — what is left: it trained, it does not hold the
+ *      minimal solution, and it fell short.
+ *
+ * A stopped run is measured but never judged, and scores nothing.
  */
 export function evaluate({
   pattern,
   architecture,
   accuracy,
   loss,
+  collapse = null,
+  epochsRun,
 }: EvaluateInput): Evaluation {
   const { totalNeurons } = architecture;
   const budget = pattern.budget;
@@ -422,15 +713,18 @@ export function evaluate({
     1,
   );
 
-  const solved = accuracy !== null && accuracy >= pattern.target;
-  const score = accuracy === null ? 0 : clamp(accuracy * efficiency, 0, 1);
-  const percent = (value: number) => `${Math.round(value * 100)}%`;
+  const stopped = epochsRun !== undefined && epochsRun < TRAIN_EPOCHS;
+  const solved = accuracy !== null && !stopped && accuracy >= pattern.target;
+  const score = accuracy === null || stopped ? 0 : scoreOf(accuracy, efficiency);
 
   let outcome: Outcome;
   let failure: NamedFailure | null = null;
 
   if (accuracy === null) {
     outcome = "untrained";
+  } else if (stopped) {
+    // Measured, reported, not judged — see `epochsRun`.
+    outcome = "stopped";
   } else if (solved) {
     // Reaching the target *is* the win (spec: "solve the pattern under the
     // neuron budget; efficiency bonus for fewer neurons"). Efficiency scales the
@@ -453,30 +747,42 @@ export function evaluate({
               accuracy,
             )}. Adding neurons cannot fix this; changing one activation can.`,
     };
-  } else if (!solved) {
+  } else if (collapse !== null) {
+    // Checked before capacity: a dead network is an optimisation failure, and
+    // "not enough neurons" would send the player to the wrong control.
+    outcome = "dead-network";
+    failure = collapseFailure(collapse, accuracy, pattern, architecture);
+  } else if (containsMinimalSolution(architecture, pattern)) {
+    outcome = "optimisation-failure";
+    failure = optimisationFailure(accuracy, pattern, architecture);
+  } else {
     outcome = "insufficient-capacity";
     const remaining = budget - totalNeurons;
+    const shape = isSingleCut(architecture)
+      ? // One cut in front of the first bend: the boundary is straight lines,
+        // so "can bend, just not far enough" would describe a curve that is not
+        // on screen.
+        `Your first hidden layer makes a single cut, so every layer after it sees one number and the boundary can only be straight lines parallel to that cut — curves come from combining several cuts.`
+      : `${plural(totalNeurons, "neuron")} across ${plural(
+          architecture.layers.length,
+          "hidden layer",
+        )} can bend the boundary, just not far enough.`;
     failure = {
       name: "Insufficient capacity",
-      detail: `${percent(accuracy)} on held-out points, short of the ${percent(
+      detail: `${shortOf(accuracy, pattern.target)} on held-out points, short of the ${percent(
         pattern.target,
-      )} this shape needs. ${totalNeurons} neuron${
-        totalNeurons === 1 ? "" : "s"
-      } across ${architecture.layers.length} hidden layer${
-        architecture.layers.length === 1 ? "" : "s"
-      } can bend the boundary, just not far enough. ${
+      )} this shape needs. ${shape} ${
         remaining >= 2
-          ? `${pattern.minimalSolution} is enough, and you still have ${remaining} neuron${
-              remaining === 1 ? "" : "s"
-            } of budget to spend.`
+          ? `${capitalise(pattern.minimalSolution)} is enough, and you still have ${plural(
+              remaining,
+              "neuron",
+            )} of budget to spend.`
           : // Near the cap, "add more" is not available and would be the wrong
             // advice anyway: the same neurons arranged differently, or with a
             // different activation, can be worth much more than extra ones.
-            `You are at the budget cap, so extra neurons are not the answer — ${pattern.minimalSolution} solves this, so what is left to change is how they are arranged: depth, and which activation bends the boundary.`
+            `You are at the budget cap, so extra neurons are not the answer — ${pattern.minimalSolution} solves this, so what is left to change is how they are arranged: width, depth, and which activation bends the boundary.`
       }`,
     };
-  } else {
-    outcome = "near-miss";
   }
 
   return {
@@ -490,6 +796,102 @@ export function evaluate({
     solved,
     outcome,
     failure,
+    epochsRun: accuracy === null ? 0 : (epochsRun ?? TRAIN_EPOCHS),
+  };
+}
+
+/**
+ * Name a collapse after what was actually measured in the layer.
+ *
+ * "Dying ReLU" only when a relu layer's every unit is at zero for every training
+ * point; "Saturated activations" only when a tanh or sigmoid layer is pinned at
+ * its limit. Anything else gets the plain description, because naming a
+ * mechanism that did not happen is the thing the pedagogy contract forbids.
+ */
+function collapseFailure(
+  collapse: Collapse,
+  accuracy: number,
+  pattern: PatternSpec,
+  architecture: Architecture,
+): NamedFailure {
+  // Measured on the training and held-out points only — see `Collapse.output`.
+  const everywhere = `${percent(accuracy)} on held-out points, because the network gives every training and held-out point the same answer: P(class B) = ${collapse.output.toFixed(
+    2,
+  )}.`;
+  const where =
+    collapse.layer === null ? "" : `hidden layer ${collapse.layer + 1}`;
+  // "Not a lack of capacity" is only a promise this network can keep when it
+  // holds the minimal solution; a small one that died may be short of both.
+  const fix = containsMinimalSolution(architecture, pattern)
+    ? `This is the optimiser failing, not a lack of capacity: fewer, wider layers train where this one stalled, and ${pattern.minimalSolution} solves the puzzle.`
+    : `This is the optimiser failing before capacity is even tested: fewer, wider layers train where this one stalled, and ${pattern.minimalSolution} solves the puzzle.`;
+
+  if (collapse.kind === "dead-relu") {
+    return {
+      name: "Dying ReLU",
+      detail: `${everywhere} Every relu unit in ${where} outputs zero for every training point. A relu at zero passes back zero gradient, so nothing above it gets a signal and nothing can revive it. ${fix}`,
+    };
+  }
+  if (collapse.kind === "saturated") {
+    return {
+      name: "Saturated activations",
+      detail: `${everywhere} Every ${collapse.activation} unit in ${where} is pinned at its limit for every training point, where its slope is almost zero — so almost no gradient flows back through it. ${fix}`,
+    };
+  }
+  return {
+    name: "Training collapsed",
+    detail: `${everywhere} ${
+      where === "" ? "The output" : `The output of ${where}`
+    } stopped depending on the input, so the loss is stuck at the coin-flip value. ${fix}`,
+  };
+}
+
+/**
+ * A network with the capacity that still missed — see `containsMinimalSolution`.
+ *
+ * The output still varies, so none of the flat-surface copy applies: this is a
+ * network that trained, just not well enough. The advice is the minimal
+ * solution, which is measured to clear the bar, rather than more neurons.
+ */
+function optimisationFailure(
+  accuracy: number,
+  pattern: PatternSpec,
+  architecture: Architecture,
+): NamedFailure {
+  const minimal = pattern.minimalLayers.length;
+  const extra = architecture.layers.length - minimal;
+  const isMinimal =
+    extra === 0 &&
+    architecture.layers.every(
+      (layer, index) => layer.neurons === pattern.minimalLayers[index]?.neurons,
+    );
+
+  const holds = isMinimal
+    ? `This is the arrangement measured to clear this bar: ${pattern.minimalSolution}.`
+    : minimal === 0
+      ? `A model with ${pattern.minimalSolution} clears this, and your layers can carry its one straight cut through to the output, so this network can draw everything that model can.`
+      : extra === 0
+        ? `This network is at least as wide as ${pattern.minimalSolution}, which clears this bar, so it can represent everything that network can.`
+        : `${
+            minimal === 1 ? "Its first layer is" : `Its first ${minimal} layers are`
+          } at least as wide as ${pattern.minimalSolution}, which clears this bar, and ${
+            extra === 1 ? "the layer after" : `the ${extra} layers after`
+          } can pass that answer straight through — so this network can represent everything that one can.`;
+
+  const why =
+    extra > 0
+      ? ` Every layer past the minimal solution is one more place for the gradient to fade or a unit to stop responding, which makes this more likely.`
+      : "";
+
+  const advice = isMinimal
+    ? `The weights start from the same place every run, so this exact network will land here again: change the arrangement to change where training ends.`
+    : `Drop back to ${pattern.minimalSolution}; it clears this puzzle.`;
+
+  return {
+    name: "Optimisation failure",
+    detail: `${shortOf(accuracy, pattern.target)} on held-out points, short of the ${percent(
+      pattern.target,
+    )} this shape needs — and capacity is not what is missing. ${holds} Training ended somewhere worse than a solution this network contains.${why} ${advice}`,
   };
 }
 

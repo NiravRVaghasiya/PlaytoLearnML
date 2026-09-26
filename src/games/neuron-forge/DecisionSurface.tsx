@@ -18,14 +18,19 @@ const CELL = VIEW / SURFACE_RESOLUTION;
  * Okabe-Ito blue ↔ orange, through a neutral mid.
  *
  * Diverging on purpose: the interesting structure is the *boundary*, which is
- * where the network is unsure, and a diverging ramp puts its lightest values
+ * where the network is unsure, and a diverging ramp puts its most neutral values
  * exactly there. Hue alone is never the only cue — the two classes also differ in
  * marker shape below, so the plot survives being read in greyscale.
+ *
+ * The neutral is the page background (`--bg`), not a raised surface. Class-A
+ * blue is 3.65:1 against `--bg` but only 2.88:1 against `--surface-2`, so points
+ * sitting on the boundary — the ones the player most needs to see — would drop
+ * below the 3:1 non-text contrast floor on the lighter neutral.
  */
 function surfaceColor(probability: number): string {
   const classA = [0x00, 0x72, 0xb2];
   const classB = [0xe6, 0x9f, 0x00];
-  const mid = [0x21, 0x27, 0x34];
+  const mid = [0x0e, 0x11, 0x16];
 
   const t = Math.min(Math.max(probability, 0), 1);
   const [from, to, local] =
@@ -86,12 +91,15 @@ export function DecisionSurface({
     <figure className="m-0">
       <svg
         viewBox={`0 0 ${VIEW} ${VIEW}`}
-        className="w-full rounded-md border border-border bg-surface-2"
+        // --bg rather than --surface-2, for the reason in surfaceColor. Before
+        // training the points sit on this directly, and their outline is --bg
+        // too, so the fill alone has to clear 3:1 against it.
+        className="w-full rounded-md border border-border bg-bg"
         role="img"
         aria-label={label}
       >
         {cells === null ? (
-          <rect width={VIEW} height={VIEW} fill="var(--surface-2)" />
+          <rect width={VIEW} height={VIEW} fill="var(--bg)" />
         ) : (
           // shapeRendering avoids hairline seams between adjacent cells.
           <g shapeRendering="crispEdges">

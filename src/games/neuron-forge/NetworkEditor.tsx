@@ -1,11 +1,13 @@
 "use client";
 
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import {
   Background,
   Handle,
   Position,
   ReactFlow,
+  useReactFlow,
+  useStore,
   type Edge,
   type Node,
   type NodeProps,
@@ -68,6 +70,33 @@ function NeuronNode({ data }: NodeProps) {
 
 /** Stable identity: a fresh object here makes React Flow warn every render. */
 const NODE_TYPES = { neuron: NeuronNode };
+
+/** Padding around the fitted graph, as a fraction of the pane. */
+const FIT_PADDING = 0.18;
+
+/**
+ * Re-fit the viewport whenever the graph or the pane changes size.
+ *
+ * React Flow's `fitView` prop only fits the nodes present on the FIRST render.
+ * The first render here is usually the empty forge — three nodes — so without
+ * this every layer added afterwards landed outside the fixed-height, overflow-
+ * hidden frame, and with pan and zoom switched off the player had no way to
+ * reach it: 21 of 23 nodes were off-pane at 8→8→4. Rendered as a child of
+ * `<ReactFlow>`, so it can use the flow's own store without a second provider.
+ * `fitView()` queues until the new nodes are measured, so calling it straight
+ * after the change is safe.
+ */
+function RefitOnChange({ signature }: { signature: string }) {
+  const { fitView } = useReactFlow();
+  const width = useStore((state) => state.width);
+  const height = useStore((state) => state.height);
+
+  useEffect(() => {
+    void fitView({ padding: FIT_PADDING, duration: 0 });
+  }, [signature, width, height, fitView]);
+
+  return null;
+}
 
 function buildGraph(layers: Layer[]): { nodes: Node[]; edges: Edge[] } {
   // Columns of ids, so edges can be produced by zipping neighbours.
@@ -165,6 +194,7 @@ export function NetworkEditor({ architecture }: NetworkEditorProps) {
     () => buildGraph(architecture.layers),
     [architecture.layers],
   );
+  const signature = nodes.map((node) => node.id).join(",");
 
   const described =
     architecture.layers.length === 0
@@ -186,7 +216,12 @@ export function NetworkEditor({ architecture }: NetworkEditorProps) {
           edges={edges}
           nodeTypes={NODE_TYPES}
           fitView
-          fitViewOptions={{ padding: 0.18 }}
+          fitViewOptions={{ padding: FIT_PADDING }}
+          // The widest legal network is 5 columns of up to 8 neurons, which only
+          // fits the 248px frame below React Flow's default 0.5 floor. The cap
+          // stops the empty forge being blown up to twice its natural size.
+          minZoom={0.2}
+          maxZoom={1.5}
           nodesDraggable={false}
           nodesConnectable={false}
           nodesFocusable={false}
@@ -202,6 +237,7 @@ export function NetworkEditor({ architecture }: NetworkEditorProps) {
           proOptions={{ hideAttribution: false }}
         >
           <Background gap={18} size={1} color="var(--border)" />
+          <RefitOnChange signature={signature} />
         </ReactFlow>
       </div>
 

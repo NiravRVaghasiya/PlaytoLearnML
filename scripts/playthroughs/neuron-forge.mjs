@@ -121,9 +121,11 @@ export async function run({ page, check, metricText }) {
     "the decision surface now shows a learned boundary",
     /Decision surface/i.test((await surface().getAttribute("aria-label")) ?? ""),
   );
+  // Any polite live region, not just the first: the shell may announce the
+  // why-card headline in a region of its own, ahead of the metric's in the DOM.
   check(
     "result is announced to screen readers",
-    /loss/i.test(await page.locator('[aria-live="polite"]').first().innerText()),
+    (await page.locator('[aria-live="polite"]').filter({ hasText: /loss/i }).count()) > 0,
   );
 
   // 4 relu neurons is the measured minimal solution for the circle.
@@ -137,6 +139,11 @@ export async function run({ page, check, metricText }) {
     // secondary metrics in a grid sibling of <main>, not inside it.
     "held-out accuracy is reported, not training accuracy",
     await page.getByText("Held-out accuracy").first().isVisible(),
+  );
+  check(
+    "the why-card headline carries the outcome and its number",
+    /Solved: \d+% held-out/.test(await whyRegion.innerText()),
+    (await whyRegion.innerText()).split("\n")[0],
   );
 
   // ── contract #4a: No non-linearity ──
@@ -173,6 +180,18 @@ export async function run({ page, check, metricText }) {
     check(
       "retry is one click away inside the alert",
       (await failure.getByRole("button", { name: /retry/i }).count()) > 0,
+    );
+
+    // The failure says "change one activation". Retry must leave the network
+    // it is talking about in place, not wipe it.
+    await failure.getByRole("button", { name: /retry/i }).click();
+    await page.waitForTimeout(250);
+    check(
+      "retry clears the result but keeps the architecture",
+      (await failure.count()) === 0 &&
+        (await budget.getAttribute("aria-valuenow")) === "4" &&
+        (await page.getByLabel("Activation for layer 1").inputValue()) === "linear",
+      `failures=${await failure.count()} budget=${await budget.getAttribute("aria-valuenow")}`,
     );
   }
 
@@ -243,11 +262,98 @@ export async function run({ page, check, metricText }) {
     await addLayer.isDisabled(),
   );
 
+  // React Flow only fits the nodes of its FIRST render. The diagram started
+  // with three nodes; eight hidden neurons later it must still show them all.
+  const clipped = await page.evaluate(() => {
+    const pane = document.querySelector(".react-flow")?.getBoundingClientRect();
+    if (!pane) return -1;
+    return [...document.querySelectorAll(".react-flow__node")].filter((node) => {
+      const box = node.getBoundingClientRect();
+      return (
+        box.left < pane.left - 1 ||
+        box.right > pane.right + 1 ||
+        box.top < pane.top - 1 ||
+        box.bottom > pane.bottom + 1
+      );
+    }).length;
+  });
+  check(
+    "the network diagram refits: every neuron is inside the frame",
+    clipped === 0,
+    `${clipped} node(s) outside the pane`,
+  );
+
   // ── the code lane, sharing the same store and the same trainer ──
   console.log("\nCode lane: same store, same model");
   await page.getByRole("radio", { name: /code/i }).click();
   const editor = page.getByLabel("Architecture script");
   check("code lane editor present", await editor.isVisible());
+
+  // ── the capacity ladder, measured in the browser the player uses ──
+  // The unit tests measure it on Node's CPU backend; numbers differ by 1–3
+  // points between backends, so the lesson is re-proved here with a margin.
+  console.log("\nThe capacity ladder, in the browser");
+  await editor.fill(
+    [
+      "const rungs = [",
+      "  ['circle', [{ neurons: 3, activation: 'relu' }], [{ neurons: 4, activation: 'relu' }]],",
+      "  ['xor',    [{ neurons: 3, activation: 'relu' }], [{ neurons: 4, activation: 'relu' }]],",
+      "  ['spiral', [{ neurons: 8, activation: 'relu' }],",
+      "             [{ neurons: 8, activation: 'relu' }, { neurons: 8, activation: 'relu' }]],",
+      "];",
+      "for (const [pattern, below, minimal] of rungs) {",
+      "  api.setPattern(pattern);",
+      "  api.setLayers(below);   const low = await api.train();",
+      "  api.setLayers(minimal); const high = await api.train();",
+      "  log('RUNG', pattern, low.accuracy.toFixed(3), high.accuracy.toFixed(3), api.target());",
+      "}",
+      "// The winning 8→8 with a third layer of 3 behind it: it holds the solution.",
+      "api.setLayers([{ neurons: 8, activation: 'relu' }, { neurons: 8, activation: 'relu' },",
+      "               { neurons: 3, activation: 'relu' }]);",
+      "const deep = await api.train();",
+      "log('CONTAINED', deep.outcome, deep.accuracy.toFixed(3));",
+      "// The whole spiral budget in three layers: measured to die, not to lack capacity.",
+      "api.setLayers([{ neurons: 8, activation: 'relu' }, { neurons: 8, activation: 'relu' },",
+      "               { neurons: 4, activation: 'relu' }]);",
+      "const dead = await api.train();",
+      "log('DEADNET', dead.outcome, dead.failure && dead.failure.name);",
+    ].join("\n"),
+  );
+  await page.getByRole("button", { name: "Run", exact: true }).click();
+  await page
+    .getByRole("region", { name: "Script output" })
+    .getByText(/DEADNET/)
+    .waitFor({ timeout: 900000 });
+  const ladder = await page
+    .getByRole("region", { name: "Script output" })
+    .innerText();
+  const rungs = ladder.split("\n").filter((l) => l.startsWith("RUNG"));
+  check("all three puzzles were measured", rungs.length === 3, `${rungs.length} rung(s)`);
+  for (const line of rungs) {
+    const [, pattern, low, high, target] = line.split(/\s+/);
+    check(
+      `${pattern}: the rung below misses and the minimal solution clears, 2+ points either side`,
+      Number(low) <= Number(target) - 0.02 && Number(high) >= Number(target) + 0.02,
+      line,
+    );
+  }
+  // Whatever this backend makes of 8→8→3 — a win, a dead layer, or a miss that
+  // still varies — it holds the minimal solution, so a capacity verdict is wrong.
+  const contained = ladder.split("\n").find((l) => l.startsWith("CONTAINED")) ?? "";
+  check(
+    "a network holding the minimal solution is never called Insufficient capacity",
+    /^CONTAINED (win|dead-network|optimisation-failure) /.test(contained),
+    contained || ladder.slice(0, 120),
+  );
+  check(
+    "a dead relu stack is named Dying ReLU, not Insufficient capacity",
+    /DEADNET dead-network Dying ReLU/.test(ladder),
+    ladder.split("\n").find((l) => l.startsWith("DEADNET")) ?? ladder.slice(0, 120),
+  );
+  check(
+    "the Dying ReLU failure strip is shown",
+    /Dying ReLU/.test((await failure.count()) > 0 ? await failure.innerText() : ""),
+  );
 
   await editor.fill(
     [
