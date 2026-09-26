@@ -22,6 +22,12 @@ export interface ImportanceBarsProps {
  * or one-hot. That is worth saying in the caption — "feature importance" from a
  * tree or a deep net does not mean the same thing, and the habit of reading these
  * bars as truth is worth complicating early.
+ *
+ * One more caveat is said in the caption because it is real: a one-hot group
+ * encodes every level next to a bias, so the group's weights are only fixed up to
+ * a shared shift. A level that never occurs in training (a bin of a 0/1 column,
+ * say) keeps its initial weight. Dropping a reference level would fix both, and
+ * would also change every matrix width the tests pin, so it is noted, not done.
  */
 export function ImportanceBars({
   columnNames,
@@ -52,6 +58,9 @@ export function ImportanceBars({
         Absolute weight the fixed model gave each matrix column. Only readable
         because the model is linear and every column is on a comparable scale —
         &quot;importance&quot; from a tree or a deep net is a different quantity.
+        Read a one-hot group (the bins, cities or weekdays) as a set: the bias
+        can absorb a shift the whole group shares, so a bar means something next
+        to its siblings rather than on its own.
       </caption>
       <thead>
         <tr className="border-b border-border">

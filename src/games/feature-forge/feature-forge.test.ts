@@ -1,11 +1,18 @@
 import * as tf from "@tensorflow/tfjs";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
+  AGE_OLD,
+  AGE_YOUNG,
   BIN_COUNT,
   CITY_LEVELS,
   COLUMNS,
+  COLUMN_INDEX,
+  FANCIER_SCHEDULE,
+  FIXED_SCHEDULE,
   LEGENDARY_COMBOS,
+  MATH_NOTES,
   NO_LIFT_BAND,
+  PER_HEAD_THRESHOLD,
   TARGET_LIFT,
   TRAIN_ROWS,
   VALIDATION_ROWS,
@@ -16,14 +23,19 @@ import {
   columnByName,
   describeFeature,
   evaluateForge,
+  featureProblem,
   fitAndScore,
   generateDataset,
   isValidFeature,
   legendariesIn,
+  scheduleFor,
   usesLeakyColumn,
+  type DesignMatrix,
   type Feature,
+  type Row,
   type Transform,
 } from "./ml";
+import { whyCardFor } from "./why-cards";
 
 beforeAll(async () => {
   await tf.ready();
@@ -38,14 +50,16 @@ const f = (transform: Transform, ...sourceCols: string[]): Feature => ({
   sourceCols,
 });
 
-/** The four transforms that unlock a relationship no rescaling can reach. */
-const FORGED = [
-  ...baselineFeatures(),
+/** The transforms that unlock a relationship no rescaling can reach. */
+const LEGENDARY = [
   f("day_of_week", "signup_ts"),
   f("bin", "age"),
   f("one_hot", "city_code"),
-  f("ratio", "income", "household"),
 ];
+const FORGED = [...baselineFeatures(), ...LEGENDARY];
+
+/** Income per head: sounds legendary, measures nothing here. */
+const PER_HEAD = f("ratio", "income", "household");
 
 async function score(
   features: Feature[],
@@ -237,9 +251,9 @@ describe("representation changes the score — measured", () => {
   // These train the real fixed model. The numbers in the comments are what was
   // measured while tuning.
 
-  it("lifts well past the target when all four relationships are unlocked", async () => {
-    const baseline = await score(baselineFeatures()); // measured 0.635
-    const forged = await score(FORGED); // measured 0.706
+  it("lifts well past the target when every legendary relationship is unlocked", async () => {
+    const baseline = await score(baselineFeatures()); // measured 0.631
+    const forged = await score(FORGED); // measured 0.711
 
     expect(forged - baseline).toBeGreaterThanOrEqual(TARGET_LIFT);
     expect(legendariesIn(FORGED)).toHaveLength(LEGENDARY_COMBOS.length);
@@ -307,7 +321,6 @@ describe("legendary combos", () => {
     expect(legendariesIn([f("day_of_week", "signup_ts")])).toHaveLength(1);
     expect(legendariesIn([f("bin", "age")])).toHaveLength(1);
     expect(legendariesIn([f("one_hot", "city_code")])).toHaveLength(1);
-    expect(legendariesIn([f("ratio", "income", "household")])).toHaveLength(1);
     expect(legendariesIn(baselineFeatures())).toHaveLength(0);
   });
 
@@ -449,5 +462,218 @@ describe("naming the failure", () => {
     });
     expect(evaluation.score).toBeLessThan(1);
     expect(NO_LIFT_BAND).toBeLessThan(TARGET_LIFT);
+  });
+});
+
+describe("the weekday lives where both lanes look for it", () => {
+  it("puts the weekend effect on days 0 and 6 of (ts // 86400) % 7", () => {
+    // The base timestamp used to be 22:13 on a day that arithmetic calls 5, so
+    // the effect sat on days 5 and 6 while the Python starter pointed at 0 and 6.
+    const index = COLUMN_INDEX.signup_ts!;
+    const rate = (day: number) => {
+      const rows = dataset.train.filter(
+        (row) => Math.floor(row.values[index]! / 86_400) % 7 === day,
+      );
+      return rows.filter((row) => row.churned === 1).length / rows.length;
+    };
+    const weekend = Math.min(rate(0), rate(6));
+    for (const day of [1, 2, 3, 4, 5]) {
+      expect(rate(day), `day ${day}`).toBeLessThan(weekend);
+    }
+  });
+});
+
+describe("income per head: a feature judged by what it measures", () => {
+  it("is a threshold that is also a straight line in the raw columns", () => {
+    // The claim the copy makes, checked row by row: "income / household < t"
+    // and "income - t * household < 0" pick out exactly the same customers.
+    const income = COLUMN_INDEX.income!;
+    const household = COLUMN_INDEX.household!;
+    for (const row of [...dataset.train, ...dataset.validation]) {
+      const ratio = row.values[income]! / row.values[household]! < PER_HEAD_THRESHOLD;
+      const line =
+        row.values[income]! - PER_HEAD_THRESHOLD * row.values[household]! < 0;
+      expect(ratio).toBe(line);
+    }
+  });
+
+  it("is not legendary, in either order", () => {
+    expect(legendariesIn([PER_HEAD])).toHaveLength(0);
+    expect(legendariesIn([f("ratio", "household", "income")])).toHaveLength(0);
+  });
+
+  it("measures no lift, on its own or on top of the legendary set", async () => {
+    // Pinned because the copy says so: if the data ever changes so that the
+    // ratio does earn its column, this fails and the copy has to change too.
+    const baseline = await score(baselineFeatures());
+    const alone = await score([...baselineFeatures(), PER_HEAD]);
+    const forged = await score(FORGED);
+    const withRatio = await score([...FORGED, PER_HEAD]);
+
+    expect(Math.abs(alone - baseline)).toBeLessThan(NO_LIFT_BAND);
+    expect(Math.abs(withRatio - forged)).toBeLessThan(NO_LIFT_BAND);
+  }, 300000);
+
+  it("is a step the baseline only partly reaches: a cut on the ratio still lifts", async () => {
+    // The copy used to say the model "could draw it before you divided
+    // anything". It can lean a line across the boundary, not make the step, so
+    // a 0/1 column for the threshold itself — the cut this forge does not
+    // offer — adds real accuracy on top of the legendary set where the ratio
+    // adds none. Pinned at DATA_SEED only: with 800 validation rows the size of
+    // this lift is noisy across seeds, which is why the copy never quotes it.
+    const income = COLUMN_INDEX.income!;
+    const household = COLUMN_INDEX.household!;
+    const cut = (row: Row) =>
+      row.values[income]! / row.values[household]! < PER_HEAD_THRESHOLD ? 1 : 0;
+    const withCut = (matrix: DesignMatrix, rows: Row[]): DesignMatrix => ({
+      xs: matrix.xs.map((xs, index) => [...xs, cut(rows[index]!)]),
+      ys: matrix.ys,
+      columnNames: [...matrix.columnNames, "income / household < threshold"],
+    });
+
+    const matrices = buildMatrices(dataset, FORGED)!;
+    const forged = (await fitAndScore(matrices)).validationAccuracy;
+    const cutScore = (
+      await fitAndScore({
+        train: withCut(matrices.train, dataset.train),
+        validation: withCut(matrices.validation, dataset.validation),
+      })
+    ).validationAccuracy;
+
+    expect(cutScore - forged).toBeGreaterThan(NO_LIFT_BAND);
+  }, 300000);
+
+  it("is explained as a straight line against a step, never as already drawn", () => {
+    const threshold = PER_HEAD_THRESHOLD.toLocaleString("en-US");
+    const context = {
+      baselineScore: 0.63,
+      trainScore: 0.72,
+      features: [...LEGENDARY, PER_HEAD],
+      legendary: LEGENDARY_COMBOS.slice(),
+      leaked: false,
+    };
+    const cardFor = (previousScore: number, currentScore: number) =>
+      whyCardFor({
+        kind: "forged-feature",
+        feature: PER_HEAD,
+        previousScore,
+        currentScore,
+        ...context,
+      });
+
+    const flat = cardFor(0.71, 0.7025);
+    expect(flat.body).toMatch(/step/);
+    expect(flat.body).toMatch(/straight line/);
+    expect(flat.body).toMatch(/adds nothing measurable/);
+    expect(flat.body).toContain(threshold);
+    expect(flat.body).toMatch(/cut on the ratio/);
+
+    // A drop beyond the band is named as the cost it was, not "nothing".
+    const costly = cardFor(0.71, 0.69);
+    expect(costly.body).toMatch(/step/);
+    expect(costly.body).not.toMatch(/adds nothing measurable/);
+    expect(costly.body).toContain("cost 2.0 points");
+
+    // A ratio that genuinely lifted the score would not get this explanation.
+    expect(cardFor(0.7, 0.72).body).not.toMatch(/straight line/);
+
+    for (const text of [flat.body, costly.body, MATH_NOTES]) {
+      expect(text).not.toMatch(/before you divided|does not need to|can already draw/);
+    }
+    expect(MATH_NOTES).toMatch(/step/);
+  });
+});
+
+describe("the legendary transforms compound", () => {
+  it("are worth more together than the sum of their separate lifts", async () => {
+    // The legendary WhyCard says so; this is the measurement behind it.
+    const baseline = await score(baselineFeatures());
+    let separate = 0;
+    for (const feature of LEGENDARY) {
+      separate += (await score([...baselineFeatures(), feature])) - baseline;
+    }
+    const together = (await score(FORGED)) - baseline;
+    expect(together).toBeGreaterThan(separate);
+  }, 300000);
+});
+
+describe("the fixed model trains fast enough to feel live", () => {
+  it("takes full-batch steps, a hundred of them", () => {
+    // The Definition of Done asks for the metric to move within about a second
+    // of a forge. Sequential optimiser steps are what a fit costs on WebGL, and
+    // this schedule is ~7× fewer of them than the mini-batch one it replaced.
+    const steps =
+      FIXED_SCHEDULE.epochs * Math.ceil(TRAIN_ROWS / FIXED_SCHEDULE.batchSize);
+    expect(steps).toBeLessThanOrEqual(100);
+    expect(scheduleFor(buildFixedModel)).toBe(FIXED_SCHEDULE);
+    expect(scheduleFor(buildFancierModel)).toBe(FANCIER_SCHEDULE);
+  });
+
+  it("stops early and leaks nothing when told its result is no longer wanted", async () => {
+    const before = tf.memory().numTensors;
+    let epochs = 0;
+    await fitAndScore(buildMatrices(dataset, baselineFeatures())!, undefined, {
+      shouldStop: () => {
+        epochs += 1;
+        return true;
+      },
+    });
+    expect(epochs).toBe(1);
+    expect(tf.memory().numTensors).toBe(before);
+  });
+});
+
+describe("why a feature cannot be forged, in words", () => {
+  it("names an unknown transform and lists the real ones", () => {
+    expect(featureProblem("binn", ["age"])).toMatch(/unknown transform "binn".*bin/);
+  });
+
+  it("names an unknown column and lists the table", () => {
+    expect(featureProblem("bin", ["agee"])).toMatch(/no column called "agee".*age/);
+  });
+
+  it("names the wrong arity", () => {
+    expect(featureProblem("ratio", ["income"])).toMatch(/ratio takes 2 columns, got 1/);
+  });
+
+  it("names a dtype the transform will not take", () => {
+    expect(featureProblem("bin", ["city_code"])).toMatch(
+      /bin needs a numeric column, and city_code is a categorical/,
+    );
+    expect(featureProblem("one_hot", ["city"])).toMatch(/no column called "city"/);
+  });
+
+  it("names a duplicate", () => {
+    expect(featureProblem("bin", ["age"], [f("bin", "age")])).toMatch(/already in the forge/);
+  });
+
+  it("says nothing for a legal feature", () => {
+    expect(featureProblem("bin", ["age"])).toBeNull();
+    expect(featureProblem("ratio", ["income", "household"])).toBeNull();
+  });
+});
+
+describe("failure copy names what is actually missing", () => {
+  const baseline = 0.63;
+
+  it("lists only the relationships still to find", () => {
+    const evaluation = evaluateForge({
+      features: [...baselineFeatures(), f("bin", "age")],
+      baselineScore: baseline,
+      currentScore: baseline + 0.03,
+      submitted: true,
+    });
+    const missing = LEGENDARY_COMBOS.filter((combo) => combo.id !== "age-curve");
+    for (const combo of missing) expect(evaluation.failure!.detail).toContain(combo.hint);
+    expect(evaluation.failure!.detail).not.toContain(
+      LEGENDARY_COMBOS.find((combo) => combo.id === "age-curve")!.hint,
+    );
+    expect(evaluation.failure!.detail).not.toMatch(/four/);
+  });
+
+  it("describes the ages the generator really uses", () => {
+    expect(MATH_NOTES).toContain(`under-${AGE_YOUNG}s`);
+    expect(MATH_NOTES).toContain(`over-${AGE_OLD}s`);
+    expect(MATH_NOTES).not.toMatch(/under-26s|over-64s/);
   });
 });

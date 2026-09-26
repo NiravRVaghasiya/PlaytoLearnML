@@ -19,6 +19,7 @@ export function VisualLane() {
   const trainScore = useForgeStore((s) => s.trainScore);
   const ready = useForgeStore((s) => s.ready);
   const training = useForgeStore((s) => s.training);
+  const fitError = useForgeStore((s) => s.fitError);
   const columnNames = useForgeStore((s) => s.columnNames);
   const importances = useForgeStore((s) => s.importances);
   const leaked = useForgeStore(hasLeak);
@@ -46,6 +47,7 @@ export function VisualLane() {
           trainScore={trainScore}
           ready={ready}
           leaked={leaked}
+          error={fitError}
         />
       </section>
 

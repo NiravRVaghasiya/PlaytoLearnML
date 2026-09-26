@@ -8,6 +8,8 @@ export interface MetricGaugeProps {
   trainScore: number;
   ready: boolean;
   leaked: boolean;
+  /** Why the baseline fit failed, when it did. */
+  error?: string | null;
 }
 
 const WIDTH = 320;
@@ -39,13 +41,16 @@ export function MetricGauge({
   trainScore,
   ready,
   leaked,
+  error = null,
 }: MetricGaugeProps) {
   const target = baselineScore + TARGET_LIFT;
   const lift = currentScore - baselineScore;
   const cleared = lift >= TARGET_LIFT;
 
   const label = !ready
-    ? "Establishing the baseline — training the fixed model on the raw columns."
+    ? error !== null
+      ? `The baseline could not be trained: ${error}. Press Retry to fit it again.`
+      : "Establishing the baseline — training the fixed model on the raw columns."
     : `Validation accuracy ${(currentScore * 100).toFixed(
         1,
       )} percent against a baseline of ${(baselineScore * 100).toFixed(
@@ -161,7 +166,9 @@ export function MetricGauge({
         {leaked
           ? "This score is not real — a leaky column is in the forge."
           : !ready
-            ? "Training the baseline…"
+            ? error !== null
+              ? "The baseline could not be trained. Press Retry."
+              : "Training the baseline…"
             : cleared
               ? `Cleared the target with ${(lift * 100).toFixed(1)} points of lift, from the same model.`
               : `${(lift * 100).toFixed(1)} points of lift. The thin bar is training accuracy — when it pulls away, the model is memorising.`}

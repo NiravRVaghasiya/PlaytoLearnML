@@ -1,6 +1,6 @@
 "use client";
 
-import { Hammer, Sparkles, Trash2 } from "lucide-react";
+import { AlertTriangle, Hammer, Sparkles, Trash2 } from "lucide-react";
 import { Button } from "@/components";
 import {
   LEGENDARY_COMBOS,
@@ -141,18 +141,28 @@ export function ForgeSlot({
                       />
                     ) : null}
                     <span className="font-mono">{describeFeature(feature)}</span>
+                    {/* 32px square: past WCAG 2.5.8's 24px minimum on its own,
+                        rather than leaning on the spacing exception, without
+                        turning a compact list row into a toolbar. */}
                     <button
                       type="button"
                       onClick={() => onRemove(feature.id)}
                       disabled={training}
                       aria-label={`Remove ${describeFeature(feature)} from the forge`}
-                      className="ml-auto rounded p-0.5 text-text-muted hover:bg-surface hover:text-wrong focus-visible:ring-2 focus-visible:ring-primary focus-visible:outline-none disabled:opacity-50"
+                      className="-my-1 ml-auto inline-flex size-8 shrink-0 items-center justify-center rounded text-text-muted hover:bg-surface hover:text-wrong focus-visible:ring-2 focus-visible:ring-primary focus-visible:outline-none disabled:opacity-50"
                     >
-                      <Trash2 aria-hidden="true" className="size-3.5" />
+                      <Trash2 aria-hidden="true" className="size-4" />
                     </button>
                   </span>
                   {leaky ? (
-                    <span className="mt-0.5 block text-[10px] text-wrong">
+                    // The red stays on the border and the icon; the words are in
+                    // body text colour. Red text on its own red tint measured
+                    // 4.1:1, under the 4.5:1 small text needs.
+                    <span className="mt-0.5 flex items-start gap-1 text-[10px] text-text">
+                      <AlertTriangle
+                        aria-hidden="true"
+                        className="mt-px size-3 shrink-0 text-wrong"
+                      />
                       Leaky — this column is only set after churn has happened.
                     </span>
                   ) : combo ? (

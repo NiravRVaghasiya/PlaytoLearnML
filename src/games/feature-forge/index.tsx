@@ -30,10 +30,16 @@ import { TransformPicker } from "./TransformPicker";
 import { VisualLane } from "./VisualLane";
 import { CodeLane } from "./CodeLane";
 
+/**
+ * Exactly the progression engine's rule: one star for a win, two for a best score
+ * of at least HIGH_SCORE_THRESHOLD, three for that AND a code-lane clear. The
+ * code-lane clear is a winning forge submitted from the Python lane
+ * (`api.submit()`), because that is where the action has to come from.
+ */
 const STAR_CRITERIA = [
   `Lift validation accuracy ${Math.round(TARGET_LIFT * 100)} points over baseline`,
-  `Score ${Math.round(HIGH_SCORE_THRESHOLD * 100)}% or better by finding legendary features`,
-  "Forge a winning set from the Python lane",
+  `Score ${Math.round(HIGH_SCORE_THRESHOLD * 100)}% or better — legendary features add to the score`,
+  "Submit a winning forge from the Python lane, with api.submit()",
 ];
 
 function Controls() {
@@ -97,7 +103,7 @@ function Controls() {
           <Button
             variant="primary"
             className="w-full"
-            onClick={submit}
+            onClick={() => submit()}
             disabled={busy || features.length === 0}
             icon={<ClipboardCheck className="size-4" />}
           >
@@ -127,6 +133,7 @@ export default function FeatureForge() {
   const trainScore = useForgeStore((s) => s.trainScore);
   const columnNames = useForgeStore((s) => s.columnNames);
   const ready = useForgeStore((s) => s.ready);
+  const fitError = useForgeStore((s) => s.fitError);
   const phase = useForgeStore((s) => s.phase);
   const failure = useForgeStore((s) => s.failure);
   const whyCard = useForgeStore((s) => s.whyCard);
@@ -181,7 +188,9 @@ export default function FeatureForge() {
             ? "good"
             : undefined,
     caption: !ready
-      ? "fitting the baseline…"
+      ? fitError !== null
+        ? "the baseline fit failed — press Retry"
+        : "fitting the baseline…"
       : leaked
         ? "not real — a leaky column is in the forge"
         : `need +${Math.round(TARGET_LIFT * 100)} points over ${(

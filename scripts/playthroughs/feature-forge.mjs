@@ -236,6 +236,12 @@ export async function run({ page, check, metricText }) {
       "after = await forge('day_of_week', 'signup_ts')",
       "print('forged from python', round(before, 4), '->', round(after, 4))",
       "print('features', [f['label'] for f in features()])",
+      "# A forge that cannot happen must say so, not return the old score.",
+      "try:",
+      "    await forge('bin', 'city')",
+      "    print('refused NOTHING')",
+      "except Exception as error:",
+      "    print('refused', str(error).splitlines()[-1][:90])",
       "print('PYDONE')",
     ].join("\n"),
   );
@@ -279,6 +285,11 @@ export async function run({ page, check, metricText }) {
     output.split("\n").find((l) => l.startsWith("weekend")) ?? "",
   );
   check(
+    "a forge Python cannot do raises a named error instead of failing silently",
+    /refused .*no column called/.test(output),
+    output.split("\n").find((l) => l.startsWith("refused")) ?? "",
+  );
+  check(
     "Python forged a feature into the same store",
     /forged from python/.test(output) && /day of week\(signup_ts\)/.test(output),
     output.split("\n").find((l) => l.startsWith("forged")) ?? "",
@@ -296,16 +307,37 @@ export async function run({ page, check, metricText }) {
   console.log("\nForging a winning set");
   await forge(page, "Bin", "age");
   await forge(page, "One-hot", "city_code");
-  await forge(page, "Ratio", "income", "household");
 
-  const finalLabel = (await gauge().getAttribute("aria-label")) ?? "";
-  const finalLift = Number(
-    finalLabel.match(/lift of ([-\d.]+) points/)?.[1] ?? NaN,
-  );
+  const liftOf = async () =>
+    Number(
+      ((await gauge().getAttribute("aria-label")) ?? "").match(
+        /lift of ([-\d.]+) points/,
+      )?.[1] ?? NaN,
+    );
+  const finalLift = await liftOf();
   check(
-    "all four legendary transforms lift past the target",
+    "the legendary transforms lift past the target",
     Number.isFinite(finalLift) && finalLift >= 6,
     `lift ${finalLift} points`,
+  );
+
+  // ── a clever-sounding feature that measures nothing ──
+  console.log("\nIncome per head: judged by what it measures");
+  await forge(page, "Ratio", "income", "household");
+  const ratioLift = await liftOf();
+  check(
+    "income per head adds (almost) nothing on top — one weight on a ratio is still a line",
+    Number.isFinite(ratioLift) && Math.abs(ratioLift - finalLift) < 1,
+    `lift ${finalLift} -> ${ratioLift} points`,
+  );
+  check(
+    "and it is not rewarded as legendary; the card says why",
+    // "Legendary: <label>" is the legendary card's title. The why: one weight
+    // on a ratio is a straight line, and the per-head effect is a step.
+    !/Legendary:/.test(await whyRegion.innerText()) &&
+      /straight line/i.test(await whyRegion.innerText()) &&
+      /\bstep\b/i.test(await whyRegion.innerText()),
+    (await whyRegion.innerText()).replace(/\n/g, " ").slice(0, 140),
   );
 
   await page.getByRole("button", { name: /Score this forge/ }).click();

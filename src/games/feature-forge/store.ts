@@ -11,6 +11,7 @@ import {
   buildMatrices,
   describeFeature,
   evaluateForge,
+  featureProblem,
   fitAndScore,
   generateDataset,
   isValidFeature,
@@ -20,6 +21,7 @@ import {
   type Dataset,
   type Evaluation,
   type Feature,
+  type FitResult,
   type Transform,
 } from "./ml";
 import { whyCardFor } from "./why-cards";
@@ -77,8 +79,21 @@ export interface ForgeState {
 
   /** True while a retrain is in flight. */
   training: boolean;
+  /**
+   * Why the last fit failed, if it did — a lost WebGL context, say. Cleared by
+   * the next fit that succeeds. The score on screen is then still the last one
+   * that was real, for the feature list it was computed from.
+   */
+  fitError: string | null;
   /** True once the player has committed the forge for scoring. */
   submitted: boolean;
+  /**
+   * The lanes that have already recorded the current win with the progression
+   * service. A win is recorded once per lane, not once per forge: the code-lane
+   * star has to stay earnable with api.submit() after the same forge was scored
+   * from the rail.
+   */
+  recordedLanes: Lane[];
   ready: boolean;
 
   phase: Phase;
@@ -95,16 +110,47 @@ export interface ForgeState {
   setTransform: (transform: Transform) => void;
   /** Commit the slot as a feature and retrain. */
   forge: () => Promise<void>;
-  /** Add a feature directly — the code lane's entry point. */
-  addFeature: (transform: Transform, sourceCols: string[]) => Promise<boolean>;
-  removeFeature: (id: string) => Promise<void>;
-  clearForge: () => Promise<void>;
+  /**
+   * Add a feature directly — the code lane's entry point. Resolves to what
+   * happened, so a caller can tell a forge that retrained from one that was
+   * refused, overtaken by a reset, or failed to fit.
+   */
+  addFeature: (transform: Transform, sourceCols: string[]) => Promise<ForgeOutcome>;
+  removeFeature: (id: string) => Promise<ForgeOutcome>;
+  clearForge: () => Promise<ForgeOutcome>;
   /** Retrain without changing the features. */
-  retrain: () => Promise<void>;
-  /** Submit for scoring. */
-  submit: () => Evaluation;
+  retrain: () => Promise<ForgeOutcome>;
+  /**
+   * Submit for scoring. `source` is the lane the submission came from, and is
+   * what earns (or does not earn) the code-lane star — not which tab is open.
+   */
+  submit: (source?: Lane) => Evaluation;
   reset: () => Promise<void>;
 }
+
+/**
+ * What a request to change the forge came to.
+ *
+ *   applied  — the model retrained and the score describes the new features
+ *   invalid  — the feature was refused before any fit (bad pairing, duplicate)
+ *   busy     — another retrain was already in flight, so nothing changed
+ *   stale    — the forge was reset while this fit ran, so its result was dropped
+ *   failed   — the fit threw; the features and score are as they were before
+ */
+export type ForgeOutcome = "applied" | "invalid" | "busy" | "stale" | "failed";
+
+/**
+ * A generation counter for fits.
+ *
+ * Every fit captures the ticket when it starts and only writes its result if the
+ * ticket is still current when it finishes. `reset` advances it, so a retrain
+ * that was in flight when the player pressed Retry cannot land in the fresh run —
+ * which it used to, leaving a Leakage failure on an empty forge, or a score and
+ * importances computed from a matrix that was no longer on screen. The same
+ * check is handed to `fitAndScore` as `shouldStop`, so the orphaned fit also
+ * stops early instead of competing with the new one.
+ */
+let fitTicket = 0;
 
 // ── selectors: primitives and stable references only ─────────────────────
 
@@ -137,7 +183,9 @@ function freshState() {
     columnNames: [] as string[],
     trainScore: 0,
     training: false,
+    fitError: null,
     submitted: false,
+    recordedLanes: [] as Lane[],
     ready: false,
     phase: "forging" as Phase,
     evaluation: null,
@@ -155,6 +203,8 @@ export const useForgeStore = create<ForgeState>((set, get) => ({
   initialise: async () => {
     const state = get();
     if (state.ready || state.training) return;
+    const ticket = fitTicket;
+    const current = () => ticket === fitTicket;
     set({ training: true });
 
     const matrices = buildMatrices(state.dataset, baselineFeatures());
@@ -162,7 +212,23 @@ export const useForgeStore = create<ForgeState>((set, get) => ({
       set({ training: false });
       return;
     }
-    const result = await fitAndScore(matrices);
+
+    let result: FitResult;
+    try {
+      result = await fitAndScore(matrices, undefined, {
+        shouldStop: () => !current(),
+      });
+    } catch (cause) {
+      if (!current()) return;
+      const message = messageOf(cause);
+      set({
+        training: false,
+        fitError: message,
+        whyCard: whyCardFor({ kind: "fit-failed", stage: "baseline", message }),
+      });
+      return;
+    }
+    if (!current()) return;
 
     set({
       baselineScore: result.validationAccuracy,
@@ -171,7 +237,15 @@ export const useForgeStore = create<ForgeState>((set, get) => ({
       importances: result.importances,
       columnNames: result.columnNames,
       training: false,
+      fitError: null,
       ready: true,
+      // The baseline is the start of a run, so nothing judged before it survives.
+      features: [],
+      submitted: false,
+      recordedLanes: [],
+      evaluation: null,
+      failure: null,
+      phase: "forging",
       whyCard: whyCardFor({
         kind: "baseline-ready",
         baselineScore: result.validationAccuracy,
@@ -224,11 +298,13 @@ export const useForgeStore = create<ForgeState>((set, get) => ({
     if (!isValidFeature(feature)) return;
     if (state.features.some((entry) => entry.id === feature.id)) return;
 
-    await applyFeatures(set, get, [...state.features, feature], {
+    const outcome = await applyFeatures(set, get, [...state.features, feature], {
       kind: "forged-feature",
       feature,
     });
-    set({ slot: [] });
+    // Only an applied forge empties the slot; a refused or overtaken one leaves
+    // whatever the player has selected since alone.
+    if (outcome === "applied") set({ slot: [] });
   },
 
   addFeature: async (transform, sourceCols) => {
@@ -238,21 +314,21 @@ export const useForgeStore = create<ForgeState>((set, get) => ({
       transform,
       sourceCols: [...sourceCols],
     };
-    if (!isValidFeature(feature)) return false;
-    if (state.features.some((entry) => entry.id === feature.id)) return false;
+    if (featureProblem(transform, sourceCols, state.features) !== null) {
+      return "invalid";
+    }
 
-    await applyFeatures(set, get, [...state.features, feature], {
+    return applyFeatures(set, get, [...state.features, feature], {
       kind: "forged-feature",
       feature,
     });
-    return true;
   },
 
   removeFeature: async (id) => {
     const state = get();
     const feature = state.features.find((entry) => entry.id === id);
-    if (!feature) return;
-    await applyFeatures(
+    if (!feature) return "invalid";
+    return applyFeatures(
       set,
       get,
       state.features.filter((entry) => entry.id !== id),
@@ -260,17 +336,37 @@ export const useForgeStore = create<ForgeState>((set, get) => ({
     );
   },
 
-  clearForge: async () => {
-    await applyFeatures(set, get, [], { kind: "cleared" });
-  },
+  clearForge: async () => applyFeatures(set, get, [], { kind: "cleared" }),
 
   retrain: async () => {
     const state = get();
-    await applyFeatures(set, get, state.features, { kind: "retrained" });
+    return applyFeatures(set, get, state.features, { kind: "retrained" });
   },
 
-  submit: () => {
+  submit: (source = "visual") => {
     const state = get();
+
+    // Nothing to judge until the score describes the features on screen: while
+    // a retrain is in flight, currentScore is still the previous matrix's.
+    if (!state.ready || state.training) {
+      return evaluateForge({
+        features: state.features,
+        baselineScore: state.baselineScore,
+        currentScore: state.currentScore,
+        submitted: false,
+      });
+    }
+
+    // Idempotent once won, per lane: submitting the same winning forge again
+    // from the same lane (running a snippet twice, say) must not record the
+    // result twice. The other lane's first submission still counts — winning
+    // on the rail and then calling api.submit() is exactly what the code-lane
+    // star asks for.
+    const alreadyWon = state.phase === "forged" && state.submitted;
+    if (alreadyWon && state.evaluation && state.recordedLanes.includes(source)) {
+      return state.evaluation;
+    }
+
     const evaluation = evaluateForge({
       features: state.features,
       baselineScore: state.baselineScore,
@@ -281,6 +377,9 @@ export const useForgeStore = create<ForgeState>((set, get) => ({
     const won = evaluation.outcome === "forged";
     set({
       submitted: true,
+      recordedLanes: won
+        ? [...(alreadyWon ? state.recordedLanes : []), source]
+        : [],
       evaluation,
       failure: evaluation.failure,
       phase: won ? "forged" : evaluation.outcome === "leakage" ? "ruined" : "forging",
@@ -291,9 +390,9 @@ export const useForgeStore = create<ForgeState>((set, get) => ({
       useProgression.getState().recordResult({
         slug: SLUG,
         score: evaluation.score,
-        lane: state.lane,
+        lane: source,
         completed: true,
-        codeLaneCleared: state.lane === "code",
+        codeLaneCleared: source === "code",
       });
     }
 
@@ -301,10 +400,15 @@ export const useForgeStore = create<ForgeState>((set, get) => ({
   },
 
   reset: async () => {
+    fitTicket += 1;
     set({ ...freshState(), whyCard: whyCardFor({ kind: "briefing" }) });
     await get().initialise();
   },
 }));
+
+function messageOf(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
+}
 
 /**
  * Retrain on a new feature list and fold the result back in.
@@ -322,21 +426,49 @@ async function applyFeatures(
     | { kind: "removed-feature"; feature: Feature }
     | { kind: "cleared" }
     | { kind: "retrained" },
-): Promise<void> {
+): Promise<ForgeOutcome> {
   const state = get();
-  if (state.training) return;
+  // Not before the baseline exists either: a lift is meaningless without it.
+  if (state.training || !state.ready) return "busy";
+
+  const ticket = fitTicket;
+  const current = () => ticket === fitTicket;
+  const previousFeatures = state.features;
 
   set({ training: true, features, submitted: false, failure: null });
 
   const combined = allFeatures(features);
   const matrices = buildMatrices(state.dataset, combined);
   if (matrices === null) {
-    set({ training: false });
-    return;
+    set({ training: false, features: previousFeatures });
+    return "invalid";
   }
 
   const previousScore = state.currentScore;
-  const result = await fitAndScore(matrices);
+  let result: FitResult;
+  try {
+    result = await fitAndScore(matrices, undefined, {
+      shouldStop: () => !current(),
+    });
+  } catch (cause) {
+    if (!current()) return "stale";
+    // Put the feature list back, so the score, importances and labels on screen
+    // still describe one matrix: the last one that actually trained. Its
+    // verdict comes back with it — a leaky forge whose next fit failed is still
+    // a leaky forge, and the named failure must not quietly disappear.
+    const message = messageOf(cause);
+    set({
+      training: false,
+      features: previousFeatures,
+      submitted: state.submitted,
+      failure: state.failure,
+      fitError: message,
+      whyCard: whyCardFor({ kind: "fit-failed", stage: "retrain", message }),
+    });
+    return "failed";
+  }
+  if (!current()) return "stale";
+
   const leak = features.some(usesLeakyColumn);
 
   // Leakage is named the moment it enters the forge, not only at submission. A
@@ -354,6 +486,9 @@ async function applyFeatures(
     importances: result.importances,
     columnNames: result.columnNames,
     training: false,
+    fitError: null,
+    // A new matrix is a new forge: no lane has recorded a win for it yet.
+    recordedLanes: [],
     evaluation: leak ? evaluation : null,
     failure: leak ? evaluation.failure : null,
     phase: leak ? "ruined" : "forging",
@@ -368,6 +503,7 @@ async function applyFeatures(
       leaked: leak,
     }),
   });
+  return "applied";
 }
 
 /** Feature ids, for the code lane to list. */
