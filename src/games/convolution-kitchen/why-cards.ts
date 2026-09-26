@@ -5,6 +5,8 @@ import {
   FILTER_BUDGET,
   ONE_LAYER_CEILING,
   TARGET_ACCURACY,
+  clearlyAboveChance,
+  detectorsAboveLayerOne,
   filtersUsed,
   isBlank,
   isSingleSigned,
@@ -60,6 +62,13 @@ export type KitchenEvent =
   | { kind: "error"; message: string };
 
 const percent = (value: number) => `${Math.round(value * 100)}%`;
+
+/**
+ * The one Concept Library page this game can honestly point at. "Let it learn"
+ * is gradient descent on the kernels themselves, and that page explains the loop.
+ * Nothing in the library covers convolution yet, so no other card links out.
+ */
+const GD_HREF = "/concepts/gradient-descent";
 
 export function whyCardFor(event: KitchenEvent): WhyCardContent {
   switch (event.kind) {
@@ -199,6 +208,34 @@ export function whyCardFor(event: KitchenEvent): WhyCardContent {
       }
 
       if (outcome === "blur-only") {
+        // With a sign-changing filter in layer 2, "every feature map looks like
+        // the photograph" is false — that filter's maps do not — so the card says
+        // what is actually true: layer 1 is handing layer 2 a photograph. With
+        // only pass-throughs and blurs up there, the photograph claim IS true, and
+        // the single-layer card below is the right one.
+        const detectors = detectorsAboveLayerOne(layers);
+        if (detectors.length > 0) {
+          const one = detectors.length === 1;
+          const names = `${detectors.map((label) => `"${label}"`).join(" and ")} in layer 2`;
+          return {
+            key: "blur-only-deep",
+            title: "Layer 1 is only passing the photograph on",
+            body: `Every filter in layer 1 has no sign change, so its map is a softened copy of the picture — and that copy is all layer 2 gets to read. ${
+              clearlyAboveChance(score.accuracy)
+                ? `${names} can still find stripes in it, which is why this scores ${percent(
+                    score.accuracy,
+                  )} rather than ${percent(CHANCE_RATE)}, but ${
+                    one ? "it is" : "they are"
+                  } doing a first layer's job one level up, and the stack gets none of what depth is for.`
+                : `${names} can look for stripes in it, but at ${percent(
+                    score.accuracy,
+                  )} against ${percent(CHANCE_RATE)} for guessing ${
+                    one ? "it is" : "they are"
+                  } finding almost nothing there — and even a detector that did would be doing a first layer's job one level up, which gets the stack none of what depth is for.`
+            } Make one layer-1 weight negative and its map stops looking like a picture. That is the point of layer 1: a feature map is not an image, it is a map of where a pattern was found — and arrangement is something layer 2 can only read off a map like that.`,
+            tone: "bad",
+          };
+        }
         return {
           key: "blur-only",
           title: "Every feature map still looks like the photograph",
@@ -243,7 +280,7 @@ export function whyCardFor(event: KitchenEvent): WhyCardContent {
           title: "This is a wall, not a plateau",
           body: `Your filters are fine. Read the per-class row: ${DISHES.map(
             (dish, index) => `${dish.short} ${percent(score.perClass[index] ?? 0)}`,
-          ).join(", ")}. The two arrangement dishes are being mistaken for each other, and they always will be, because your stack ends in a global average — one layer gives the classifier one number per filter, "how much of this pattern is in the picture", and those two dishes contain the same amount of everything. They differ only in where it is. Nothing you type into a 3x3 grid changes that; a second layer does, because it can see WHERE layer 1 responded before the average erases it.`,
+          ).join(", ")}. The two arrangement dishes are being mistaken for each other, and with one layer they will keep being mistaken, because your stack ends in a global average — one layer gives the classifier one number per filter, "how much of this pattern is in the picture", and those two dishes contain the same amount of everything. They differ only in where it is. Apart from the few rows where the two textures meet, nothing you type into a 3x3 grid can see that; a second layer can, because it sees WHERE layer 1 responded before the average erases it.`,
           tone: "bad",
         };
       }
@@ -284,11 +321,14 @@ export function whyCardFor(event: KitchenEvent): WhyCardContent {
         layers.filter((layer) => layer.kernels.length > 0).length < 2;
       const better = learned.accuracy - mine;
 
+      // One layer: learnStack is exactly the player's shape. Two layers: its
+      // depthwise layer 2 learns a grid per input map where the player's shares
+      // one, so "exact" would overclaim — say which it is.
       return {
         key: `learned-${Math.round(learned.accuracy * 1000)}`,
-        title: `Gradient descent got ${percent(
-          learned.accuracy,
-        )} out of your exact shape`,
+        title: `Gradient descent got ${percent(learned.accuracy)} out of ${
+          single ? "your exact shape" : "the shape of your stack"
+        }`,
         body: `${
           single && learned.accuracy < TARGET_ACCURACY
             ? `It had a free hand with all ${
@@ -301,8 +341,14 @@ export function whyCardFor(event: KitchenEvent): WhyCardContent {
                   better,
                 )} above your hand-designed version on the same architecture, so there is room left in the weights.`
               : `Which is about what you got by hand — you found kernels as good as the ones gradient descent settles on. That is a real result, and it is also the last time it will happen: this is a 3x3 filter over one channel, the largest thing a person can reason about directly.`
-        } Look at what it actually picked. Some of those grids will be recognisable — a positive band against a negative band is an edge detector however you arrive at it. Others will look like nothing in particular and work anyway. A real layer-2 filter mixes every input channel, so it is 3x3xC numbers with no grid to draw it on, and that is where hand-designing stops for good.`,
+        } ${
+          single
+            ? ``
+            : `One difference to keep in mind: its layer 2 learned a separate 3x3 grid for each layer-1 map, where yours shares one grid across all of them, so it had a little more freedom than your version does. `
+        }Its kernels are drawn under the Let it learn button — look at what it actually picked. Some of those grids will be recognisable — a positive band against a negative band is an edge detector however you arrive at it. Others will look like nothing in particular and work anyway. A real layer-2 filter mixes every input channel, so it is 3x3xC numbers with no grid to draw it on, and that is where hand-designing stops for good.`,
         tone: "info",
+        conceptHref: GD_HREF,
+        conceptLabel: "How gradient descent works",
       };
     }
 

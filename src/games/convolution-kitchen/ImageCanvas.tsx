@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { clamp } from "@/lib/utils";
 import {
   DISHES,
   IMAGE_SIZE,
@@ -38,6 +39,15 @@ const SCALE = 11;
  * two things that carry MEANING are not left inside it: the window's nine numbers
  * are a real table, and the picture itself gets a text description. The bitmap is
  * the illustration; the table is the content.
+ *
+ * ── Sizing ──────────────────────────────────────────────────────────────────
+ * The bitmap is 264 px wide and used to be drawn at exactly that, which overflowed
+ * a 320 px phone by about a dozen pixels (WCAG 1.4.10). It now shrinks with its
+ * container, so the window overlay is positioned in percentages and a click is
+ * mapped back to a pixel through the canvas's rendered size, not a fixed scale.
+ *
+ * Moving the window also says what it found, through a polite live region, so a
+ * screen-reader user hears the new sum without having to go and find the table.
  */
 export function ImageCanvas({
   sample,
@@ -47,6 +57,27 @@ export function ImageCanvas({
   onMove,
 }: ImageCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  /**
+   * Where the player last moved the window to, and on what. The announcement is
+   * only spoken for that exact position, kernel and plate, so editing a weight or
+   * changing plate does not read out a sum for a window nobody just moved.
+   */
+  const [moved, setMoved] = useState<{
+    row: number;
+    col: number;
+    kernel: Kernel | null;
+    sample: Sample;
+  } | null>(null);
+
+  const moveTo = useCallback(
+    (targetRow: number, targetCol: number) => {
+      const nextRow = clamp(Math.round(targetRow), 0, IMAGE_SIZE - KERNEL_SIZE);
+      const nextCol = clamp(Math.round(targetCol), 0, IMAGE_SIZE - KERNEL_SIZE);
+      setMoved({ row: nextRow, col: nextCol, kernel, sample });
+      onMove(nextRow, nextCol);
+    },
+    [kernel, sample, onMove],
+  );
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -79,31 +110,50 @@ export function ImageCanvas({
     (event: React.KeyboardEvent<HTMLButtonElement>) => {
       const step = event.shiftKey ? 3 : 1;
       let handled = true;
-      if (event.key === "ArrowUp") onMove(row - step, col);
-      else if (event.key === "ArrowDown") onMove(row + step, col);
-      else if (event.key === "ArrowLeft") onMove(row, col - step);
-      else if (event.key === "ArrowRight") onMove(row, col + step);
-      else if (event.key === "Home") onMove(0, 0);
-      else if (event.key === "End") onMove(IMAGE_SIZE - 3, IMAGE_SIZE - 3);
+      if (event.key === "ArrowUp") moveTo(row - step, col);
+      else if (event.key === "ArrowDown") moveTo(row + step, col);
+      else if (event.key === "ArrowLeft") moveTo(row, col - step);
+      else if (event.key === "ArrowRight") moveTo(row, col + step);
+      else if (event.key === "Home") moveTo(0, 0);
+      else if (event.key === "End") moveTo(IMAGE_SIZE - 3, IMAGE_SIZE - 3);
       else handled = false;
       if (handled) event.preventDefault();
     },
-    [onMove, row, col],
+    [moveTo, row, col],
   );
 
   /** Click to place the window's centre where the pointer is. */
   const handleClick = useCallback(
     (event: React.MouseEvent<HTMLButtonElement>) => {
-      const bounds = event.currentTarget.getBoundingClientRect();
-      const x = Math.floor((event.clientX - bounds.left) / SCALE);
-      const y = Math.floor((event.clientY - bounds.top) / SCALE);
-      onMove(y - 1, x - 1);
+      // Enter and Space on a button also fire `click`, at (0, 0). That used to
+      // throw the window into the top-left corner; the arrow keys are the
+      // keyboard's way to move it, so a keyboard click is left alone.
+      if (event.detail === 0) return;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const bounds = canvas.getBoundingClientRect();
+      if (bounds.width === 0 || bounds.height === 0) return;
+      const x = Math.floor(((event.clientX - bounds.left) / bounds.width) * IMAGE_SIZE);
+      const y = Math.floor(((event.clientY - bounds.top) / bounds.height) * IMAGE_SIZE);
+      moveTo(y - 1, x - 1);
     },
-    [onMove],
+    [moveTo],
   );
 
   const dish = DISHES[sample.label]!;
   const result = kernel ? convolveOne(sample, kernel, row, col) : null;
+  const announcement =
+    result !== null &&
+    moved !== null &&
+    moved.row === row &&
+    moved.col === col &&
+    moved.kernel === kernel &&
+    moved.sample === sample
+      ? `Window at row ${row + 1}, column ${col + 1}: the nine products sum to ${result.sum.toFixed(
+          2,
+        )}, ${result.activated > 0 ? `and the ReLU passes it` : `and the ReLU outputs 0`}.`
+      : "";
+  const percent = (pixels: number) => `${(pixels / IMAGE_SIZE) * 100}%`;
 
   return (
     <div className="flex flex-col gap-3 sm:flex-row">
@@ -124,7 +174,7 @@ export function ImageCanvas({
           }, column ${
             col + 1
           }. Arrow keys move it one pixel, shift and arrow keys move it three, or click to place it.`}
-          className="relative block w-fit rounded-md border border-border focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]"
+          className="relative block w-fit max-w-full rounded-md border border-border focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]"
           onKeyDown={handleKey}
           onClick={handleClick}
         >
@@ -132,7 +182,7 @@ export function ImageCanvas({
             ref={canvasRef}
             width={IMAGE_SIZE * SCALE}
             height={IMAGE_SIZE * SCALE}
-            className="block rounded-md"
+            className="block h-auto max-w-full rounded-md"
             // The bitmap is illustration. Everything that matters is in the table
             // below and in the description beside it.
             aria-hidden="true"
@@ -141,13 +191,16 @@ export function ImageCanvas({
             aria-hidden="true"
             className="pointer-events-none absolute border-2 border-[var(--primary)] shadow-[0_0_0_2px_var(--bg)]"
             style={{
-              left: col * SCALE,
-              top: row * SCALE,
-              width: KERNEL_SIZE * SCALE,
-              height: KERNEL_SIZE * SCALE,
+              left: percent(col),
+              top: percent(row),
+              width: percent(KERNEL_SIZE),
+              height: percent(KERNEL_SIZE),
             }}
           />
         </button>
+        <p className="sr-only-live" aria-live="polite" aria-atomic="true">
+          {announcement}
+        </p>
         <p className="text-xs text-text-muted">
           {dish.label} · {IMAGE_SIZE}x{IMAGE_SIZE} · window at row {row + 1},
           column {col + 1}

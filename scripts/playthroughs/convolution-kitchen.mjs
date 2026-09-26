@@ -20,7 +20,12 @@
 export const slug = "convolution-kitchen";
 export const title = "Convolution Kitchen";
 
-/** Scoring is async and the caption says so while it runs. */
+/**
+ * Scoring is async and the caption says so while it runs.
+ *
+ * The raw-pixel baseline is fitted once, AFTER the first score is on screen (it
+ * used to hold the first score back), so it has its own caption to wait out.
+ */
 async function settle(page, timeout = 90000) {
   await page
     .waitForFunction(
@@ -28,7 +33,8 @@ async function settle(page, timeout = 90000) {
         const caption = document.body.innerText;
         return (
           !/refitting the classifier/i.test(caption) &&
-          !/scoring the opening filter/i.test(caption)
+          !/scoring the opening filter/i.test(caption) &&
+          !/fitting the baseline/i.test(caption)
         );
       },
       null,
@@ -342,6 +348,30 @@ export async function run({ page, check }) {
   check(
     "the learned score is reported as a metric too",
     /Learned kernels/.test(await page.locator("body").innerText()),
+  );
+
+  // The why-card sends the player to the grids under the button, so they must be
+  // there: one 3x3 table per filter in the learned shape (three, here), each
+  // scaled so its strongest weight reads ±2 as the note beneath them says.
+  const picked = page.getByRole("region", { name: "What gradient descent picked" });
+  const pickedGrids = picked.getByRole("table");
+  const gridCount = await pickedGrids.count();
+  const cellsPerGrid = [];
+  const peaks = [];
+  for (let index = 0; index < gridCount; index += 1) {
+    const cells = await pickedGrids.nth(index).locator("td").allInnerTexts();
+    cellsPerGrid.push(cells.length);
+    peaks.push(Math.max(...cells.map((cell) => Math.abs(Number(cell)))));
+  }
+  check(
+    "the kernels gradient descent picked are drawn, one grid per filter",
+    gridCount === 3 && cellsPerGrid.every((count) => count === 9),
+    `${gridCount} grids, cells ${cellsPerGrid.join("/")}`,
+  );
+  check(
+    "each learned grid is scaled so its strongest weight reads 2",
+    peaks.length === gridCount && peaks.every((peak) => peak === 2),
+    `peaks ${peaks.join(", ")}`,
   );
 
   // ── the win: depth, on fewer filters ──

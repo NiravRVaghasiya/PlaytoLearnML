@@ -17,26 +17,39 @@ import {
   MATH_EQUATION,
   MATH_NOTES,
   TARGET_ACCURACY,
+  THRIFTY_FILTERS,
   filtersUsed,
   outputChannels,
   stackGeometry,
 } from "./ml";
-import { SLUG, useKitchenStore } from "./store";
+import { SLUG, currentLearned, useKitchenStore } from "./store";
 import { LayerStack } from "./LayerStack";
+import { LearnedKernels } from "./LearnedKernels";
 import { VisualLane } from "./VisualLane";
 import { CodeLane } from "./CodeLane";
 
+/**
+ * The engine's rule, in this game's terms: ★1 served, ★2 a best score of at least
+ * HIGH_SCORE_THRESHOLD, ★3 that plus a code-lane serve. `servedPoints` is built so
+ * the threshold falls exactly at THRIFTY_FILTERS with no duplicates, and the tests
+ * hold the sentence below to that arithmetic. The third star used to promise a
+ * filter-count rubric the game computed and nobody read.
+ */
 const STAR_CRITERIA = [
   `Read all four dishes at ${Math.round(TARGET_ACCURACY * 100)}% or better`,
-  `Score ${Math.round(HIGH_SCORE_THRESHOLD * 100)}% or better on thrift and cleanliness`,
-  "Win with four filters or fewer, none dead and none duplicated",
+  `Score ${Math.round(
+    HIGH_SCORE_THRESHOLD * 100,
+  )}% or better: serve with ${THRIFTY_FILTERS} filters or fewer, none duplicated`,
+  "Serve a stack you built from the code lane",
 ];
 
 function Controls() {
   const layers = useKitchenStore((s) => s.layers);
   const evaluation = useKitchenStore((s) => s.evaluation);
   const learning = useKitchenStore((s) => s.learning);
-  const learned = useKitchenStore((s) => s.learned);
+  // Only for the stack on screen: a result learned for another shape is not
+  // "this shape" — see `currentLearned`.
+  const learned = useKitchenStore(currentLearned);
   const windowKernel = useKitchenStore((s) => s.windowKernel);
 
   const setWeight = useKitchenStore((s) => s.setWeight);
@@ -83,17 +96,20 @@ function Controls() {
           {learning ? "Training…" : "Let it learn"}
         </Button>
         <p className="mt-1.5 text-xs text-text-muted">
-          {learned === null
-            ? `Trains your exact stack shape end to end and shows the kernels gradient descent picks instead. It is the honest check on whether your design or your architecture is the limit.`
-            : `Gradient descent got ${Math.round(
-                learned.accuracy * 100,
-              )}% out of this shape.`}
+          {learning
+            ? `Training a stack of this shape end to end. Edits wait until it is done.`
+            : learned === null
+              ? `Trains a stack of your shape end to end and shows the kernels gradient descent picks instead. It is the honest check on whether your design or your architecture is the limit.`
+              : `Gradient descent got ${Math.round(
+                  learned.accuracy * 100,
+                )}% out of this shape.`}
         </p>
+        {learned !== null && !learning ? <LearnedKernels learned={learned} /> : null}
 
         <Button
           variant="ghost"
           className="mt-3 w-full"
-          onClick={reset}
+          onClick={() => reset()}
           disabled={busy}
           icon={<RotateCcw className="size-4" />}
         >
@@ -111,7 +127,7 @@ export default function ConvolutionKitchen() {
   const score = useKitchenStore((s) => s.score);
   const baseline = useKitchenStore((s) => s.baseline);
   const evaluation = useKitchenStore((s) => s.evaluation);
-  const learned = useKitchenStore((s) => s.learned);
+  const learned = useKitchenStore(currentLearned);
   const scoring = useKitchenStore((s) => s.scoring);
   const phase = useKitchenStore((s) => s.phase);
   const failure = useKitchenStore((s) => s.failure);
@@ -237,8 +253,8 @@ export default function ConvolutionKitchen() {
         recentGain: lastGain,
         starCriteria: STAR_CRITERIA,
       }}
-      onRetry={reset}
-      onNext={phase === "served" ? reset : undefined}
+      onRetry={() => reset()}
+      onNext={phase === "served" ? () => reset() : undefined}
       nextLabel={phase === "served" ? "Try it with fewer filters" : undefined}
     />
   );

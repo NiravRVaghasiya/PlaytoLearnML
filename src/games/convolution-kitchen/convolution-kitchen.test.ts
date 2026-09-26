@@ -1,5 +1,12 @@
 import * as tf from "@tensorflow/tfjs";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  EMPTY_PROGRESSION,
+  HIGH_SCORE_THRESHOLD,
+  createMemoryAdapter,
+  starsFor,
+  useProgression,
+} from "@/engine/progression";
 import {
   ARRANGEMENT_CLASSES,
   CHANCE_RATE,
@@ -8,20 +15,27 @@ import {
   DISHES,
   DUPLICATE_THRESHOLD,
   FILTER_BUDGET,
+  FitCancelledError,
   IMAGE_SIZE,
   KERNEL_CELLS,
   KERNEL_PRESETS,
   MAX_KERNELS_PER_LAYER,
+  MATH_CODE,
+  MATH_EQUATION,
+  MATH_NOTES,
   MAX_LAYERS,
   ONE_LAYER_CEILING,
   PIXELS,
   TARGET_ACCURACY,
+  THRIFTY_FILTERS,
   WEIGHT_MAX,
   WEIGHT_MIN,
   channelLabels,
+  clearlyAboveChance,
   convolveOne,
   correlation,
   describeKernel,
+  detectorsAboveLayerOne,
   evaluateKitchen,
   extractFeatures,
   featureMapsFor,
@@ -37,12 +51,14 @@ import {
   outputChannels,
   scoreRawPixels,
   scoreStack,
+  servedPoints,
+  shapeKey,
   stackGeometry,
   type Layer,
   type PoolType,
   type ScoreResult,
 } from "./ml";
-import { createCodeApi, useKitchenStore } from "./store";
+import { SLUG, createCodeApi, currentLearned, useKitchenStore } from "./store";
 import { whyCardFor, windowCaption } from "./why-cards";
 
 /**
@@ -645,7 +661,11 @@ describe("the verdict", () => {
     const evaluation = await judge(WINNER);
     expect(evaluation.outcome).toBe("served");
     expect(evaluation.failure).toBeNull();
-    expect(evaluation.stars).toBe(3);
+    // Three stars once the code lane serves it, by the engine's own rule — the
+    // game no longer keeps a second rubric of its own for the tooltip to drift from.
+    expect(
+      starsFor({ completed: true, bestScore: evaluation.points, codeLaneCleared: true }),
+    ).toBe(3);
     expect(evaluation.points).toBeGreaterThan(0.9);
   }, 180000);
 
@@ -1094,5 +1114,442 @@ describe("why-cards", () => {
     expect(windowCaption(3.2, 3.2)).toMatch(/looks like the kernel/);
     expect(windowCaption(0, 0)).toMatch(/cancelled|flat/);
     expect(windowCaption(-2.5, 0)).toMatch(/opposite/);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Invariants behind the audit fixes: memory, cancellation, stale results, the
+// star rule, and what the code lane's setters promise.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** A few plates are enough to exercise a fit's bookkeeping, and cost almost nothing. */
+const tiny = {
+  train: dataset.train.slice(0, 16),
+  validation: dataset.validation.slice(0, 8),
+};
+
+describe("fits clean up after themselves", () => {
+  // Earlier tests leave rescores running in the background. A direct score
+  // supersedes and cancels all of them, so nothing else is allocating tensors
+  // while these count them.
+  beforeAll(async () => {
+    await useKitchenStore.getState().score_();
+  }, 300000);
+
+  it("frees the optimizer along with the model on every score, baseline and learn", async () => {
+    // Warm each path once so backend-level caches are not counted as leaks.
+    const stack = [layer("avg", "Vertical edge")];
+    const shape = [makeLayer([makeKernel("Blank")], "avg")];
+    await scoreStack(tiny, stack);
+    await scoreRawPixels(tiny);
+    await learnStack(tiny, shape);
+
+    const before = tf.memory().numTensors;
+    await scoreStack(tiny, stack);
+    expect(tf.memory().numTensors, "scoreStack leaked").toBe(before);
+    await scoreRawPixels(tiny);
+    expect(tf.memory().numTensors, "scoreRawPixels leaked").toBe(before);
+    await learnStack(tiny, shape);
+    expect(tf.memory().numTensors, "learnStack leaked").toBe(before);
+  }, 180000);
+
+  it("stops a cancelled fit, reports it as cancelled, and still frees everything", async () => {
+    const stack = [layer("avg", "Vertical edge")];
+    await scoreStack(tiny, stack);
+    const before = tf.memory().numTensors;
+
+    await expect(
+      scoreStack(tiny, stack, { cancelled: true }),
+    ).rejects.toBeInstanceOf(FitCancelledError);
+    const token = { cancelled: false };
+    const learning = learnStack(tiny, [makeLayer([makeKernel("Blank")], "avg")], token);
+    token.cancelled = true;
+    await expect(learning).rejects.toBeInstanceOf(FitCancelledError);
+
+    expect(tf.memory().numTensors).toBe(before);
+  }, 180000);
+});
+
+describe("the shape a learned result belongs to", () => {
+  it("ignores weights and changes with kernel counts and pooling", () => {
+    const base = [layer("avg", "Vertical edge")];
+    expect(shapeKey([layer("avg", "Blur")])).toBe(shapeKey(base));
+    expect(shapeKey([layer("max", "Vertical edge")])).not.toBe(shapeKey(base));
+    expect(shapeKey([layer("avg", "Vertical edge", "Blur")])).not.toBe(shapeKey(base));
+    expect(shapeKey(WINNER)).not.toBe(shapeKey(base));
+  });
+});
+
+describe("the second star, as the score formula decides it", () => {
+  it("lands exactly on the thrifty, duplicate-free wins the criterion names", () => {
+    for (let filters = 1; filters <= FILTER_BUDGET; filters += 1) {
+      for (let duplicates = 0; duplicates <= 3; duplicates += 1) {
+        const earns = servedPoints(filters, duplicates) >= HIGH_SCORE_THRESHOLD;
+        expect(earns, `${filters} filters, ${duplicates} duplicate pairs`).toBe(
+          filters <= THRIFTY_FILTERS && duplicates === 0,
+        );
+      }
+    }
+  });
+
+  it("keeps every served stack above every failing one", () => {
+    for (let filters = 1; filters <= FILTER_BUDGET; filters += 1) {
+      for (let duplicates = 0; duplicates <= 6; duplicates += 1) {
+        expect(servedPoints(filters, duplicates)).toBeGreaterThan(0.5);
+      }
+    }
+  });
+
+  it("no longer hands the thrift star to a six-filter win", async () => {
+    const fat: Layer[] = [
+      layer("avg", "Vertical edge", "Horizontal edge", "Diagonal edge"),
+      layer("avg", "Pass through", "Horizontal edge", "Vertical edge"),
+    ];
+    const score = await scored(fat);
+    const { health, duplicates } = inspectFilters(dataset, fat);
+    const evaluation = evaluateKitchen({ layers: fat, score, health, duplicates, learned: null });
+    expect(evaluation.outcome).toBe("served");
+    expect(evaluation.points).toBeLessThan(HIGH_SCORE_THRESHOLD);
+
+    const lean = await scored(WINNER);
+    const leanHealth = inspectFilters(dataset, WINNER);
+    const leanEvaluation = evaluateKitchen({
+      layers: WINNER,
+      score: lean,
+      health: leanHealth.health,
+      duplicates: leanHealth.duplicates,
+      learned: null,
+    });
+    expect(leanEvaluation.points).toBeGreaterThanOrEqual(HIGH_SCORE_THRESHOLD);
+  }, 300000);
+});
+
+describe("the blur verdict with a second layer on top", () => {
+  it("still names the blur, and stops claiming every filter is an average", async () => {
+    // What "Add layer 2" on the opening kitchen produces: a Blur under a
+    // pass-through and a real edge detector.
+    const stack: Layer[] = [
+      layer("avg", "Blur"),
+      layer("avg", "Pass through", "Horizontal edge"),
+    ];
+    const score = await scored(stack);
+    const { health, duplicates } = inspectFilters(dataset, stack);
+    const evaluation = evaluateKitchen({ layers: stack, score, health, duplicates, learned: null });
+
+    expect(evaluation.outcome).toBe("blur-only");
+    const detail = evaluation.failure!.detail;
+    expect(detail).toMatch(/Every filter in layer 1/);
+    expect(detail).not.toMatch(/Every filter you have/);
+    expect(detail).toMatch(/"Horizontal edge"/);
+    expect(detail).toMatch(/positive weight and at least one negative weight/);
+    // It compares against the target, not against guessing, because layer 2 is
+    // detecting something and the score is no longer at chance.
+    expect(detail).toContain(`against the ${Math.round(TARGET_ACCURACY * 100)}% needed`);
+
+    // Only the filter that can detect anything is credited with finding it, and
+    // the verb agrees with how many there are.
+    expect(detail).toContain(`Whatever "Horizontal edge" finds in that copy, it could`);
+    expect(detail).not.toMatch(/Whatever[^.]*"Pass through"/);
+
+    const card = whyCardFor({ kind: "scored", evaluation, layers: stack, baseline: 0.31 });
+    expect(card.title).not.toMatch(/looks like the photograph/);
+    expect(card.body).toMatch(/layer 2/);
+    // "Which is why this scores X rather than chance" is said because it is true.
+    expect(clearlyAboveChance(score.accuracy)).toBe(true);
+    expect(card.body).toContain(
+      `which is why this scores ${Math.round(score.accuracy * 100)}% rather than ${Math.round(
+        CHANCE_RATE * 100,
+      )}%`,
+    );
+
+    // The same card on a score at chance does not claim layer 2 is finding stripes.
+    const atChance = whyCardFor({
+      kind: "scored",
+      evaluation: { ...evaluation, score: { ...score, accuracy: CHANCE_RATE } },
+      layers: stack,
+      baseline: 0.31,
+    });
+    expect(atChance.body).not.toMatch(/which is why this scores/);
+    expect(atChance.body).toMatch(/finding almost nothing/);
+  }, 300000);
+
+  it("keeps the every-filter wording when nothing above layer 1 has a sign change", async () => {
+    // Two clicks from the opening kitchen: Add layer 2, then remove its
+    // Horizontal edge. A pass-through detects nothing; it only passes on.
+    const stack: Layer[] = [layer("avg", "Blur"), layer("avg", "Pass through")];
+    expect(detectorsAboveLayerOne(stack)).toEqual([]);
+    const score = await scored(stack);
+    const { health, duplicates } = inspectFilters(dataset, stack);
+    const evaluation = evaluateKitchen({ layers: stack, score, health, duplicates, learned: null });
+
+    expect(evaluation.outcome).toBe("blur-only");
+    // Measured at 23%: no filter anywhere measures a difference, and the score says so.
+    expect(clearlyAboveChance(score.accuracy)).toBe(false);
+    const detail = evaluation.failure!.detail;
+    expect(detail).toMatch(/Every filter you have, in both layers, has weights of a single sign/);
+    expect(detail).not.toMatch(/Whatever/);
+    expect(detail).toContain(
+      `The detection score agrees: ${Math.round(score.accuracy * 100)}% against ${Math.round(
+        CHANCE_RATE * 100,
+      )}% for guessing.`,
+    );
+
+    const card = whyCardFor({ kind: "scored", evaluation, layers: stack, baseline: 0.31 });
+    expect(card.key).toBe("blur-only");
+    expect(card.title).toMatch(/looks like the photograph/);
+    expect(card.body).not.toMatch(/find stripes|which is why this scores/);
+  }, 300000);
+
+  it("counts only sign-changing filters above layer 1 as detectors, once each", () => {
+    expect(detectorsAboveLayerOne([layer("avg", "Vertical edge")])).toEqual([]);
+    expect(
+      detectorsAboveLayerOne([
+        layer("avg", "Blur"),
+        layer("avg", "Pass through", "Blur", "Blank"),
+      ]),
+    ).toEqual([]);
+    expect(
+      detectorsAboveLayerOne([
+        layer("avg", "Vertical edge"),
+        layer("avg", "Pass through", "Horizontal edge", "Horizontal edge"),
+      ]),
+    ).toEqual(["Horizontal edge"]);
+  });
+});
+
+describe("the math drawer", () => {
+  it("indexes the kernel the same way round as the code beside it", () => {
+    // The code multiplies image[y + i][x + j] by kernel[i][j]: rows first.
+    expect(MATH_CODE).toContain("image[y + i][x + j] * kernel[i][j]");
+    expect(MATH_EQUATION).toContain("I(y+i,\\; x+j)\\, K(i,j)");
+    expect(MATH_EQUATION).not.toContain("I(x+i");
+  });
+
+  it("shows the average pool the kitchen defaults to, not only the max", () => {
+    expect(makeLayer([]).pool).toBe("avg");
+    expect(MATH_EQUATION).toMatch(/P_\{\\text\{avg\}\}/);
+    expect(MATH_EQUATION).toMatch(/P_\{\\max\}/);
+  });
+
+  it("does not call the one-layer ceiling a mathematical impossibility", () => {
+    expect(MATH_NOTES).not.toMatch(/mathematically incapable/);
+    expect(MATH_NOTES).toContain(`${Math.round(ONE_LAYER_CEILING * 100)}%`);
+  });
+});
+
+describe("the store's async lifecycle", () => {
+  beforeEach(() => {
+    useProgression.setState({
+      ...EMPTY_PROGRESSION,
+      hydrated: true,
+      syncError: null,
+      lastGain: null,
+    });
+    useProgression.getState().setAdapter(createMemoryAdapter());
+    useKitchenStore.setState({
+      layers: [makeLayer([makeKernel("Blur")], "avg")],
+      evaluation: null,
+      learned: null,
+      learnedShape: null,
+      scoring: false,
+      learning: false,
+      phase: "designing",
+      failure: null,
+      lane: "visual",
+      editSource: "visual",
+    });
+  });
+
+  it("forgets a learned result when the shape changes, and keeps it through weight edits", () => {
+    const layers = useKitchenStore.getState().layers;
+    useKitchenStore.setState({
+      learned: { accuracy: 0.8, kernels: [] },
+      learnedShape: shapeKey(layers),
+    });
+    expect(currentLearned(useKitchenStore.getState())).not.toBeNull();
+
+    useKitchenStore.getState().applyPreset(0, 0, "Vertical edge");
+    expect(currentLearned(useKitchenStore.getState())).not.toBeNull();
+
+    useKitchenStore.getState().addKernel(0, "Horizontal edge");
+    expect(currentLearned(useKitchenStore.getState())).toBeNull();
+
+    useKitchenStore.getState().removeKernel(0, 1);
+    // Back to the shape that was learned, so its result is true again.
+    expect(currentLearned(useKitchenStore.getState())).not.toBeNull();
+
+    useKitchenStore.getState().setPool(0, "max");
+    expect(currentLearned(useKitchenStore.getState())).toBeNull();
+    useKitchenStore.getState().setPool(0, "avg");
+
+    useKitchenStore.getState().addLayer();
+    expect(currentLearned(useKitchenStore.getState())).toBeNull();
+  });
+
+  it("keeps the failure up while an edit is rescored, and reuses it when nothing changed", async () => {
+    await useKitchenStore.getState().score_();
+    const first = useKitchenStore.getState().failure;
+    expect(first?.name).toBe("You built a blur");
+
+    // An edit no longer blanks the verdict it is about to be judged against.
+    useKitchenStore.getState().setWeight(0, 0, 4, 2);
+    expect(useKitchenStore.getState().failure).toBe(first);
+    expect(useKitchenStore.getState().scoring).toBe(true);
+
+    // Put the weight back and rescore: same verdict, same words, same object —
+    // so the shell's alert is not remounted and not re-announced.
+    useKitchenStore.getState().setWeight(0, 0, 4, 1);
+    await useKitchenStore.getState().score_();
+    expect(useKitchenStore.getState().failure).toBe(first);
+  }, 300000);
+
+  it("makes one edit of a code-lane setWeights call, not nine", () => {
+    let layerChanges = 0;
+    const unsubscribe = useKitchenStore.subscribe((state, previous) => {
+      if (state.layers !== previous.layers) layerChanges += 1;
+    });
+    void createCodeApi().setWeights(0, 0, [1, 0, -1, 2, 0, -2, 1, 0, -1]);
+    unsubscribe();
+    expect(layerChanges).toBe(1);
+    expect(useKitchenStore.getState().layers[0]!.kernels[0]!.label).toBe(
+      "Vertical edge",
+    );
+  });
+
+  it("starts learning while a rescore is pending instead of silently doing nothing", async () => {
+    useKitchenStore.getState().applyPreset(0, 0, "Vertical edge");
+    expect(useKitchenStore.getState().scoring).toBe(true);
+    const run = useKitchenStore.getState().letItLearn();
+    expect(useKitchenStore.getState().learning).toBe(true);
+    // A Retry while it is still waiting on that rescore stops it before it
+    // trains: nothing from that run lands afterwards. (Retry mid-fit is below.)
+    useKitchenStore.getState().reset();
+    await run;
+    const state = useKitchenStore.getState();
+    expect(state.learning).toBe(false);
+    expect(state.learned).toBeNull();
+    expect(state.whyCard?.key).not.toMatch(/^learned-/);
+    expect(state.layers[0]!.kernels[0]!.label).toBe("Blur");
+  }, 300000);
+
+  it("stops a Let it learn that is already fitting when the kitchen is reset", async () => {
+    useKitchenStore.setState({
+      layers: [makeLayer([makeKernel("Vertical edge")], "avg")],
+      // Known, so no baseline fit starts behind the score and muddies the count.
+      baseline: 0.3,
+    });
+    // A direct score supersedes whatever earlier tests left scheduled, so from
+    // here on the only thing allocating tensors is the run under test.
+    await useKitchenStore.getState().score_();
+    const before = tf.memory().numTensors;
+
+    const run = useKitchenStore.getState().letItLearn();
+    // Past the flush and into learnStack: its model and batches now exist, and
+    // the fit that would take about 20 seconds to finish is under way.
+    await vi.waitFor(
+      () => expect(tf.memory().numTensors).toBeGreaterThan(before),
+      { timeout: 60000, interval: 5 },
+    );
+    expect(useKitchenStore.getState().learning).toBe(true);
+
+    const resetAt = performance.now();
+    useKitchenStore.getState().reset();
+    await run;
+    // Cancelled at the next batch (measured at about a quarter of a second),
+    // rather than left to train to the end for an answer nobody will read.
+    expect(performance.now() - resetAt).toBeLessThan(8000);
+
+    const state = useKitchenStore.getState();
+    expect(state.learning).toBe(false);
+    expect(state.learned).toBeNull();
+    expect(state.learnedShape).toBeNull();
+    // The cancellation is not reported as an error, and no learned card lands.
+    // (The reset's own rescore may already have replaced the briefing.)
+    expect(state.whyCard?.key).not.toMatch(/^(learned|error)-/);
+    expect(state.layers[0]!.kernels[0]!.label).toBe("Blur");
+
+    // And the cancelled fit freed everything it had allocated.
+    await useKitchenStore.getState().score_();
+    expect(tf.memory().numTensors).toBe(before);
+  }, 300000);
+
+  it("credits the code lane for a serve only when the code lane built it", async () => {
+    // The code tab is open, but the stack was built with the visual controls.
+    useKitchenStore.getState().setLane("code");
+    useKitchenStore.getState().applyPreset(0, 0, "Vertical edge");
+    useKitchenStore.getState().addLayer();
+    await useKitchenStore.getState().score_();
+    expect(useKitchenStore.getState().phase).toBe("served");
+    expect(useProgression.getState().games[SLUG]?.completed).toBe(true);
+    expect(useProgression.getState().games[SLUG]?.codeLaneCleared).toBe(false);
+
+    // Now build the same stack through the api, from the visual tab.
+    useKitchenStore.getState().setLane("visual");
+    const api = createCodeApi();
+    await api.reset();
+    await api.applyPreset(0, 0, "Vertical edge");
+    await api.addLayer();
+    expect(useKitchenStore.getState().phase).toBe("served");
+    expect(api.score().accuracy).toBeGreaterThan(TARGET_ACCURACY);
+    expect(useProgression.getState().games[SLUG]?.codeLaneCleared).toBe(true);
+  }, 600000);
+});
+
+describe("the code lane's setters", () => {
+  beforeEach(() => {
+    useKitchenStore.setState({
+      layers: [makeLayer([makeKernel("Blur")], "avg")],
+      evaluation: null,
+      learned: null,
+      learnedShape: null,
+      scoring: false,
+      learning: false,
+      phase: "designing",
+      failure: null,
+    });
+  });
+
+  it("throw by name on anything the steppers could not have asked for", () => {
+    const api = createCodeApi();
+    expect(() => api.applyPreset(0, 0, "Sobel")).toThrow(/Unknown preset "Sobel"/);
+    expect(() => api.addKernel(0, "Sobel")).toThrow(/Unknown preset "Sobel"/);
+    expect(() => api.applyPreset(3, 0, "Blur")).toThrow(/no layer 3/);
+    expect(() => api.applyPreset(0, 5, "Blur")).toThrow(/no filter 5/);
+    expect(() => api.setWeights(0, 0, [1, 1, 1, 1, Number.NaN, 1, 1, 1, 1])).toThrow(
+      /must be numbers/,
+    );
+    expect(() => api.removeKernel(0, 0)).toThrow(/at least one filter/);
+    expect(() => api.removeLayer(0)).toThrow(/at least one layer/);
+    expect(() => api.maps(Number.NaN)).toThrow(/image index/);
+    // Nothing reached the store.
+    expect(useKitchenStore.getState().layers[0]!.kernels[0]!.label).toBe("Blur");
+    expect(useKitchenStore.getState().layers).toHaveLength(1);
+  });
+
+  it("refuse to overfill a layer or the stack, as the buttons do", () => {
+    const api = createCodeApi();
+    for (let count = 1; count < MAX_KERNELS_PER_LAYER; count += 1) {
+      void api.addKernel(0, "Vertical edge");
+    }
+    expect(() => api.addKernel(0, "Vertical edge")).toThrow(/full/);
+    // Four in layer 1, and layer 2 arrives with its default pair: six of six.
+    void api.addLayer();
+    expect(() => api.addLayer()).toThrow(/At most 2 layers/);
+    expect(filtersUsed(useKitchenStore.getState().layers)).toBe(FILTER_BUDGET);
+    expect(() => api.addKernel(1, "Pass through")).toThrow(/filters are spent/);
+  });
+
+  it("refuse to edit while Let it learn has the kitchen", () => {
+    useKitchenStore.setState({ learning: true });
+    expect(() => createCodeApi().applyPreset(0, 0, "Vertical edge")).toThrow(
+      /busy with "Let it learn"/,
+    );
+    useKitchenStore.setState({ learning: false });
+  });
+
+  it("cap a learned shape at the same two layers as everything else", async () => {
+    await expect(
+      createCodeApi().learn([{ kernels: 1 }, { kernels: 1 }, { kernels: 1 }]),
+    ).rejects.toThrow(/At most 2 layers/);
   });
 });

@@ -14,6 +14,7 @@ import {
   type FilterHealth,
   type Kernel,
 } from "./ml";
+import { weightTint } from "./tint";
 
 export interface KernelDesignerProps {
   kernel: Kernel;
@@ -40,7 +41,8 @@ export interface KernelDesignerProps {
  * the whole kernel is reachable by Tab and Enter, and the number is legible rather
  * than implied by a shade. The tint is added on top of the number, never instead of
  * it, and it is a blue-to-orange pair rather than red-to-green so that a
- * red-green colour deficiency does not hide the sign.
+ * red-green colour deficiency does not hide the sign. It is capped so the number,
+ * and the plus and minus glyphs, keep AA contrast on the strongest cell (tint.ts).
  *
  * The weight sum is printed under the grid because it is the single most
  * diagnostic number about a kernel: near zero means a detector, far from zero
@@ -63,14 +65,6 @@ export function KernelDesigner({
   const flat = isBlank(kernel);
   const oneSided = isSingleSigned(kernel) && !flat;
   const groupId = `kernel-${layerIndex}-${kernelIndex}`;
-
-  const tint = (weight: number): string => {
-    if (weight === 0) return "var(--surface-2)";
-    const strength = (Math.abs(weight) / WEIGHT_MAX) * 62 + 14;
-    return weight > 0
-      ? `color-mix(in srgb, var(--class-a) ${strength}%, var(--surface-2))`
-      : `color-mix(in srgb, var(--class-b) ${strength}%, var(--surface-2))`;
-  };
 
   return (
     <div
@@ -138,11 +132,11 @@ export function KernelDesigner({
           <div
             key={cell}
             className="flex flex-col items-center rounded-sm border border-border"
-            style={{ background: tint(weight) }}
+            style={{ background: weightTint(weight) }}
           >
             <button
               type="button"
-              className="flex h-6 w-full items-center justify-center text-text-muted hover:text-text disabled:opacity-40"
+              className="flex h-6 w-full items-center justify-center text-text hover:bg-bg/25 disabled:opacity-40"
               disabled={disabled || weight >= WEIGHT_MAX}
               onClick={() => onWeight(cell, weight + 1)}
               aria-label={`Increase row ${
@@ -157,7 +151,7 @@ export function KernelDesigner({
             </span>
             <button
               type="button"
-              className="flex h-6 w-full items-center justify-center text-text-muted hover:text-text disabled:opacity-40"
+              className="flex h-6 w-full items-center justify-center text-text hover:bg-bg/25 disabled:opacity-40"
               disabled={disabled || weight <= WEIGHT_MIN}
               onClick={() => onWeight(cell, weight - 1)}
               aria-label={`Decrease row ${

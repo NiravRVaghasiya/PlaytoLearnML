@@ -8,8 +8,10 @@ import { clamp } from "@/lib/utils";
 import {
   CLASS_COUNT,
   FILTER_BUDGET,
+  FitCancelledError,
   IMAGE_SIZE,
   KERNEL_CELLS,
+  KERNEL_PRESETS,
   MAX_KERNELS_PER_LAYER,
   MAX_LAYERS,
   WEIGHT_MAX,
@@ -26,6 +28,8 @@ import {
   presetByLabel,
   scoreRawPixels,
   scoreStack,
+  shapeKey,
+  type CancelToken,
   type Dataset,
   type Evaluation,
   type Kernel,
@@ -39,6 +43,18 @@ import { whyCardFor } from "./why-cards";
 
 export const SLUG = "convolution-kitchen";
 export const DATASET_SEED = 4711;
+
+/**
+ * How long an edit waits before the stack is rescored.
+ *
+ * Every stepper click used to start a full fit of the head on the spot, and
+ * `api.setWeights` clicked nine steppers in one call — so one line of code could
+ * put nine fits on the GPU at once, eight of them already out of date. A short
+ * pause lets a burst of edits share one fit. It is short enough that a single
+ * click still feels immediate, and the caption says "refitting" from the moment
+ * of the click, not from the moment the fit starts.
+ */
+export const SCORE_DEBOUNCE_MS = 200;
 
 export type Phase = "designing" | "served";
 
@@ -73,6 +89,12 @@ const emptyScore = (): ScoreResult => ({
  *
  * `inputImage` is `previewIndex` into the validation split: the images are
  * generated, seeded and immutable, so an index is the whole of the state.
+ *
+ * Every edit takes an optional `source` lane. It is the lane the edit CAME from,
+ * which is not the same thing as the tab on screen — scoring lands a second or
+ * two after the edit, and a player can switch tabs in between. The code-lane star
+ * is awarded on where the stack was built, so the code lane's api passes "code"
+ * and every visual control leaves it at the default.
  */
 export interface KitchenState {
   dataset: Dataset;
@@ -90,7 +112,17 @@ export interface KitchenState {
   /** Same head on raw pixels. Fitted once; it never changes. */
   baseline: number | null;
   evaluation: Evaluation | null;
+  /**
+   * The last "Let it learn" result, and the shape it was learned for.
+   *
+   * The result is a property of the SHAPE — kernel counts and pooling — and it
+   * used to be cleared only by removing a layer, so "Let it learn" on one layer
+   * followed by "Add layer 2" reported the one-layer number as "this shape". Read
+   * it through `currentLearned`, which returns null whenever the stack on screen
+   * is not the shape that was learned. Weight and preset edits keep it, correctly.
+   */
   learned: LearnedResult | null;
+  learnedShape: string | null;
 
   scoring: boolean;
   learning: boolean;
@@ -98,25 +130,50 @@ export interface KitchenState {
   failure: NamedFailure | null;
   whyCard: WhyCardContent | null;
   lane: Lane;
+  /** Which lane made the last edit — see the note on `source` above. */
+  editSource: Lane;
 
   setLane: (lane: Lane) => void;
   setPreview: (index: number) => void;
   moveWindow: (row: number, col: number) => void;
   setWindowKernel: (index: number) => void;
 
-  setWeight: (layerIndex: number, kernelIndex: number, cell: number, value: number) => void;
-  applyPreset: (layerIndex: number, kernelIndex: number, preset: string) => void;
-  addKernel: (layerIndex: number, preset?: string) => void;
-  removeKernel: (layerIndex: number, kernelIndex: number) => void;
-  setPool: (layerIndex: number, pool: PoolType) => void;
-  addLayer: () => void;
-  removeLayer: (layerIndex: number) => void;
+  setWeight: (
+    layerIndex: number,
+    kernelIndex: number,
+    cell: number,
+    value: number,
+    source?: Lane,
+  ) => void;
+  /** All nine weights of one kernel, as ONE edit and one rescore. */
+  setWeights: (
+    layerIndex: number,
+    kernelIndex: number,
+    weights: readonly number[],
+    source?: Lane,
+  ) => void;
+  applyPreset: (
+    layerIndex: number,
+    kernelIndex: number,
+    preset: string,
+    source?: Lane,
+  ) => void;
+  addKernel: (layerIndex: number, preset?: string, source?: Lane) => void;
+  removeKernel: (layerIndex: number, kernelIndex: number, source?: Lane) => void;
+  setPool: (layerIndex: number, pool: PoolType, source?: Lane) => void;
+  addLayer: (source?: Lane) => void;
+  removeLayer: (layerIndex: number, source?: Lane) => void;
 
-  /** Fit the fixed head on the current features and judge the kitchen. */
+  /**
+   * Fit the fixed head on the current features and judge the kitchen, now.
+   *
+   * Edits do not call this directly: they schedule it (`SCORE_DEBOUNCE_MS`). A
+   * direct call supersedes anything scheduled or in flight.
+   */
   score_: () => Promise<void>;
   /** Train the same-shaped stack end to end, for comparison. */
   letItLearn: () => Promise<void>;
-  reset: () => void;
+  reset: (source?: Lane) => void;
 }
 
 // ── selectors: primitives and stable references only ─────────────────────
@@ -129,6 +186,11 @@ export const budgetLeft = (state: KitchenState): number =>
   Math.max(0, FILTER_BUDGET - filtersUsed(state.layers));
 export const previewSample = (state: KitchenState): Sample =>
   state.dataset.validation[state.previewIndex]!;
+/** The learned result, if and only if it was learned for the stack on screen. */
+export const currentLearned = (state: KitchenState): LearnedResult | null =>
+  state.learned !== null && state.learnedShape === shapeKey(state.layers)
+    ? state.learned
+    : null;
 
 /**
  * The starting kitchen.
@@ -144,6 +206,34 @@ function startingLayers(): Layer[] {
 
 const dataset = generateDataset(DATASET_SEED);
 
+/** Lanes arrive as click events too (`onClick={reset}`), so read them defensively. */
+const laneOf = (source: unknown): Lane => (source === "code" ? "code" : "visual");
+
+/**
+ * Keep the previous failure object when the verdict has not changed.
+ *
+ * Every edit used to clear the failure and every rescore put it back, so the
+ * shell's alert unmounted and remounted on each stepper click and a screen reader
+ * re-read the same hundred-word paragraph four times for one weight nudged from
+ * -2 to +2. The previous verdict now stays up while the rescore runs (the caption
+ * says "refitting"), and when the new one is word-for-word the same, the same
+ * object is handed back so React does not touch the DOM at all.
+ */
+function sameFailure(
+  previous: NamedFailure | null,
+  next: NamedFailure | null,
+): NamedFailure | null {
+  if (
+    previous !== null &&
+    next !== null &&
+    previous.name === next.name &&
+    previous.detail === next.detail
+  ) {
+    return previous;
+  }
+  return next;
+}
+
 /**
  * Supersedes in-flight scoring runs.
  *
@@ -153,8 +243,240 @@ const dataset = generateDataset(DATASET_SEED);
  * every edit on `scoring`. Instead every run takes a ticket, and a run that
  * finishes holding a stale ticket throws its result away. The player edits freely;
  * only the last request gets to write.
+ *
+ * An edit bumps the ticket the moment it happens, not when its debounced rescore
+ * starts: otherwise a fit for the PREVIOUS stack that finished inside the
+ * debounce window would still hold the current ticket and write its score onto a
+ * stack that no longer exists. It also cancels that fit, so it stops spending the
+ * GPU on an answer nobody will read.
  */
 let scoreTicket = 0;
+let activeScore: CancelToken | null = null;
+let scoreTimer: ReturnType<typeof setTimeout> | null = null;
+/** The newest scoring run, so "Let it learn" can wait for it. Never rejects. */
+let scoreInFlight: Promise<void> = Promise.resolve();
+/** Callers of the code-lane setters waiting for the rescore to land. */
+let settledWaiters: Array<() => void> = [];
+
+function supersedeScoring(): void {
+  scoreTicket += 1;
+  if (activeScore !== null) activeScore.cancelled = true;
+  activeScore = null;
+  if (scoreTimer !== null) {
+    clearTimeout(scoreTimer);
+    scoreTimer = null;
+  }
+}
+
+function releaseSettledWaiters(): void {
+  const waiting = settledWaiters;
+  settledWaiters = [];
+  for (const resolve of waiting) resolve();
+}
+
+/**
+ * Invalidates in-flight "Let it learn" runs.
+ *
+ * The shell's Retry used to reset the kitchen while an end-to-end training run
+ * was still going, and when that run finished it wrote its learned result, its
+ * why-card and a re-judged verdict onto the fresh opening kitchen. A reset now
+ * bumps the generation and cancels the fit; the old run checks the generation
+ * when it resolves and writes nothing.
+ */
+let learnGeneration = 0;
+let activeLearn: CancelToken | null = null;
+
+/**
+ * The raw-pixel baseline, fitted once per page and shared.
+ *
+ * It is a property of the seeded dataset, not of any stack, so every caller gets
+ * the same promise — the first score no longer waits on it, and a second caller
+ * (React Strict Mode mounts twice in development) no longer fits it again. It is
+ * still MEASURED, never a constant: CLAUDE.md does not allow a hardcoded metric.
+ */
+let baselinePromise: Promise<number> | null = null;
+
+function ensureBaseline(data: Dataset): Promise<number> {
+  if (baselinePromise === null) {
+    baselinePromise = scoreRawPixels(data).catch((error: unknown) => {
+      // Let a later score try again rather than caching the failure.
+      baselinePromise = null;
+      throw error;
+    });
+  }
+  return baselinePromise;
+}
+
+/**
+ * The store, for the helpers below. They live at module level beside the tickets
+ * and tokens they manage, and only ever run after the store exists.
+ */
+const kitchen = () => useKitchenStore.getState();
+const setKitchen = (partial: Partial<KitchenState>) =>
+  useKitchenStore.setState(partial);
+
+/**
+ * Every edit ends here: supersede the old answer at once, say so at once, and
+ * fit the new stack once the burst of edits is over.
+ */
+function scheduleScore(): void {
+  supersedeScoring();
+  scoreTimer = setTimeout(() => {
+    scoreTimer = null;
+    void kitchen().score_();
+  }, SCORE_DEBOUNCE_MS);
+}
+
+/**
+ * The body of `score_`. Resolves true when it published a result for the stack
+ * still on screen. Catches everything, so `scoreInFlight` never rejects.
+ */
+async function runScore(): Promise<boolean> {
+  supersedeScoring();
+  const ticket = scoreTicket;
+  const cancel: CancelToken = { cancelled: false };
+  activeScore = cancel;
+  const state = kitchen();
+  const layers = state.layers;
+  const source = state.editSource;
+  setKitchen({ scoring: true });
+
+  try {
+    const score = await scoreStack(state.dataset, layers, cancel);
+    // A newer edit has already asked for a different answer. Drop this one
+    // rather than writing a score that belongs to a stack no longer on screen.
+    if (ticket !== scoreTicket) return false;
+
+    const { health, duplicates } = inspectFilters(state.dataset, layers);
+    const current = kitchen();
+    const evaluation = evaluateKitchen({
+      layers,
+      score,
+      health,
+      duplicates,
+      learned: current.learnedShape === shapeKey(layers) ? current.learned : null,
+    });
+
+    const served = evaluation.outcome === "served";
+
+    /**
+     * Keep the edit's own explanation unless the verdict actually changed.
+     *
+     * Scoring lands a second or two after every stepper click, and the first
+     * version of this store let it stamp the verdict card over the top each
+     * time — which meant the copy explaining what a zero-sum kernel does was
+     * never on screen long enough to read, and the same three sentences about
+     * the same unchanged verdict reappeared on every click. So the why-card
+     * only yields to the score when the score has news: a different outcome, or
+     * the first one. The per-kernel detail stays put while a player is fiddling
+     * inside one verdict, which is exactly when they want it.
+     */
+    const previous = current.evaluation?.outcome;
+    const isNews = previous === undefined || previous !== evaluation.outcome;
+    setKitchen({
+      score,
+      evaluation,
+      scoring: false,
+      phase: served ? "served" : "designing",
+      failure: sameFailure(current.failure, evaluation.failure),
+      whyCard: isNews
+        ? whyCardFor({
+            kind: "scored",
+            evaluation,
+            layers,
+            baseline: current.baseline,
+          })
+        : current.whyCard,
+    });
+    activeScore = null;
+
+    if (served) {
+      useProgression.getState().recordResult({
+        slug: SLUG,
+        score: evaluation.points,
+        lane: source,
+        completed: true,
+        codeLaneCleared: source === "code",
+      });
+    }
+    // Last, so a snippet awaiting a setter sees the result AND the credit.
+    releaseSettledWaiters();
+    return true;
+  } catch (error) {
+    if (ticket !== scoreTicket || error instanceof FitCancelledError) return false;
+    activeScore = null;
+    setKitchen({
+      scoring: false,
+      whyCard: whyCardFor({
+        kind: "error",
+        message: error instanceof Error ? error.message : String(error),
+      }),
+    });
+    releaseSettledWaiters();
+    return false;
+  }
+}
+
+/** The score is already on screen by now; the baseline follows when it is ready. */
+async function fillBaseline(): Promise<void> {
+  if (kitchen().baseline !== null) return;
+  try {
+    const baseline = await ensureBaseline(kitchen().dataset);
+    if (kitchen().baseline === null) setKitchen({ baseline });
+  } catch {
+    // Leaves the tile on "fitting the baseline…"; the next score retries.
+  }
+}
+
+/** Run any rescore that is still waiting out its debounce, and wait for the newest. */
+async function flushScore(): Promise<void> {
+  if (scoreTimer !== null) {
+    clearTimeout(scoreTimer);
+    scoreTimer = null;
+    void kitchen().score_();
+  }
+  await scoreInFlight;
+}
+
+/**
+ * Disown any "Let it learn" still running: a reset, or a new run, makes it an
+ * answer to a question nobody is asking any more. Edits cannot get here — they
+ * are held off while learning, in the store and by name in the api.
+ */
+function invalidateLearn(): void {
+  learnGeneration += 1;
+  if (activeLearn !== null) activeLearn.cancelled = true;
+  activeLearn = null;
+}
+
+/** Swap one kernel for another and rescore: the shared tail of every weight edit. */
+function replaceKernel(
+  layerIndex: number,
+  kernelIndex: number,
+  updated: Kernel,
+  whyCard: WhyCardContent,
+  source: unknown,
+): void {
+  const layers = kitchen().layers.map((candidate, index) =>
+    index !== layerIndex
+      ? candidate
+      : {
+          ...candidate,
+          kernels: candidate.kernels.map((k, i) =>
+            i === kernelIndex ? updated : k,
+          ),
+        },
+  );
+  // `failure` is deliberately left alone — see `sameFailure`.
+  setKitchen({
+    layers,
+    whyCard,
+    phase: "designing",
+    scoring: true,
+    editSource: laneOf(source),
+  });
+  scheduleScore();
+}
 
 export const useKitchenStore = create<KitchenState>((set, get) => ({
   dataset,
@@ -169,6 +491,7 @@ export const useKitchenStore = create<KitchenState>((set, get) => ({
   baseline: null,
   evaluation: null,
   learned: null,
+  learnedShape: null,
 
   scoring: false,
   learning: false,
@@ -176,6 +499,7 @@ export const useKitchenStore = create<KitchenState>((set, get) => ({
   failure: null,
   whyCard: whyCardFor({ kind: "briefing" }),
   lane: "visual" as Lane,
+  editSource: "visual" as Lane,
 
   setLane: (lane) => set({ lane }),
 
@@ -200,15 +524,14 @@ export const useKitchenStore = create<KitchenState>((set, get) => ({
     set({ windowKernel: clamp(Math.round(index), 0, kernels.length - 1) });
   },
 
-  setWeight: (layerIndex, kernelIndex, cell, value) => {
+  setWeight: (layerIndex, kernelIndex, cell, value, source) => {
     const state = get();
     // Edits are NOT blocked while scoring: see scoreTicket. Only an explicit
     // end-to-end training run, which is a deliberate click with its own label,
     // holds them off.
     if (state.learning) return;
-    const layer = state.layers[layerIndex];
-    const kernel = layer?.kernels[kernelIndex];
-    if (!layer || !kernel) return;
+    const kernel = state.layers[layerIndex]?.kernels[kernelIndex];
+    if (!kernel) return;
     if (cell < 0 || cell >= KERNEL_CELLS) return;
 
     const weight = clamp(Math.round(value), WEIGHT_MIN, WEIGHT_MAX);
@@ -219,31 +542,39 @@ export const useKitchenStore = create<KitchenState>((set, get) => ({
     const updated: Kernel = { ...kernel, weights };
     updated.label = describeKernel(updated);
 
-    const layers = state.layers.map((candidate, index) =>
-      index !== layerIndex
-        ? candidate
-        : {
-            ...candidate,
-            kernels: candidate.kernels.map((k, i) =>
-              i === kernelIndex ? updated : k,
-            ),
-          },
+    replaceKernel(
+      layerIndex,
+      kernelIndex,
+      updated,
+      whyCardFor({ kind: "weight-changed", kernel: updated, layerIndex }),
+      source,
     );
-
-    set({
-      layers,
-      whyCard: whyCardFor({
-        kind: "weight-changed",
-        kernel: updated,
-        layerIndex,
-      }),
-      failure: null,
-      phase: "designing",
-    });
-    void get().score_();
   },
 
-  applyPreset: (layerIndex, kernelIndex, preset) => {
+  setWeights: (layerIndex, kernelIndex, values, source) => {
+    const state = get();
+    if (state.learning) return;
+    const kernel = state.layers[layerIndex]?.kernels[kernelIndex];
+    if (!kernel || values.length !== KERNEL_CELLS) return;
+
+    const weights = values.map((value) =>
+      clamp(Math.round(value), WEIGHT_MIN, WEIGHT_MAX),
+    );
+    if (weights.every((weight, cell) => weight === kernel.weights[cell])) return;
+
+    const updated: Kernel = { ...kernel, weights };
+    updated.label = describeKernel(updated);
+
+    replaceKernel(
+      layerIndex,
+      kernelIndex,
+      updated,
+      whyCardFor({ kind: "weight-changed", kernel: updated, layerIndex }),
+      source,
+    );
+  },
+
+  applyPreset: (layerIndex, kernelIndex, preset, source) => {
     const state = get();
     // Edits are NOT blocked while scoring: see scoreTicket. Only an explicit
     // end-to-end training run, which is a deliberate click with its own label,
@@ -251,30 +582,19 @@ export const useKitchenStore = create<KitchenState>((set, get) => ({
     if (state.learning) return;
     const chosen = presetByLabel(preset);
     if (!chosen) return;
+    const kernel = state.layers[layerIndex]?.kernels[kernelIndex];
+    if (!kernel) return;
 
-    const layers = state.layers.map((candidate, index) =>
-      index !== layerIndex
-        ? candidate
-        : {
-            ...candidate,
-            kernels: candidate.kernels.map((kernel, i) =>
-              i === kernelIndex
-                ? { ...kernel, label: chosen.label, weights: [...chosen.weights] }
-                : kernel,
-            ),
-          },
+    replaceKernel(
+      layerIndex,
+      kernelIndex,
+      { ...kernel, label: chosen.label, weights: [...chosen.weights] },
+      whyCardFor({ kind: "preset-applied", preset: chosen, layerIndex }),
+      source,
     );
-
-    set({
-      layers,
-      whyCard: whyCardFor({ kind: "preset-applied", preset: chosen, layerIndex }),
-      failure: null,
-      phase: "designing",
-    });
-    void get().score_();
   },
 
-  addKernel: (layerIndex, preset = "Vertical edge") => {
+  addKernel: (layerIndex, preset = "Vertical edge", source) => {
     const state = get();
     // Edits are NOT blocked while scoring: see scoreTicket. Only an explicit
     // end-to-end training run, which is a deliberate click with its own label,
@@ -292,11 +612,11 @@ export const useKitchenStore = create<KitchenState>((set, get) => ({
         ? candidate
         : { ...candidate, kernels: [...candidate.kernels, makeKernel(preset)] },
     );
-    set({ layers, failure: null, phase: "designing" });
-    void get().score_();
+    set({ layers, phase: "designing", scoring: true, editSource: laneOf(source) });
+    scheduleScore();
   },
 
-  removeKernel: (layerIndex, kernelIndex) => {
+  removeKernel: (layerIndex, kernelIndex, source) => {
     const state = get();
     // Edits are NOT blocked while scoring: see scoreTicket. Only an explicit
     // end-to-end training run, which is a deliberate click with its own label,
@@ -316,13 +636,14 @@ export const useKitchenStore = create<KitchenState>((set, get) => ({
     set({
       layers,
       windowKernel: 0,
-      failure: null,
       phase: "designing",
+      scoring: true,
+      editSource: laneOf(source),
     });
-    void get().score_();
+    scheduleScore();
   },
 
-  setPool: (layerIndex, pool) => {
+  setPool: (layerIndex, pool, source) => {
     const state = get();
     // Edits are NOT blocked while scoring: see scoreTicket. Only an explicit
     // end-to-end training run, which is a deliberate click with its own label,
@@ -344,13 +665,14 @@ export const useKitchenStore = create<KitchenState>((set, get) => ({
         layers,
         previousAccuracy: previous,
       }),
-      failure: null,
       phase: "designing",
+      scoring: true,
+      editSource: laneOf(source),
     });
-    void get().score_();
+    scheduleScore();
   },
 
-  addLayer: () => {
+  addLayer: (source) => {
     const state = get();
     // Edits are NOT blocked while scoring: see scoreTicket. Only an explicit
     // end-to-end training run, which is a deliberate click with its own label,
@@ -374,13 +696,14 @@ export const useKitchenStore = create<KitchenState>((set, get) => ({
     set({
       layers,
       whyCard: whyCardFor({ kind: "layer-added", layers }),
-      failure: null,
       phase: "designing",
+      scoring: true,
+      editSource: laneOf(source),
     });
-    void get().score_();
+    scheduleScore();
   },
 
-  removeLayer: (layerIndex) => {
+  removeLayer: (layerIndex, source) => {
     const state = get();
     // Edits are NOT blocked while scoring: see scoreTicket. Only an explicit
     // end-to-end training run, which is a deliberate click with its own label,
@@ -389,125 +712,81 @@ export const useKitchenStore = create<KitchenState>((set, get) => ({
     if (state.layers.length <= 1) return;
 
     const layers = state.layers.filter((_, index) => index !== layerIndex);
+    // No need to clear `learned`: `currentLearned` compares shapes, and going
+    // back to a shape that WAS learned correctly brings its result back.
     set({
       layers,
       windowKernel: 0,
-      learned: null,
-      failure: null,
       phase: "designing",
+      scoring: true,
+      editSource: laneOf(source),
     });
-    void get().score_();
+    scheduleScore();
   },
 
-  score_: async () => {
-    const state = get();
-    const ticket = ++scoreTicket;
-    set({ scoring: true });
-
-    try {
-      const layers = get().layers;
-      const score = await scoreStack(state.dataset, layers);
-      const { health, duplicates } = inspectFilters(state.dataset, layers);
-      const evaluation = evaluateKitchen({
-        layers,
-        score,
-        health,
-        duplicates,
-        learned: get().learned,
-      });
-
-      // Fitted once, then kept: it is a property of the dataset, not of the run.
-      let baseline = get().baseline;
-      if (baseline === null) {
-        baseline = await scoreRawPixels(state.dataset);
-      }
-
-      // A newer edit has already asked for a different answer. Drop this one
-      // rather than writing a score that belongs to a stack no longer on screen.
-      if (ticket !== scoreTicket) return;
-
-      const served = evaluation.outcome === "served";
-
-      /**
-       * Keep the edit's own explanation unless the verdict actually changed.
-       *
-       * Scoring lands a second or two after every stepper click, and the first
-       * version of this store let it stamp the verdict card over the top each
-       * time — which meant the copy explaining what a zero-sum kernel does was
-       * never on screen long enough to read, and the same three sentences about
-       * the same unchanged verdict reappeared on every click. So the why-card
-       * only yields to the score when the score has news: a different outcome, or
-       * the first one. The per-kernel detail stays put while a player is fiddling
-       * inside one verdict, which is exactly when they want it.
-       */
-      const previous = get().evaluation?.outcome;
-      const isNews = previous === undefined || previous !== evaluation.outcome;
-      set({
-        score,
-        baseline,
-        evaluation,
-        scoring: false,
-        phase: served ? "served" : "designing",
-        failure: evaluation.failure,
-        whyCard: isNews
-          ? whyCardFor({ kind: "scored", evaluation, layers, baseline })
-          : get().whyCard,
-      });
-
-      if (served) {
-        useProgression.getState().recordResult({
-          slug: SLUG,
-          score: evaluation.points,
-          lane: get().lane,
-          completed: true,
-          codeLaneCleared: get().lane === "code",
-        });
-      }
-    } catch (error) {
-      if (ticket !== scoreTicket) return;
-      set({
-        scoring: false,
-        whyCard: whyCardFor({
-          kind: "error",
-          message: error instanceof Error ? error.message : String(error),
-        }),
-      });
-    }
+  score_: () => {
+    const run = runScore();
+    // "Let it learn" waits on the score, not on the baseline behind it.
+    scoreInFlight = run.then(() => undefined);
+    return run.then((published) => (published ? fillBaseline() : undefined));
   },
 
   letItLearn: async () => {
     const state = get();
-    if (state.learning || state.scoring) return;
+    if (state.learning) return;
     if (filtersUsed(state.layers) === 0) return;
+
+    invalidateLearn();
+    const generation = learnGeneration;
+    const cancel: CancelToken = { cancelled: false };
+    activeLearn = cancel;
+    // Edits hold off from here, so the stack cannot change under the run.
     set({ learning: true });
 
     try {
+      // A rescore can still be waiting out its debounce from the click just
+      // before this one. It used to make this button silently do nothing; now
+      // the rescore runs first, so the comparison below is against the score of
+      // the stack actually being learned rather than the one before it.
+      await flushScore();
+      if (generation !== learnGeneration) return;
+
       const layers = get().layers;
-      const learned = await learnStack(state.dataset, layers);
+      const learned = await learnStack(state.dataset, layers, cancel);
+      if (generation !== learnGeneration) return;
+
+      const current = get();
       const evaluation =
-        get().evaluation === null
+        current.evaluation === null
           ? null
           : evaluateKitchen({
               layers,
-              score: get().score,
-              health: get().evaluation!.health,
-              duplicates: get().evaluation!.duplicates,
+              score: current.score,
+              health: current.evaluation.health,
+              duplicates: current.evaluation.duplicates,
               learned,
             });
 
       set({
         learned,
+        learnedShape: shapeKey(layers),
         learning: false,
-        evaluation: evaluation ?? get().evaluation,
-        failure: evaluation?.failure ?? get().failure,
+        evaluation: evaluation ?? current.evaluation,
+        failure: sameFailure(
+          current.failure,
+          evaluation?.failure ?? current.failure,
+        ),
         whyCard: whyCardFor({
           kind: "learned",
           learned,
           layers,
-          mine: get().score.accuracy,
+          mine: current.score.accuracy,
         }),
       });
     } catch (error) {
+      if (generation !== learnGeneration || error instanceof FitCancelledError) {
+        return;
+      }
       set({
         learning: false,
         whyCard: whyCardFor({
@@ -515,10 +794,15 @@ export const useKitchenStore = create<KitchenState>((set, get) => ({
           message: error instanceof Error ? error.message : String(error),
         }),
       });
+    } finally {
+      if (activeLearn === cancel) activeLearn = null;
     }
   },
 
-  reset: () => {
+  reset: (source) => {
+    // Stop and disown any "Let it learn" still running, so its result cannot
+    // land on the fresh kitchen (the shell's Retry is live during training).
+    invalidateLearn();
     set({
       layers: startingLayers(),
       previewIndex: 0,
@@ -528,11 +812,13 @@ export const useKitchenStore = create<KitchenState>((set, get) => ({
       score: emptyScore(),
       evaluation: null,
       learned: null,
-      scoring: false,
+      learnedShape: null,
+      scoring: true,
       learning: false,
       phase: "designing",
       failure: null,
       whyCard: whyCardFor({ kind: "briefing" }),
+      editSource: laneOf(source),
     });
     void get().score_();
   },
@@ -543,16 +829,27 @@ export const useKitchenStore = create<KitchenState>((set, get) => ({
  *
  * Every verb writes the same store the sliders and steppers write, so a snippet
  * and a stepper click are the same operation (CLAUDE.md two-lane rule).
+ *
+ * The setters check their arguments and throw a named error for anything the
+ * steppers could not have produced — an unknown preset, a layer or slot that
+ * does not exist, a full layer, a spent budget. The store itself quietly ignores
+ * those (a button cannot ask for slot 7), and in a snippet a quiet no-op is a
+ * typo that reports success: `addKernel(0, "Sobel")` used to add a Blank filter
+ * and then diagnose it as dead.
+ *
+ * They also return a promise that resolves when the kitchen has been rescored,
+ * so `await api.addLayer(); log(api.score().accuracy)` reads the new score rather
+ * than the one from before the edit. Ignoring the promise is fine too.
  */
 export interface KitchenCodeApi {
-  setWeights: (layerIndex: number, kernelIndex: number, weights: number[]) => void;
-  applyPreset: (layerIndex: number, kernelIndex: number, preset: string) => void;
-  addKernel: (layerIndex: number, preset?: string) => void;
-  removeKernel: (layerIndex: number, kernelIndex: number) => void;
-  setPool: (layerIndex: number, pool: string) => void;
-  addLayer: () => void;
-  removeLayer: (layerIndex: number) => void;
-  reset: () => void;
+  setWeights: (layerIndex: number, kernelIndex: number, weights: number[]) => Promise<void>;
+  applyPreset: (layerIndex: number, kernelIndex: number, preset: string) => Promise<void>;
+  addKernel: (layerIndex: number, preset?: string) => Promise<void>;
+  removeKernel: (layerIndex: number, kernelIndex: number) => Promise<void>;
+  setPool: (layerIndex: number, pool: string) => Promise<void>;
+  addLayer: () => Promise<void>;
+  removeLayer: (layerIndex: number) => Promise<void>;
+  reset: () => Promise<void>;
 
   layers: () => Array<{
     pool: PoolType;
@@ -594,22 +891,34 @@ function asPool(value: string | undefined, fallback: PoolType = "avg"): PoolType
   return match;
 }
 
-function kernelFrom(entry: number[] | string): Kernel {
-  if (typeof entry === "string") {
-    const preset = presetByLabel(entry);
-    if (!preset) {
-      throw new Error(`Unknown preset "${entry}".`);
-    }
-    return makeKernel(preset);
+function presetNamed(label: unknown) {
+  const preset = typeof label === "string" ? presetByLabel(label) : undefined;
+  if (!preset) {
+    throw new Error(
+      `Unknown preset "${String(label)}". Try one of: ${KERNEL_PRESETS.map(
+        (candidate) => candidate.label,
+      ).join(", ")}.`,
+    );
   }
+  return preset;
+}
+
+function checkedWeights(entry: unknown, what: string): number[] {
   if (!Array.isArray(entry) || entry.length !== KERNEL_CELLS) {
-    throw new Error(`A kernel needs exactly ${KERNEL_CELLS} weights.`);
+    throw new Error(`${what} needs exactly ${KERNEL_CELLS} weights.`);
   }
-  const kernel = makeKernel("Blank");
-  kernel.weights = entry.map((weight) => {
-    if (!Number.isFinite(weight)) throw new Error("Weights must be numbers.");
+  return entry.map((weight: unknown) => {
+    if (typeof weight !== "number" || !Number.isFinite(weight)) {
+      throw new Error("Weights must be numbers.");
+    }
     return clamp(Math.round(weight), WEIGHT_MIN, WEIGHT_MAX);
   });
+}
+
+function kernelFrom(entry: number[] | string): Kernel {
+  if (typeof entry === "string") return makeKernel(presetNamed(entry));
+  const kernel = makeKernel("Blank");
+  kernel.weights = checkedWeights(entry, "A kernel");
   kernel.label = describeKernel(kernel);
   return kernel;
 }
@@ -624,26 +933,123 @@ export function createCodeApi(): KitchenCodeApi {
       .reduce((total, layer) => total * layer.kernels.length, 1),
   });
 
+  /** Resolves once no rescore is waiting or running. Never rejects. */
+  const settled = (): Promise<void> => {
+    if (!store.getState().scoring && scoreTimer === null) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      settledWaiters.push(resolve);
+    });
+  };
+
+  const editable = () => {
+    const state = store.getState();
+    if (state.learning) {
+      throw new Error(
+        'The kitchen is busy with "Let it learn". Wait for it to finish before changing the stack.',
+      );
+    }
+    return state;
+  };
+
+  const layerAt = (layerIndex: unknown) => {
+    const { layers } = editable();
+    if (
+      typeof layerIndex !== "number" ||
+      !Number.isInteger(layerIndex) ||
+      layerIndex < 0 ||
+      layerIndex >= layers.length
+    ) {
+      throw new Error(
+        `There is no layer ${String(layerIndex)}. The kitchen has ${layers.length} layer${
+          layers.length === 1 ? "" : "s"
+        }, numbered from 0.`,
+      );
+    }
+    return layers[layerIndex]!;
+  };
+
+  const slotAt = (layerIndex: unknown, kernelIndex: unknown) => {
+    const layer = layerAt(layerIndex);
+    if (
+      typeof kernelIndex !== "number" ||
+      !Number.isInteger(kernelIndex) ||
+      kernelIndex < 0 ||
+      kernelIndex >= layer.kernels.length
+    ) {
+      throw new Error(
+        `Layer ${String(layerIndex)} has no filter ${String(kernelIndex)}. It has ${
+          layer.kernels.length
+        }, numbered from 0.`,
+      );
+    }
+  };
+
+  const roomForAFilter = () => {
+    if (filtersUsed(store.getState().layers) >= FILTER_BUDGET) {
+      throw new Error(`All ${FILTER_BUDGET} filters are spent. Remove one first.`);
+    }
+  };
+
   return {
     setWeights: (layerIndex, kernelIndex, weights) => {
-      if (!Array.isArray(weights) || weights.length !== KERNEL_CELLS) {
-        throw new Error(`setWeights needs exactly ${KERNEL_CELLS} numbers.`);
-      }
-      weights.forEach((weight, cell) => {
-        store.getState().setWeight(layerIndex, kernelIndex, cell, weight);
-      });
+      slotAt(layerIndex, kernelIndex);
+      const values = checkedWeights(weights, "setWeights");
+      // One kernel swap and one rescore, not nine stepper clicks and nine fits.
+      store.getState().setWeights(layerIndex, kernelIndex, values, "code");
+      return settled();
     },
-    applyPreset: (layerIndex, kernelIndex, preset) =>
-      store.getState().applyPreset(layerIndex, kernelIndex, preset),
-    addKernel: (layerIndex, preset) =>
-      store.getState().addKernel(layerIndex, preset),
-    removeKernel: (layerIndex, kernelIndex) =>
-      store.getState().removeKernel(layerIndex, kernelIndex),
-    setPool: (layerIndex, pool) =>
-      store.getState().setPool(layerIndex, asPool(pool)),
-    addLayer: () => store.getState().addLayer(),
-    removeLayer: (layerIndex) => store.getState().removeLayer(layerIndex),
-    reset: () => store.getState().reset(),
+    applyPreset: (layerIndex, kernelIndex, preset) => {
+      slotAt(layerIndex, kernelIndex);
+      const chosen = presetNamed(preset);
+      store.getState().applyPreset(layerIndex, kernelIndex, chosen.label, "code");
+      return settled();
+    },
+    addKernel: (layerIndex, preset) => {
+      const layer = layerAt(layerIndex);
+      const chosen = preset === undefined ? undefined : presetNamed(preset);
+      if (layer.kernels.length >= MAX_KERNELS_PER_LAYER) {
+        throw new Error(`Layer ${layerIndex} is full: ${MAX_KERNELS_PER_LAYER} filters at most.`);
+      }
+      roomForAFilter();
+      store.getState().addKernel(layerIndex, chosen?.label, "code");
+      return settled();
+    },
+    removeKernel: (layerIndex, kernelIndex) => {
+      slotAt(layerIndex, kernelIndex);
+      if (layerAt(layerIndex).kernels.length <= 1) {
+        throw new Error(
+          `Layer ${layerIndex} needs at least one filter. Remove the layer instead.`,
+        );
+      }
+      store.getState().removeKernel(layerIndex, kernelIndex, "code");
+      return settled();
+    },
+    setPool: (layerIndex, pool) => {
+      layerAt(layerIndex);
+      store.getState().setPool(layerIndex, asPool(pool), "code");
+      return settled();
+    },
+    addLayer: () => {
+      const { layers } = editable();
+      if (layers.length >= MAX_LAYERS) {
+        throw new Error(`At most ${MAX_LAYERS} layers.`);
+      }
+      roomForAFilter();
+      store.getState().addLayer("code");
+      return settled();
+    },
+    removeLayer: (layerIndex) => {
+      layerAt(layerIndex);
+      if (store.getState().layers.length <= 1) {
+        throw new Error("The kitchen needs at least one layer.");
+      }
+      store.getState().removeLayer(layerIndex, "code");
+      return settled();
+    },
+    reset: () => {
+      store.getState().reset("code");
+      return settled();
+    },
 
     layers: () =>
       store.getState().layers.map((layer) => ({
@@ -665,7 +1071,7 @@ export function createCodeApi(): KitchenCodeApi {
         throw new Error(`At most ${MAX_LAYERS} layers.`);
       }
       const layers = spec.map((entry) => {
-        if (!Array.isArray(entry.kernels) || entry.kernels.length === 0) {
+        if (!Array.isArray(entry?.kernels) || entry.kernels.length === 0) {
           throw new Error("Every layer needs at least one kernel.");
         }
         if (entry.kernels.length > MAX_KERNELS_PER_LAYER) {
@@ -681,8 +1087,11 @@ export function createCodeApi(): KitchenCodeApi {
       if (!Array.isArray(spec) || spec.length === 0) {
         throw new Error("learn needs at least one layer.");
       }
+      if (spec.length > MAX_LAYERS) {
+        throw new Error(`At most ${MAX_LAYERS} layers.`);
+      }
       const layers = spec.map((entry) => {
-        const count = Math.round(entry.kernels);
+        const count = typeof entry?.kernels === "number" ? Math.round(entry.kernels) : Number.NaN;
         if (!Number.isFinite(count) || count < 1 || count > MAX_KERNELS_PER_LAYER) {
           throw new Error(
             `Kernel count must be between 1 and ${MAX_KERNELS_PER_LAYER}.`,
@@ -700,6 +1109,9 @@ export function createCodeApi(): KitchenCodeApi {
       inspectFilters(store.getState().dataset, store.getState().layers),
 
     maps: (imageIndex = 0) => {
+      if (typeof imageIndex !== "number" || !Number.isFinite(imageIndex)) {
+        throw new Error("maps takes an image index, e.g. api.maps(0).");
+      }
       const state = store.getState();
       const sample =
         state.dataset.validation[

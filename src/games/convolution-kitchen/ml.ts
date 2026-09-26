@@ -396,6 +396,18 @@ export const outputChannels = (layers: readonly Layer[]): number =>
     .filter((layer) => layer.kernels.length > 0)
     .reduce((total, layer) => total * layer.kernels.length, 1);
 
+/**
+ * What "Let it learn" depends on: how many kernels each layer holds and how it
+ * pools. Not the weights — those are exactly what gradient descent replaces — so
+ * a learned result stays valid through weight and preset edits and goes stale the
+ * moment a filter, a layer or a pooling choice changes.
+ */
+export const shapeKey = (layers: readonly Layer[]): string =>
+  layers
+    .filter((layer) => layer.kernels.length > 0)
+    .map((layer) => `${layer.kernels.length}:${layer.pool}`)
+    .join("|");
+
 /** Human-readable channel names, in the order TF emits them. */
 export function channelLabels(layers: readonly Layer[]): string[] {
   if (layers.length === 0) return [];
@@ -676,6 +688,54 @@ export function convolveOne(
   return { patch, products, sum, activated: Math.max(0, sum) };
 }
 
+// ── Cancelling a fit ──────────────────────────────────────────────────────
+
+/**
+ * A cooperative stop flag for a training run.
+ *
+ * Every edit rescores the stack and a Retry throws the whole kitchen away, and in
+ * both cases the fit already running is now answering a question nobody is
+ * asking. A superseded result was always discarded; the flag stops it spending
+ * the GPU first, so the fit that matters is not queued behind the ones that do
+ * not. It is read at the start of every batch, which costs nothing — unlike an
+ * `onBatchEnd` hook, it never forces the batch's loss off the GPU to be read.
+ */
+export interface CancelToken {
+  cancelled: boolean;
+}
+
+/** Thrown by a fit that was cancelled. Callers treat it as "no result", not as an error. */
+export class FitCancelledError extends Error {
+  constructor() {
+    super("The fit was superseded before it finished.");
+    this.name = "FitCancelledError";
+  }
+}
+
+function stopWhenCancelled(model: tf.LayersModel, cancel: CancelToken | undefined) {
+  return cancel === undefined
+    ? undefined
+    : {
+        onBatchBegin: () => {
+          if (cancel.cancelled) model.stopTraining = true;
+        },
+      };
+}
+
+/**
+ * Free a model AND the optimizer it was compiled with.
+ *
+ * `model.dispose()` only frees an optimizer the model created itself. Every model
+ * here is compiled with `tf.train.adam(rate)`, an instance passed in, so the
+ * model does not own it and its moment tensors used to outlive every fit — six
+ * per score, eight per learn, one WebGL texture each, for every stepper click.
+ */
+function disposeModel(model: tf.LayersModel): void {
+  const optimizer = model.optimizer;
+  model.dispose();
+  optimizer?.dispose();
+}
+
 // ── The fixed classifier ──────────────────────────────────────────────────
 
 export const HEAD_SEED = 1337;
@@ -751,6 +811,7 @@ function accuracyFrom(
 export async function scoreStack(
   dataset: Dataset,
   layers: readonly Layer[],
+  cancel?: CancelToken,
 ): Promise<ScoreResult> {
   const width = outputChannels(layers);
   if (filtersUsed(layers) === 0 || width === 0) {
@@ -765,6 +826,7 @@ export async function scoreStack(
   }
 
   const trainFeatures = extractFeatures(dataset.train, layers);
+  if (cancel?.cancelled) throw new FitCancelledError();
   const validationFeatures = extractFeatures(dataset.validation, layers);
 
   const model = buildHead(width);
@@ -777,7 +839,9 @@ export async function scoreStack(
       batchSize: 64,
       shuffle: false,
       verbose: 0,
+      callbacks: stopWhenCancelled(model, cancel),
     });
+    if (cancel?.cancelled) throw new FitCancelledError();
 
     const predict = (features: number[][], samples: readonly Sample[]) =>
       tf.tidy(() => {
@@ -798,7 +862,7 @@ export async function scoreStack(
   } finally {
     xs.dispose();
     ys.dispose();
-    model.dispose();
+    disposeModel(model);
   }
 }
 
@@ -835,7 +899,7 @@ export async function scoreRawPixels(dataset: Dataset): Promise<number> {
   } finally {
     xs.dispose();
     ys.dispose();
-    model.dispose();
+    disposeModel(model);
   }
 }
 
@@ -876,6 +940,7 @@ export interface LearnedResult {
 export async function learnStack(
   dataset: Dataset,
   layers: readonly Layer[],
+  cancel?: CancelToken,
 ): Promise<LearnedResult> {
   const shapes = layers
     .filter((layer) => layer.kernels.length > 0)
@@ -943,7 +1008,9 @@ export async function learnStack(
       batchSize: 32,
       shuffle: false,
       verbose: 0,
+      callbacks: stopWhenCancelled(model, cancel),
     });
+    if (cancel?.cancelled) throw new FitCancelledError();
 
     const accuracy = tf.tidy(() => {
       const input = toBatch(dataset.validation);
@@ -980,7 +1047,7 @@ export async function learnStack(
   } finally {
     xs.dispose();
     ys.dispose();
-    model.dispose();
+    disposeModel(model);
   }
 }
 
@@ -1035,6 +1102,36 @@ export const ARRANGEMENT_CLASSES: readonly ClassId[] = [2, 3] as const;
  * measured above this bound, and the target is 90%.
  */
 export const ONE_LAYER_CEILING = 0.85;
+
+/**
+ * How far past guessing a score has to be before the copy may say something in
+ * the stack is being detected.
+ *
+ * The validation split is VALIDATION_SIZE (400) plates, so a stack at chance
+ * wobbles by about two points; ten is five times that. The gap it separates is
+ * not a close call either: measured, a blurred layer 1 under only averaging
+ * filters scores 23-25%, and under a sign-changing layer-2 filter 49-51%.
+ */
+export const CHANCE_MARGIN = 0.1;
+export const clearlyAboveChance = (accuracy: number): boolean =>
+  accuracy >= CHANCE_RATE + CHANCE_MARGIN;
+
+/**
+ * The filters above layer 1 that have a sign change, once per label: the ones
+ * that can detect something in whatever layer 1 hands them. A pass-through or a
+ * blur up there only passes that on.
+ */
+export function detectorsAboveLayerOne(layers: readonly Layer[]): string[] {
+  return [
+    ...new Set(
+      layers
+        .slice(1)
+        .flatMap((layer) => layer.kernels)
+        .filter((kernel) => !isSingleSigned(kernel))
+        .map((kernel) => kernel.label),
+    ),
+  ];
+}
 
 export interface FilterHealth {
   layerIndex: number;
@@ -1195,14 +1292,48 @@ export type Outcome =
 export interface Evaluation {
   outcome: Outcome;
   score: ScoreResult;
-  /** Detection score the same architecture reaches with LEARNED kernels. */
+  /** Detection score the same shape reaches with LEARNED kernels. */
   learned: LearnedResult | null;
   health: FilterHealth[];
   duplicates: DuplicatePair[];
   filters: number;
-  stars: number;
+  /**
+   * The normalised score progression sees. Stars are NOT computed here: the
+   * engine owns that rule (★2 = points ≥ HIGH_SCORE_THRESHOLD, ★3 = that plus a
+   * code-lane clear), and a second rubric in the game is how the tooltip and the
+   * awarded stars came to disagree.
+   */
   points: number;
   failure: NamedFailure | null;
+}
+
+/**
+ * What a served stack scores (spec: "the fewest / cleanest filters").
+ *
+ * Full marks for the leanest stack that can serve — one edge detector under a
+ * pass-through and an asymmetric filter, which the tests prove passes — and a
+ * fixed deduction for every filter past it and for every duplicated pair, which
+ * is a filter paid for twice. The old blend (0.55 + thrift + cleanliness) cleared
+ * the second-star threshold on every ordinary win, six filters included, so the
+ * star that says "thrift" measured nothing. With these deductions the threshold
+ * lands exactly on "four filters or fewer, none duplicated" (`THRIFTY_FILTERS`),
+ * a pass never drops below `SERVED_FLOOR`, and no combination sits near the
+ * threshold for floating point to round across.
+ */
+export const LEAN_FILTERS = 3;
+export const THRIFTY_FILTERS = LEAN_FILTERS + 1;
+export const FILTER_PENALTY = 0.12;
+export const DUPLICATE_PENALTY = 0.25;
+/** Above every failing score, which are capped at 0.5. */
+export const SERVED_FLOOR = 0.55;
+
+export function servedPoints(filters: number, duplicates: number): number {
+  const extra = Math.max(0, filters - LEAN_FILTERS);
+  return clamp(
+    1 - FILTER_PENALTY * extra - DUPLICATE_PENALTY * duplicates,
+    SERVED_FLOOR,
+    1,
+  );
 }
 
 const percent = (value: number) => `${Math.round(value * 100)}%`;
@@ -1246,7 +1377,6 @@ export function evaluateKitchen({
     return {
       ...base,
       outcome: "empty",
-      stars: 0,
       points: 0,
       failure: null,
     };
@@ -1256,20 +1386,18 @@ export function evaluateKitchen({
   const blurs = health.filter((filter) => filter.blur);
   const live = health.length - dead.length;
 
-  // Points reward the spec's "fewest / cleanest": accuracy first, then thrift.
-  const thrift = clamp(1 - (filters - 2) / (FILTER_BUDGET * 2), 0, 1);
-  const cleanliness = clamp(1 - duplicates.length * 0.25 - dead.length * 0.25, 0, 1);
+  // Points reward the spec's "fewest / cleanest": a pass first, then thrift. A
+  // failing stack scores in proportion to how close it got, below every pass.
   const points =
     score.accuracy >= TARGET_ACCURACY
-      ? clamp(0.55 + 0.25 * thrift + 0.2 * cleanliness, 0, 1)
-      : clamp((score.accuracy / TARGET_ACCURACY) * 0.5, 0, 1);
+      ? servedPoints(filters, duplicates.length)
+      : clamp((score.accuracy / TARGET_ACCURACY) * 0.5, 0, 0.5);
 
   if (dead.length > 0) {
     const worst = dead[0]!;
     return {
       ...base,
       outcome: "dead-filters",
-      stars: 0,
       points: Math.min(points, 0.45),
       failure: {
         name: "Dead filters",
@@ -1294,24 +1422,57 @@ export function evaluateKitchen({
     };
   }
 
+  /**
+   * The blur verdict is about LAYER 1, and it stays the verdict with a second
+   * layer on top — layer 1 is still the thing to fix. What changes is the claim
+   * the copy may make, and it turns on whether anything above layer 1 has a sign
+   * change. If nothing does — one layer, or a pass-through and a blur on top —
+   * "every filter you have is an average" is literally true and the score sits at
+   * chance. With a layer-2 edge detector it is false: that filter DOES detect
+   * something, measured at about half the plates. What it detects it in is a
+   * smoothed photograph, and smoothing then detecting is, near enough, one filter
+   * — exactly so when layer 1 pools by averaging, since a non-negative kernel
+   * passes the ReLU unchanged — so the stack has a second layer and none of what
+   * a second layer is for.
+   */
   const layerOne = health.filter((filter) => filter.layerIndex === 0);
+  const deep = health.some((filter) => filter.layerIndex > 0);
+  const detectorsAbove = detectorsAboveLayerOne(layers);
   if (blurs.length > 0 && blurs.length === layerOne.length) {
     const first = blurs[0]!;
+    const one = detectorsAbove.length === 1;
+    // "Agrees" only if the score really is at chance; the copy does not get to
+    // assume it.
+    const verdictOnScore = `The detection score ${
+      clearlyAboveChance(score.accuracy) ? "is" : "agrees:"
+    } ${percent(score.accuracy)} against ${percent(CHANCE_RATE)} for guessing.`;
+    const detail =
+      detectorsAbove.length === 0
+        ? `Every filter you have${
+            deep ? ", in both layers," : ""
+          } has weights of a single sign, which means every one of them computes a weighted AVERAGE ${
+            deep
+              ? `and nothing else: layer 1 averages nine pixels, and layer 2 only averages those averages again. "${first.label}" in layer 1 is one of them.`
+              : `of nine pixels and nothing else. "${first.label}" is one of them.`
+          } An average measures brightness — and every dish in this kitchen was plated with randomised brightness and contrast on purpose, so that number carries no information about which dish it is. ${verdictOnScore} A detector has to measure a DIFFERENCE, which means at least one positive weight and at least one negative weight. Change a sign${
+            deep ? " in layer 1" : ""
+          } and watch the feature map stop looking like the photograph.`
+        : `Every filter in layer 1 has weights of a single sign, which means each one computes a weighted AVERAGE of nine pixels and nothing else. "${
+            first.label
+          }" is one of them. On its own an average measures brightness, which every plate here randomises — and above it, it means layer 2 is not reading a map of detected patterns at all, only a softened copy of the photograph. Whatever ${detectorsAbove
+            .map((label) => `"${label}"`)
+            .join(" and ")} ${one ? "finds" : "find"} in that copy, ${
+            one ? "it" : "they"
+          } could have found in the photograph directly: smoothing and then detecting is, near enough, just detecting. So your second layer is doing a first layer's job, and the stack gets none of what depth is for — ${percent(
+            score.accuracy,
+          )} against the ${percent(
+            TARGET_ACCURACY,
+          )} needed. Layer 1 has to measure a DIFFERENCE, which means at least one positive weight and at least one negative weight. Change a sign there and layer 2 finally has something to arrange.`;
     return {
       ...base,
       outcome: "blur-only",
-      stars: 0,
       points: Math.min(points, 0.45),
-      failure: {
-        name: "You built a blur",
-        detail: `Every filter you have has weights of a single sign, which means every one of them computes a weighted AVERAGE of nine pixels and nothing else. "${
-          first.label
-        }" is one of them. An average measures brightness — and every dish in this kitchen was plated with randomised brightness and contrast on purpose, so that number carries no information about which dish it is. The detection score agrees: ${percent(
-          score.accuracy,
-        )} against ${percent(
-          CHANCE_RATE,
-        )} for guessing. A detector has to measure a DIFFERENCE, which means at least one positive weight and at least one negative weight. Change a sign and watch the feature map stop looking like the photograph.`,
-      },
+      failure: { name: "You built a blur", detail },
     };
   }
 
@@ -1320,7 +1481,6 @@ export function evaluateKitchen({
     return {
       ...base,
       outcome: "duplicate-filters",
-      stars: 0,
       points: Math.min(points, 0.5),
       failure: {
         name: "Duplicate filters",
@@ -1336,11 +1496,9 @@ export function evaluateKitchen({
   }
 
   if (score.accuracy >= TARGET_ACCURACY) {
-    const stars = 1 + (points >= 0.75 ? 1 : 0) + (duplicates.length === 0 && dead.length === 0 && filters <= 4 ? 1 : 0);
     return {
       ...base,
       outcome: "served",
-      stars: Math.min(stars, 3),
       points,
       failure: null,
     };
@@ -1389,7 +1547,6 @@ export function evaluateKitchen({
     return {
       ...base,
       outcome: "one-layer-ceiling",
-      stars: 0,
       points,
       failure: {
         name: "One layer is not enough",
@@ -1407,7 +1564,7 @@ export function evaluateKitchen({
           score.perClass[3] ?? 0,
         )} — and the mistakes land on each OTHER: ${Math.round(
           crossed,
-        )} of the ${arrangementTotal} plates of those two came back wearing the sibling's name. There is a reason, and it is not your kernels. Those two dishes contain exactly the same amount of vertical and horizontal texture; they differ only in WHERE each one sits. Your stack ends in a global average, so a single layer hands the classifier one number per filter — how much of that pattern is in the picture — and for those two dishes those numbers are the same. No choice of 3x3 kernel changes that. ${
+        )} of the ${arrangementTotal} plates of those two came back wearing the sibling's name. There is a reason, and it is not your kernels. Those two dishes contain exactly the same amount of vertical and horizontal texture; they differ only in WHERE each one sits. Your stack ends in a global average, so a single layer hands the classifier one number per filter — how much of that pattern is in the picture — and for those two dishes those numbers come out almost exactly the same. The only difference left is the two or three rows where the textures meet, and no choice of 3x3 kernel gets much out of a sliver that thin. ${
           learned === null
             ? `Do not take my word for it: press "Let it learn" and gradient descent will pick kernels for this exact shape instead of you. It has never been measured past ${percent(
                 ONE_LAYER_CEILING,
@@ -1416,7 +1573,11 @@ export function evaluateKitchen({
               )} you need.`
             : `You already checked: gradient descent picking its own kernels for this shape reached ${percent(
                 learned.accuracy,
-              )}. Same wall.`
+              )}. ${
+                learned.accuracy < TARGET_ACCURACY
+                  ? `Same wall.`
+                  : `That run got past it, which no single-layer run behind this verdict ever did — so read the wall as a very steep slope, and the next sentence as the way over it.`
+              }`
         } A second layer sees the first layer's map, so a filter there can respond to vertical texture ABOVE horizontal texture — turning a position into a quantity before the average throws the position away. That is what "hierarchical features" means, and this is the smallest example of it that cannot be faked.`,
       },
     };
@@ -1425,7 +1586,6 @@ export function evaluateKitchen({
   return {
     ...base,
     outcome: "needs-work",
-    stars: 0,
     points,
     failure: {
       name: "Not detected yet",
@@ -1434,9 +1594,17 @@ export function evaluateKitchen({
       )} needed. Nothing is structurally wrong: your filters are live, none of them duplicate each other${
         learned === null
           ? ""
-          : `, and the same architecture with learned kernels reaches ${percent(
+          : `, and the same shape with learned kernels reaches ${percent(
               learned.accuracy,
-            )} — so the shape of your stack is fine and the weights are what is left`
+            )}${
+              singleLayer
+                ? ""
+                : ` (its layer 2 learns a separate grid for each layer-1 map, where yours shares one, so read that as a little generous)`
+            } — ${
+              learned.accuracy >= TARGET_ACCURACY
+                ? `so the shape of your stack can do it and the weights are what is left`
+                : `so even with the weights chosen for you, this shape comes up short too`
+            }`
       }. Read the per-class scores rather than the total: ${DISHES.map(
         (dish, index) => `${dish.short} ${percent(score.perClass[index] ?? 0)}`,
       ).join(", ")}. The dish with the lowest number is the pattern none of your filters responds to yet.`,
@@ -1446,11 +1614,20 @@ export function evaluateKitchen({
 
 // ── Reveal the math ───────────────────────────────────────────────────────
 
-export const MATH_EQUATION = String.raw`(I * K)(x,y) = \sum_{i=0}^{2}\sum_{j=0}^{2} I(x+i,\; y+j)\, K(i,j)
+/**
+ * Rows first, exactly as MATH_CODE indexes `image[y + i][x + j] * kernel[i][j]`:
+ * y is the row, x the column, and K(i, j) is the kernel's row i, column j. Written
+ * the other way round the equation applies K transposed, which turns the
+ * "Vertical edge" preset into a horizontal one. Both pooling rules are shown
+ * because the kitchen defaults to the average, not the max.
+ */
+export const MATH_EQUATION = String.raw`(I * K)(y,x) = \sum_{i=0}^{2}\sum_{j=0}^{2} I(y+i,\; x+j)\, K(i,j)
 \\[1em]
-A(x,y) = \max\bigl(0,\; (I * K)(x,y)\bigr)
+A(y,x) = \max\bigl(0,\; (I * K)(y,x)\bigr)
+\\[1em]
+P_{\max}(y,x) = \max_{\substack{0 \le i < 2 \\ 0 \le j < 2}} A(2y+i,\; 2x+j)
 \qquad
-P(x,y) = \max_{\substack{0 \le i < 2 \\ 0 \le j < 2}} A(2x+i,\; 2y+j)`;
+P_{\text{avg}}(y,x) = \tfrac{1}{4} \sum_{i=0}^{1}\sum_{j=0}^{1} A(2y+i,\; 2x+j)`;
 
 export const MATH_CODE = `// The whole operation. Nine multiplies, one sum, per output cell.
 for (let y = 0; y < height - 2; y++) {
@@ -1468,12 +1645,14 @@ for (let y = 0; y < height - 2; y++) {
 // 3x3 detector is 9 numbers whether the image is 24 pixels or 24 million,
 // and it finds its pattern wherever the pattern happens to be.`;
 
-export const MATH_NOTES = `Convolution is a sliding pattern-matcher, and the sum above is the match score. Where the patch under the kernel looks like the kernel, positive weights land on bright pixels and negative weights land on dark ones, and the total is large. Where it looks like the kernel's opposite, the total is large and negative — which the ReLU then throws away, because "strongly not this pattern" and "not this pattern" are the same answer as far as the next layer is concerned.
+export const MATH_NOTES = `Convolution is a sliding pattern-matcher, and the sum above is the match score. (Rows first, as in the code: y is the row, x the column, and K(i, j) sits in the kernel's row i, column j.) Where the patch under the kernel looks like the kernel, positive weights land on bright pixels and negative weights land on dark ones, and the total is large. Where it looks like the kernel's opposite, the total is large and negative — which the ReLU then throws away, because "strongly not this pattern" and "not this pattern" are the same answer as far as the next layer is concerned.
 
 That is why a kernel with weights all of one sign cannot detect anything. It has no opposite. Whatever patch you slide it over, the answer is some multiple of the local brightness, and this kitchen randomises brightness on every plate.
 
 Pooling is doing two jobs at once. The obvious one is size: 2x2 pooling quarters the map. The one that matters more is invariance — the stripes in these images sit at a random phase, so a filter's response wobbles as the pattern shifts under it, and a pooled response stops caring exactly where the match happened. Max pooling asks "is this pattern present anywhere in this block", average pooling asks "how much of it is in this block". Those are different questions and on this menu they get different scores.
 
-The stack ends in a global average, one number per filter. That is a real design (it is how modern classifiers finish) and it has a consequence worth sitting with: a single convolution layer can only ever tell the classifier HOW MUCH of each pattern is in the picture, never where. Two of the four dishes here contain identical amounts of vertical and horizontal texture and differ only in arrangement, so a one-layer stack is mathematically incapable of separating them — not short of training, incapable. A second layer looks at the first layer's map, so a filter in it can respond to "vertical texture above horizontal texture", converting a position into a quantity before the average destroys the position. Edges, then textures, then arrangement. That is the whole idea of depth, and it is the reason a 3x3 kernel at layer four can be sensitive to something the size of a face.
+The stack ends in a global average, one number per filter. That is a real design (it is how modern classifiers finish) and it has a consequence worth sitting with: a single convolution layer can only ever tell the classifier HOW MUCH of each pattern is in the picture, never where. Two of the four dishes here contain identical amounts of vertical and horizontal texture and differ only in arrangement, so to a one-layer stack they look almost exactly alike. The only thing left to tell them by is the two or three rows where the textures meet, and that sliver is not enough: gradient descent, given a free hand with one layer, has never been measured past ${Math.round(
+  ONE_LAYER_CEILING * 100,
+)}% here. Not short of training — short of any way to see where things are. A second layer looks at the first layer's map, so a filter in it can respond to "vertical texture above horizontal texture", converting a position into a quantity before the average destroys the position. Edges, then textures, then arrangement. That is the whole idea of depth, and it is the reason a 3x3 kernel at layer four can be sensitive to something the size of a face.
 
-The last thing is the honest one. You can draw an edge detector by hand; the presets in this kitchen are the classic ones and they work. Nobody hand-draws layer four. A real conv layer mixes its input channels, so its kernel is 3x3xC numbers and there is no grid to draw it on — and the useful values in it look like nothing in particular. "Let it learn" trains the exact stack you built and shows you what gradient descent picks instead. Sometimes it rediscovers your edge detectors, which is a nice moment. Sometimes it does not, and that is a more useful one.`;
+The last thing is the honest one. You can draw an edge detector by hand; the presets in this kitchen are the classic ones and they work. Nobody hand-draws layer four. A real conv layer mixes its input channels, so its kernel is 3x3xC numbers and there is no grid to draw it on — and the useful values in it look like nothing in particular. "Let it learn" trains a stack of the same shape and shows you the kernels gradient descent picks instead — its layer 2 learns a separate grid for each layer-1 map, a little more freedom than your shared one. Sometimes it rediscovers your edge detectors, which is a nice moment. Sometimes it does not, and that is a more useful one.`;

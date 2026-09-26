@@ -18,6 +18,11 @@ import { createCodeApi } from "./store";
  * stack without adopting it, and `api.learn` trains one end to end. Sixteen
  * one-layer stacks in a loop is a proof a player can run themselves, which is worth
  * considerably more than a paragraph from me saying it is so.
+ *
+ * The setters return a promise that settles when the kitchen has been rescored,
+ * and they throw by name on anything the steppers could not have produced — an
+ * unknown preset, a slot that does not exist, a spent budget — rather than doing
+ * nothing and letting the snippet report success.
  */
 
 const STARTER_CODE = `// The game claims one layer cannot pass this menu. Check it.
@@ -81,8 +86,9 @@ log('');
 log('Three filters and a second layer beats six in one. Depth is not');
 log('more capacity here - it is the only way to keep a position.');
 log('');
-log('Build the winner in your own kitchen:');
-log('  api.applyPreset(0, 0, "Vertical edge"); api.addLayer()');
+log('Build the winner in your own kitchen (the setters wait for the rescore):');
+log('  await api.applyPreset(0, 0, "Vertical edge"); await api.addLayer();');
+log('  log(api.score().accuracy)');
 
 function pct(x) { return (x * 100).toFixed(1) + '%'; }`;
 
