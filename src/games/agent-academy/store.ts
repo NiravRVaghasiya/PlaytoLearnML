@@ -13,6 +13,7 @@ import {
   EPISODE_BATCH,
   MAX_EPISODES,
   MAX_STEPS,
+  REWARD_KNOBS,
   START,
   cellAt,
   emptyQTable,
@@ -92,6 +93,12 @@ export interface AcademyState {
   epsilon: number;
 
   qTable: QTable;
+  /**
+   * How many times each (state, action) pair has been taken, same shape as the
+   * table. The Q-value panel's "never tried" and the heatmap's untinted cells
+   * read this rather than guessing from a value of 0 — see `TrainOptions.visits`.
+   */
+  visits: QTable;
   history: EpisodeRecord[];
   episodesUsed: number;
 
@@ -126,8 +133,17 @@ export interface AcademyState {
   setEpsilon: (epsilon: number) => void;
   toggleHeatmap: () => void;
   toggleOptimal: () => void;
-  /** Run a batch of episodes and fold the result back in. */
-  train: (episodes?: number) => void;
+  /**
+   * Run a batch of episodes and fold the result back in.
+   *
+   * `source` is the lane the click came from, so a graduation earns the code-lane
+   * star only when the code lane actually trained it — not whenever that tab
+   * happens to be open. Once the agent graduates the visual lane swaps Train for
+   * "New academy", and the code lane's `train` refuses by name (see
+   * `createCodeApi().train`), so re-running a snippet cannot re-record or
+   * un-graduate a finished run.
+   */
+  train: (episodes?: number, source?: Lane) => void;
   /** Throw the agent away, keep the reward function and epsilon. */
   forget: () => void;
   /** Back to the starting reward function and epsilon. */
@@ -215,7 +231,7 @@ export interface CellValue {
   visited: boolean;
 }
 
-export function cellValues(qTable: QTable): CellValue[] {
+export function cellValues(qTable: QTable, visits?: QTable): CellValue[] {
   return qTable.map((row, state) => {
     let best = -Infinity;
     let action: Action = 0;
@@ -233,15 +249,24 @@ export function cellValues(qTable: QTable): CellValue[] {
       col: position.col,
       best,
       action,
-      visited: row.some((value) => value !== 0),
+      // Tracked, not inferred: with a step cost of 0 a tried action can learn a
+      // value of exactly 0. The fallback keeps the old reading for callers that
+      // only have a table.
+      visited: visits
+        ? (visits[state] ?? []).some((count) => count > 0)
+        : row.some((value) => value !== 0),
     };
   });
 }
+
+/** Anything that is not literally "code" — a click event, say — is the visual lane. */
+const laneOf = (source: unknown): Lane => (source === "code" ? "code" : "visual");
 
 function freshAgent(rewards: RewardConfig) {
   const qTable = emptyQTable();
   return {
     qTable,
+    visits: emptyQTable(),
     history: [] as EpisodeRecord[],
     episodesUsed: 0,
     report: evaluatePolicy(qTable, rewards),
@@ -313,20 +338,28 @@ export const useAcademyStore = create<AcademyState>((set, get) => ({
     });
   },
 
-  train: (episodes = EPISODE_BATCH) => {
+  train: (episodes = EPISODE_BATCH, source) => {
     const state = get();
     if (state.training) return;
 
-    const budget = Math.min(episodes, MAX_EPISODES - state.episodesUsed);
+    // A NaN or fractional count from the code lane used to reach the counter and
+    // leave it at NaN for good; the api rejects those by name, and this is the
+    // floor under it.
+    const requested = Math.floor(episodes);
+    if (!Number.isFinite(requested) || requested < 1) return;
+    const budget = Math.min(requested, MAX_EPISODES - state.episodesUsed);
     if (budget <= 0) return;
+    const lane = laneOf(source);
 
     set({ training: true });
 
     // The table is mutated in place by runEpisodes, which is how Q-learning
     // works; a fresh array is handed to the store so React sees a new reference.
     const qTable = state.qTable.map((row) => [...row]);
+    const visits = state.visits.map((row) => [...row]);
     const batch = runEpisodes({
       qTable,
+      visits,
       rewards: state.rewards,
       epsilon: state.epsilon,
       episodes: budget,
@@ -358,6 +391,7 @@ export const useAcademyStore = create<AcademyState>((set, get) => ({
 
     set({
       qTable,
+      visits,
       history,
       episodesUsed,
       report: evaluation.report,
@@ -373,6 +407,9 @@ export const useAcademyStore = create<AcademyState>((set, get) => ({
         episodesUsed,
         epsilon: state.epsilon,
         rewards: state.rewards,
+        // The why-card waits for the same evidence the failure strip does, or it
+        // would name a verdict the strip is deliberately holding back.
+        diagnosed: showFailure,
       }),
     });
 
@@ -380,9 +417,9 @@ export const useAcademyStore = create<AcademyState>((set, get) => ({
       useProgression.getState().recordResult({
         slug: SLUG,
         score: evaluation.score,
-        lane: state.lane,
+        lane,
         completed: true,
-        codeLaneCleared: state.lane === "code",
+        codeLaneCleared: lane === "code",
       });
     }
   },
@@ -474,27 +511,92 @@ const REWARD_KEYS: ReadonlyArray<keyof RewardConfig> = [
   "bump",
 ];
 
+function rewardKey(key: unknown): keyof RewardConfig {
+  const match = REWARD_KEYS.find((candidate) => candidate === key);
+  if (match === undefined) {
+    throw new Error(
+      `Unknown reward "${String(key)}". Try one of: ${REWARD_KEYS.join(", ")}.`,
+    );
+  }
+  return match;
+}
+
+/**
+ * A partial reward function from the code lane, checked before it is used.
+ *
+ * `simulate({ rewards: { cheese: 3 } })` used to spread the typo straight in, so
+ * the experiment silently ran on the player's current rewards and "proved"
+ * something about a reward function nobody wrote. Throwaway experiments may go
+ * past the sliders' ranges — that is what they are for — but every key has to be
+ * real and every value a finite number.
+ */
+function checkedRewards(partial: unknown): Partial<RewardConfig> {
+  if (partial === undefined) return {};
+  if (typeof partial !== "object" || partial === null || Array.isArray(partial)) {
+    throw new Error("rewards must be an object, e.g. { pellet: 3 }.");
+  }
+  const checked: Partial<RewardConfig> = {};
+  for (const [key, value] of Object.entries(partial)) {
+    const match = rewardKey(key);
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      throw new Error(`Reward "${key}" must be a finite number.`);
+    }
+    checked[match] = value;
+  }
+  return checked;
+}
+
 export function createCodeApi(): AcademyCodeApi {
   return {
     setReward: (key, value) => {
-      const match = REWARD_KEYS.find((candidate) => candidate === key);
-      if (match === undefined) {
-        throw new Error(
-          `Unknown reward "${key}". Try one of: ${REWARD_KEYS.join(", ")}.`,
-        );
-      }
-      if (!Number.isFinite(value)) {
+      const match = rewardKey(key);
+      if (typeof value !== "number" || !Number.isFinite(value)) {
         throw new Error(`Reward "${key}" must be a finite number.`);
+      }
+      // The player's own rewards are what the sliders show, so they stay inside
+      // the sliders' ranges; a slider pinned at its end while the store holds
+      // something else would be one store telling two stories.
+      const knob = REWARD_KNOBS.find((candidate) => candidate.key === match);
+      if (knob && (value < knob.min || value > knob.max)) {
+        throw new Error(
+          `Reward "${key}" must be between ${knob.min} and ${knob.max}. api.simulate and api.solve take any value without adopting it.`,
+        );
       }
       useAcademyStore.getState().setReward(match, value);
     },
     setEpsilon: (epsilon) => {
-      if (!Number.isFinite(epsilon) || epsilon < 0 || epsilon > 1) {
+      if (
+        typeof epsilon !== "number" ||
+        !Number.isFinite(epsilon) ||
+        epsilon < 0 ||
+        epsilon > 1
+      ) {
         throw new Error("Epsilon must be a number between 0 and 1.");
       }
       useAcademyStore.getState().setEpsilon(epsilon);
     },
-    train: (episodes) => useAcademyStore.getState().train(episodes),
+    train: (episodes) => {
+      if (
+        episodes !== undefined &&
+        (typeof episodes !== "number" || !Number.isFinite(episodes) || episodes < 1)
+      ) {
+        throw new Error(
+          `Episodes must be a number of at least 1 (got ${String(episodes)}).`,
+        );
+      }
+      const state = useAcademyStore.getState();
+      if (state.phase === "graduated") {
+        throw new Error(
+          "This agent has already graduated. api.forget() starts a fresh one on the same rules.",
+        );
+      }
+      if (state.episodesUsed >= MAX_EPISODES) {
+        throw new Error(
+          `All ${MAX_EPISODES} episodes are spent. api.forget() starts a fresh agent.`,
+        );
+      }
+      state.train(episodes === undefined ? undefined : Math.floor(episodes), "code");
+    },
     forget: () => useAcademyStore.getState().forget(),
     rewards: () => ({ ...useAcademyStore.getState().rewards }),
     epsilon: () => useAcademyStore.getState().epsilon,
@@ -528,13 +630,26 @@ export function createCodeApi(): AcademyCodeApi {
 
     simulate: ({ rewards, epsilon, episodes = 300, seed = 1 } = {}) => {
       const state = useAcademyStore.getState();
-      const merged = { ...state.rewards, ...rewards };
+      const merged = { ...state.rewards, ...checkedRewards(rewards) };
       const useEpsilon = epsilon ?? state.epsilon;
-      if (!Number.isFinite(useEpsilon) || useEpsilon < 0 || useEpsilon > 1) {
+      if (
+        typeof useEpsilon !== "number" ||
+        !Number.isFinite(useEpsilon) ||
+        useEpsilon < 0 ||
+        useEpsilon > 1
+      ) {
         throw new Error("Epsilon must be a number between 0 and 1.");
       }
-      if (!Number.isFinite(episodes) || episodes < 1 || episodes > 20000) {
+      if (
+        typeof episodes !== "number" ||
+        !Number.isFinite(episodes) ||
+        episodes < 1 ||
+        episodes > 20000
+      ) {
         throw new Error("Episodes must be between 1 and 20000.");
+      }
+      if (typeof seed !== "number" || !Number.isFinite(seed)) {
+        throw new Error("seed must be a finite number.");
       }
       const report = trainFresh(merged, useEpsilon, Math.floor(episodes), seed)
         .report;
@@ -542,7 +657,10 @@ export function createCodeApi(): AcademyCodeApi {
     },
 
     solve: (rewards) => {
-      const merged = { ...useAcademyStore.getState().rewards, ...rewards };
+      const merged = {
+        ...useAcademyStore.getState().rewards,
+        ...checkedRewards(rewards),
+      };
       const optimal = solveOptimal(merged);
       return {
         reachesGoal: optimal.reachesGoal,

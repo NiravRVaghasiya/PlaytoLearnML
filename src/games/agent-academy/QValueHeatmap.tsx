@@ -4,6 +4,11 @@ import { ACTIONS, ACTION_ARROWS, ACTION_LABELS, type QTable } from "./ml";
 
 export interface QValueHeatmapProps {
   qTable: QTable;
+  /**
+   * Visit counts, same shape as the table. "Never tried" is read from here: a
+   * value of 0 is not proof of anything once the step or wall penalty is 0.
+   */
+  visits: QTable;
   /** Which cell to open up. Defaults to the start. */
   state: number;
   label: string;
@@ -26,13 +31,15 @@ export interface QValueHeatmapProps {
  */
 export function QValueHeatmap({
   qTable,
+  visits,
   state,
   label,
   episodesUsed,
 }: QValueHeatmapProps) {
   const row = qTable[state] ?? [0, 0, 0, 0];
+  const counts = visits[state] ?? [0, 0, 0, 0];
   const best = Math.max(...row);
-  const untouched = row.filter((value) => value === 0).length;
+  const untouched = ACTIONS.filter((action) => (counts[action] ?? 0) === 0).length;
   const magnitude = Math.max(...row.map((value) => Math.abs(value)), 1e-6);
 
   return (
@@ -78,7 +85,7 @@ export function QValueHeatmap({
           {ACTIONS.map((action) => {
             const value = row[action] ?? 0;
             const chosen = value === best;
-            const never = value === 0;
+            const never = (counts[action] ?? 0) === 0;
             return (
               <tr key={action} className="border-t border-border">
                 <th scope="row" className="py-1.5 text-left font-normal">
@@ -89,6 +96,12 @@ export function QValueHeatmap({
                   {chosen ? (
                     <span className="ml-1.5 rounded-sm bg-[var(--primary)] px-1 text-[10px] font-medium text-[var(--primary-ink)]">
                       chosen
+                    </span>
+                  ) : null}
+                  {/* In words as well as in the grey bar: colour is never the only channel. */}
+                  {never && episodesUsed > 0 ? (
+                    <span className="ml-1.5 text-[10px] text-text-muted">
+                      never tried
                     </span>
                   ) : null}
                 </th>
@@ -119,10 +132,10 @@ export function QValueHeatmap({
 
       {untouched > 0 ? (
         <p className="text-xs text-text-muted">
-          A 0 here is not a low opinion, it is the absence of one — that action has
-          never been taken from this square, so nothing has ever updated it. An
-          agent at ε 0 picks the largest of these numbers, which means a 0 can only
-          ever be beaten, never corrected.
+          An untried action&apos;s 0 is not a low opinion, it is the absence of one —
+          that action has never been taken from this square, so nothing has ever
+          updated it. An agent at ε 0 picks the largest of these numbers, which
+          means that 0 can only ever be beaten, never corrected.
         </p>
       ) : null}
     </section>

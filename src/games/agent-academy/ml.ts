@@ -356,11 +356,24 @@ export function stepEnvironment(
  * twelve seeds, 0.2 and 0.4 solve the same fraction of runs; 0.4 does it sooner.
  *
  * gamma 0.95 is what makes the agent prefer finishing quickly, and it is also the
- * reason the cheese is tempting: a reward nine steps away is worth 0.63 of its
- * face value, while a reward two steps away keeps 0.90 of it.
+ * reason the cheese is tempting. The backup is V = r + gamma * V(next), so a
+ * reward collected on the n-th move is weighted gamma^(n-1): the exit, paid on
+ * move nine, keeps 0.66 of its face value, while the cheese, paid on move two,
+ * keeps 0.95 of it. `discountAfter` below is that rule, and the copy quotes it
+ * rather than a hand-typed exponent.
  */
 export const LEARNING_RATE = 0.4;
 export const DISCOUNT = 0.95;
+
+/**
+ * What a reward collected on move `moves` is worth, as a fraction of face value.
+ *
+ * gamma^(moves-1), not gamma^moves: the first reward is the one the backup adds
+ * undiscounted. Counting from zero is the easy off-by-one here, and it is the one
+ * the Reveal-the-Math notes used to make.
+ */
+export const discountAfter = (moves: number): number =>
+  DISCOUNT ** Math.max(0, moves - 1);
 
 export type QTable = number[][];
 
@@ -421,6 +434,15 @@ export interface TrainOptions {
   random: () => number;
   /** Learn from what happens, or just measure the current policy. */
   learn?: boolean;
+  /**
+   * Per (state, action) visit counts, incremented in place when supplied.
+   *
+   * Kept beside the Q-table rather than inferred from it. "This action has never
+   * been tried" used to be read off `Q === 0`, which is true at the defaults and
+   * false the moment the step or wall penalty is set to 0: a tried action with a
+   * zero reward and a zero bootstrap updates to exactly 0 and looks untouched.
+   */
+  visits?: number[][];
 }
 
 /**
@@ -441,6 +463,7 @@ export function runEpisodes({
   episodes,
   random,
   learn = true,
+  visits,
 }: TrainOptions): EpisodeRecord[] {
   const records: EpisodeRecord[] = [];
 
@@ -463,6 +486,10 @@ export function runEpisodes({
       total += result.reward;
       if (cellAt(result.next) === "pellet" && result.outcome === "moved") {
         pelletsEaten += 1;
+      }
+      if (visits) {
+        const row = visits[state];
+        if (row) row[action] = (row[action] ?? 0) + 1;
       }
 
       if (learn) {
@@ -597,6 +624,59 @@ export function roundTripValue(rewards: RewardConfig): number {
 }
 
 /**
+ * What heading straight for the exit is worth from the start, discounted.
+ *
+ * The best return over every SHORTEST route out — nine moves here, and the good
+ * ones pass the cheese once on the way. This is the number to hold against
+ * `farmValue`, and it is not V*(start): V*(start) is the value of whatever the
+ * best policy does, so once farming wins the two readouts would print the same
+ * figure twice and the exit's actual worth would appear nowhere.
+ *
+ * A small dynamic programme rather than a formula, so it stays right if the maze
+ * changes: distance-to-exit by BFS (traps end the episode, so no route passes
+ * through one), then the best discounted sum over moves that each get one step
+ * closer. Bumps stay put, so they never qualify.
+ */
+export function straightExitValue(rewards: RewardConfig): number {
+  const toGoal = new Array<number>(STATE_COUNT).fill(Number.POSITIVE_INFINITY);
+  toGoal[stateOf(GOAL)] = 0;
+  let frontier: Position[] = [GOAL];
+  while (frontier.length > 0) {
+    const next: Position[] = [];
+    for (const position of frontier) {
+      for (const action of ACTIONS) {
+        const candidate = move(position, action);
+        if (isWall(candidate) || cellAt(candidate) === "trap") continue;
+        const key = stateOf(candidate);
+        if (Number.isFinite(toGoal[key]!)) continue;
+        toGoal[key] = toGoal[stateOf(position)]! + 1;
+        next.push(candidate);
+      }
+    }
+    frontier = next;
+  }
+
+  const memo = new Map<number, number>();
+  const best = (position: Position): number => {
+    const state = stateOf(position);
+    const cached = memo.get(state);
+    if (cached !== undefined) return cached;
+    let value = Number.NEGATIVE_INFINITY;
+    for (const action of ACTIONS) {
+      const result = stepEnvironment(position, action, rewards);
+      if (toGoal[stateOf(result.next)] !== toGoal[state]! - 1) continue;
+      const candidate =
+        result.reward + (result.done ? 0 : DISCOUNT * best(result.next));
+      if (candidate > value) value = candidate;
+    }
+    memo.set(state, value);
+    return value;
+  };
+
+  return best(START);
+}
+
+/**
  * Value iteration on the player's reward function.
  *
  * The maze is 28 states, 4 actions, deterministic and fully known, so the best
@@ -718,6 +798,31 @@ export const DIAGNOSIS_SEED = 4242;
  */
 export const DEFAULT_EPSILON = 0.05;
 
+/**
+ * A graduate's score: 0.6 for graduating on the last episode of the budget, up to
+ * 1.0 for graduating on none, linear in between (spec: "fewest episodes").
+ */
+export const COMPETENT_BASE = 0.6;
+export const COMPETENT_SPAN = 0.4;
+
+export function competentScore(episodesUsed: number): number {
+  const efficiency = clamp(1 - episodesUsed / MAX_EPISODES, 0, 1);
+  return clamp(COMPETENT_BASE + COMPETENT_SPAN * efficiency, 0, 1);
+}
+
+/**
+ * The most episodes a graduation can spend and still score `threshold`.
+ *
+ * The inverse of `competentScore`, so the star criterion on screen can quote an
+ * episode count instead of a percentage nobody can act on. The tests hold it to
+ * the scorer on both sides of the boundary, so floating point cannot make the two
+ * disagree about the last episode that counts.
+ */
+export function episodesForScore(threshold: number): number {
+  const efficiency = (threshold - COMPETENT_BASE) / COMPETENT_SPAN;
+  return Math.max(0, Math.floor(MAX_EPISODES * (1 - efficiency) + 1e-9));
+}
+
 export type Outcome =
   | "competent"
   | "reward-hacking"
@@ -821,12 +926,11 @@ export function evaluateRun({
 
   if (report.goalRate >= COMPETENCE_RATE) {
     // Fewer episodes is better, per the spec's "fewest episodes".
-    const efficiency = clamp(1 - episodesUsed / MAX_EPISODES, 0, 1);
     return {
       outcome: "competent",
       report,
       episodesUsed,
-      score: clamp(0.6 + 0.4 * efficiency, 0, 1),
+      score: competentScore(episodesUsed),
       failure: null,
       optimal,
       explorer: null,
@@ -983,6 +1087,7 @@ function rewardHackingDetail(
         )}. Moving is not a cost any more, so there is nothing for the agent to finish FOR. `
       : ``;
 
+  const exitMoves = stepsFromStart(GOAL);
   const arithmetic =
     optimal.behaviour === "farm"
       ? `${positiveStep}At ${signed(rewards.pellet)} a bite against ${signed(
@@ -991,11 +1096,15 @@ function rewardHackingDetail(
           roundTripValue(rewards),
         )} — repeatable, forever. Pacing beside it is worth ${signed(
           farmValue(rewards),
-        )}; the exit pays ${paid(
+        )}. The exit pays ${paid(
           rewards.goal,
-        )} once, nine steps away, discounted to ${(DISCOUNT ** 9).toFixed(
+        )} once, on move ${exitMoves}, where it is discounted to ${discountAfter(
+          exitMoves,
+        ).toFixed(
           2,
-        )} of face value. ${
+        )} of face value — so heading straight out, cheese included on the way, is worth only ${signed(
+          straightExitValue(rewards),
+        )}. ${
           lucky
             ? `The reward curve would have climbed higher if it had never left.`
             : `Your agent worked this out: ${report.meanPellets.toFixed(
@@ -1138,13 +1247,15 @@ const action = Math.random() < epsilon
 
 export const MATH_NOTES = `Q(s,a) is the agent's estimate of everything it will collect from here on, if it takes action a now and behaves greedily afterwards. The update nudges that estimate toward what it just observed — the reward it actually got, plus its own estimate of the state it landed in. Nothing in it knows what the maze looks like. It only knows what happened.
 
-The discount γ = ${DISCOUNT} is why the agent prefers finishing sooner: a reward n steps away is worth γⁿ times its face value. The exit is nine steps off, so it keeps ${(
-  DISCOUNT ** 9
-).toFixed(2)} of what you pay for it, while the cheese two steps away keeps ${(
-  DISCOUNT ** 2
-).toFixed(
+The discount γ = ${DISCOUNT} is why the agent prefers finishing sooner: a reward collected on the n-th move is worth γⁿ⁻¹ times its face value — the first move's reward counts in full, because the update adds r before it discounts anything. The exit is collected on move ${stepsFromStart(
+  GOAL,
+)}, so it keeps ${discountAfter(stepsFromStart(GOAL)).toFixed(
   2,
-)}. That gap is the whole reason a nearby mediocre reward can out-compete a distant excellent one.
+)} of what you pay for it, while the cheese on move ${stepsFromStart(
+  PELLET,
+)} keeps ${discountAfter(stepsFromStart(PELLET)).toFixed(
+  2,
+)} — and the cheese can be collected again two moves later, and again after that. That gap, compounded by repetition, is the whole reason a nearby mediocre reward can out-compete a distant excellent one.
 
 ε is the entire exploration mechanism, and it is doing something less obvious than "add noise". A Q-value that is never updated stays at whatever it was initialised to. An agent that only ever takes the action it currently believes in will keep confirming that belief and never learn what the alternatives were worth. Exploration is not there to add randomness for its own sake — it is there to generate the data that corrects the table.
 

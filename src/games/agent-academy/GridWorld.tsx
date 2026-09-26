@@ -291,8 +291,16 @@ export function GridWorld({
         ) : null}
       </figcaption>
 
-      {/* The same grid as text, so the maze is legible without reading a picture. */}
-      <table className="sr-only-live">
+      {/*
+       * The same grid as text, so the maze is legible without reading a picture.
+       *
+       * The clipping class sits on a wrapping div, not on the table. A table box is
+       * never narrower than its min-content width and ignores `overflow: hidden`,
+       * so a 1px `sr-only` TABLE still laid out 566px wide and gave the whole page
+       * a horizontal scrollbar on phones. A block container clips properly.
+       */}
+      <div className="sr-only-live">
+      <table>
         <caption>Grid contents by row and column</caption>
         <thead>
           <tr>
@@ -325,6 +333,7 @@ export function GridWorld({
           ))}
         </tbody>
       </table>
+      </div>
     </figure>
   );
 }

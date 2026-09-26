@@ -1,4 +1,11 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import {
+  EMPTY_PROGRESSION,
+  HIGH_SCORE_THRESHOLD,
+  createMemoryAdapter,
+  starsFor,
+  useProgression,
+} from "@/engine/progression";
 import { seededRandom } from "@/lib/utils";
 import {
   ACTIONS,
@@ -21,8 +28,12 @@ import {
   START,
   STATE_COUNT,
   TRAP,
+  MATH_NOTES,
   cellAt,
+  competentScore,
+  discountAfter,
   emptyQTable,
+  episodesForScore,
   evaluatePolicy,
   evaluateRun,
   farmValue,
@@ -37,6 +48,7 @@ import {
   stateOf,
   stepEnvironment,
   stepsFromStart,
+  straightExitValue,
   trainFresh,
   type Action,
   type Outcome,
@@ -44,6 +56,7 @@ import {
 } from "./ml";
 import {
   DIAGNOSE_AFTER,
+  SLUG,
   cellValues,
   createCodeApi,
   greedyTrail,
@@ -1075,5 +1088,271 @@ describe("the cell the maze is built around", () => {
     for (let state = 0; state < STATE_COUNT; state += 1) {
       expect(cellAt(positionOf(state))).not.toBe("wall");
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Invariants behind the audit fixes. Each one is a claim some piece of copy or
+// some readout makes, checked against the arithmetic that is supposed to back it.
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("what walking straight out is worth", () => {
+  it("is the best policy's value when the best policy walks out", () => {
+    // At the defaults the optimum IS the nine-move route past the cheese, so the
+    // two readouts agree — to the last digit, because they are the same sum.
+    expect(solveOptimal(DEFAULT_REWARDS).reachesGoal).toBe(true);
+    expect(straightExitValue(DEFAULT_REWARDS)).toBeCloseTo(
+      solveOptimal(DEFAULT_REWARDS).valueAtStart,
+      6,
+    );
+    expect(straightExitValue(DEFAULT_REWARDS)).toBeCloseTo(10.52, 2);
+  });
+
+  it("stays the exit's own value when farming wins, instead of repeating the farm", () => {
+    // The playthrough's reward-hacking setting. V*(start) is the farming value
+    // here, which is why it could not be the "walking out" row: the editor
+    // printed +19.2 twice and the exit's real +12.4 nowhere.
+    const rewards = withRewards({ pellet: 3 });
+    const optimal = solveOptimal(rewards);
+    expect(optimal.behaviour).toBe("farm");
+    expect(optimal.valueAtStart).toBeCloseTo(farmValue(rewards), 4);
+    expect(straightExitValue(rewards)).toBeCloseTo(12.42, 2);
+    expect(straightExitValue(rewards)).toBeLessThan(farmValue(rewards));
+  });
+
+  it("is never worth more than the best policy, whatever the rewards", () => {
+    for (const knob of REWARD_KNOBS) {
+      for (const value of [knob.min, knob.max]) {
+        const rewards = withRewards({ [knob.key]: value });
+        expect(straightExitValue(rewards)).toBeLessThanOrEqual(
+          solveOptimal(rewards).valueAtStart + 1e-9,
+        );
+      }
+    }
+  });
+});
+
+describe("the discount the copy quotes", () => {
+  it("weights the exit by gamma to the eighth, which is what value iteration does", () => {
+    // Goal-only rewards: the only thing V*(start) can be is the exit's payout,
+    // discounted by however the backup discounts move nine.
+    const goalOnly: RewardConfig = { goal: 20, trap: 0, step: 0, pellet: 0, bump: 0 };
+    const moves = stepsFromStart(GOAL);
+    expect(moves).toBe(9);
+    expect(solveOptimal(goalOnly).valueAtStart).toBeCloseTo(
+      20 * discountAfter(moves),
+      9,
+    );
+    expect(discountAfter(moves)).toBeCloseTo(DISCOUNT ** 8, 12);
+  });
+
+  it("weights the cheese on move two by gamma, not gamma squared", () => {
+    const cheeseOnly: RewardConfig = { goal: 0, trap: 0, step: 0, pellet: 1, bump: 0 };
+    expect(straightExitValue(cheeseOnly)).toBeCloseTo(
+      discountAfter(stepsFromStart(PELLET)),
+      12,
+    );
+    expect(discountAfter(stepsFromStart(PELLET))).toBeCloseTo(DISCOUNT, 12);
+  });
+
+  it("prints those factors in the math notes and the reward-hacking verdict", () => {
+    const exit = discountAfter(stepsFromStart(GOAL)).toFixed(2);
+    const cheese = discountAfter(stepsFromStart(PELLET)).toFixed(2);
+    expect(MATH_NOTES).toContain(`keeps ${exit} of what you pay`);
+    expect(MATH_NOTES).toContain(`keeps ${cheese}`);
+    // The off-by-one it used to make: gamma^9 = 0.63 and gamma^2 = 0.90.
+    expect(MATH_NOTES).not.toContain((DISCOUNT ** 9).toFixed(2));
+    expect(MATH_NOTES).not.toContain((DISCOUNT ** 2).toFixed(2));
+
+    const rewards = withRewards({ pellet: 3 });
+    const { qTable } = trainFresh(rewards, 0.3, 400, 7);
+    const evaluation = evaluateRun({ qTable, rewards, epsilon: 0.3, episodesUsed: 400 });
+    expect(evaluation.outcome).toBe("reward-hacking");
+    const detail = evaluation.failure!.detail;
+    expect(detail).toContain(`discounted to ${exit} of face value`);
+    expect(detail).toContain(`+${straightExitValue(rewards).toFixed(1)}`);
+  });
+});
+
+describe("the second star", () => {
+  it("names the last episode count that still scores the high-score threshold", () => {
+    const budget = episodesForScore(HIGH_SCORE_THRESHOLD);
+    expect(budget).toBeGreaterThan(0);
+    expect(budget).toBeLessThan(MAX_EPISODES);
+    expect(competentScore(budget)).toBeGreaterThanOrEqual(HIGH_SCORE_THRESHOLD);
+    expect(competentScore(budget + 1)).toBeLessThan(HIGH_SCORE_THRESHOLD);
+    // And the engine agrees about what those scores are worth.
+    expect(
+      starsFor({ completed: true, bestScore: competentScore(budget), codeLaneCleared: false }),
+    ).toBe(2);
+    expect(
+      starsFor({ completed: true, bestScore: competentScore(budget + 1), codeLaneCleared: true }),
+    ).toBe(1);
+  });
+
+  it("is the score evaluateRun awards a graduate", () => {
+    const { qTable } = trainFresh(DEFAULT_REWARDS, 0.3, 300, 7);
+    const evaluation = evaluateRun({
+      qTable,
+      rewards: DEFAULT_REWARDS,
+      epsilon: 0.3,
+      episodesUsed: 300,
+    });
+    expect(evaluation.outcome).toBe("competent");
+    expect(evaluation.score).toBe(competentScore(300));
+  });
+});
+
+describe("tracking what was actually tried", () => {
+  it("counts every step taken, per state and action", () => {
+    const qTable = emptyQTable();
+    const visits = emptyQTable();
+    const records = runEpisodes({
+      qTable,
+      visits,
+      rewards: DEFAULT_REWARDS,
+      epsilon: 0.3,
+      episodes: 20,
+      random: seededRandom(5),
+    });
+    const steps = records.reduce((total, record) => total + record.steps, 0);
+    expect(visits.flat().reduce((total, count) => total + count, 0)).toBe(steps);
+  });
+
+  it("marks a tried action as tried even when its value is exactly 0", () => {
+    // Step and wall costs of 0 and no cheese: the agent's first moves update to
+    // r + gamma*0 = 0 and look, by value alone, untouched.
+    const rewards = withRewards({ step: 0, bump: 0, pellet: 0 });
+    const qTable = emptyQTable();
+    const visits = emptyQTable();
+    runEpisodes({
+      qTable,
+      visits,
+      rewards,
+      epsilon: 1,
+      episodes: 1,
+      random: seededRandom(3),
+    });
+    const start = stateOf(START);
+    const triedAtZero = ACTIONS.some(
+      (action) => visits[start]![action]! > 0 && qTable[start]![action] === 0,
+    );
+    expect(triedAtZero).toBe(true);
+
+    const cell = cellValues(qTable, visits).find((entry) => entry.state === start)!;
+    expect(cell.visited).toBe(true);
+  });
+
+  it("keeps visits in the store and clears them with the agent", () => {
+    useAcademyStore.getState().reset();
+    useAcademyStore.getState().setEpsilon(0.3);
+    useAcademyStore.getState().train();
+    const state = useAcademyStore.getState();
+    const steps = state.history.reduce((total, record) => total + record.steps, 0);
+    expect(state.visits.flat().reduce((total, count) => total + count, 0)).toBe(steps);
+
+    useAcademyStore.getState().forget();
+    expect(
+      useAcademyStore.getState().visits.flat().every((count) => count === 0),
+    ).toBe(true);
+  });
+});
+
+describe("the store's guards", () => {
+  beforeEach(() => {
+    useProgression.setState({
+      ...EMPTY_PROGRESSION,
+      hydrated: true,
+      syncError: null,
+      lastGain: null,
+    });
+    useProgression.getState().setAdapter(createMemoryAdapter());
+    useAcademyStore.getState().reset();
+  });
+
+  const graduate = (train: () => void) => {
+    useAcademyStore.getState().setEpsilon(0.3);
+    for (let batch = 0; batch < 6; batch += 1) {
+      train();
+      if (useAcademyStore.getState().phase === "graduated") return;
+    }
+    throw new Error("expected ε 0.3 to graduate within 600 episodes");
+  };
+
+  it("rejects a NaN, a non-number or a sub-one episode count from the code lane", () => {
+    const api = createCodeApi();
+    expect(() => api.train(Number.NaN)).toThrow(/at least 1/);
+    expect(() => api.train(0.5)).toThrow(/at least 1/);
+    expect(() => api.train("100" as unknown as number)).toThrow(/at least 1/);
+    expect(useAcademyStore.getState().episodesUsed).toBe(0);
+  });
+
+  it("never lets a bad count reach the episode counter, whoever sends it", () => {
+    useAcademyStore.getState().train(Number.NaN);
+    expect(useAcademyStore.getState().episodesUsed).toBe(0);
+    useAcademyStore.getState().train(150.7);
+    expect(useAcademyStore.getState().episodesUsed).toBe(150);
+    expect(useAcademyStore.getState().history).toHaveLength(150);
+  });
+
+  it("will not let a re-run snippet train a graduated agent again", () => {
+    // The visual lane swaps Train for "New academy" at graduation; the code lane
+    // gets the same rule, by name, so a second run cannot un-graduate the first.
+    const api = createCodeApi();
+    graduate(() => api.train());
+    const before = useAcademyStore.getState();
+    expect(() => api.train(100)).toThrow(/already graduated/);
+    const after = useAcademyStore.getState();
+    expect(after.phase).toBe("graduated");
+    expect(after.episodesUsed).toBe(before.episodesUsed);
+    expect(after.history).toBe(before.history);
+
+    // And forgetting the agent is the documented way to go again.
+    api.forget();
+    expect(() => api.train(100)).not.toThrow();
+  });
+
+  it("credits the code lane only when the code lane trained the agent", () => {
+    // The visible tab says code, but the click came from the visual Train button.
+    useAcademyStore.getState().setLane("code");
+    graduate(() => useAcademyStore.getState().train());
+    expect(useProgression.getState().games[SLUG]?.completed).toBe(true);
+    expect(useProgression.getState().games[SLUG]?.codeLaneCleared).toBe(false);
+
+    useAcademyStore.getState().reset();
+    useAcademyStore.getState().setLane("visual");
+    const api = createCodeApi();
+    graduate(() => api.train());
+    expect(useProgression.getState().games[SLUG]?.codeLaneCleared).toBe(true);
+  });
+
+  it("rejects typos and non-numbers in the rewards a simulation runs on", () => {
+    const api = createCodeApi();
+    expect(() => api.simulate({ rewards: { cheese: 3 } as never })).toThrow(
+      /Unknown reward "cheese"/,
+    );
+    expect(() => api.simulate({ rewards: { pellet: Number.NaN } })).toThrow(/finite/);
+    expect(() => api.solve({ goal: "20" as unknown as number })).toThrow(/finite/);
+    // Experiments may go past the sliders; the player's own rewards may not.
+    expect(api.solve({ pellet: 20 }).reachesGoal).toBe(false);
+    expect(() => api.setReward("pellet", 20)).toThrow(/between 0 and 6/);
+    expect(useAcademyStore.getState().rewards.pellet).toBe(DEFAULT_REWARDS.pellet);
+  });
+
+  it("does not name a verdict on the why-card before the failure strip would", () => {
+    useAcademyStore.getState().setEpsilon(0);
+    useAcademyStore.getState().train();
+    let state = useAcademyStore.getState();
+    // The verdict is already computed — it is held back, not missing.
+    expect(state.evaluation?.outcome).toBe("no-exploration");
+    expect(state.failure).toBeNull();
+    expect(state.whyCard?.key).toMatch(/^progress-/);
+    expect(state.whyCard?.body).not.toMatch(/Another \d+ episodes will move it/);
+
+    useAcademyStore.getState().train();
+    state = useAcademyStore.getState();
+    expect(state.episodesUsed).toBe(DIAGNOSE_AFTER);
+    expect(state.failure?.name).toBe("No exploration");
+    expect(state.whyCard?.key).toMatch(/^stuck-/);
   });
 });

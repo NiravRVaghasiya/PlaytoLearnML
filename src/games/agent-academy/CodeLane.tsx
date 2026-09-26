@@ -20,12 +20,23 @@ import { createCodeApi } from "./store";
  * `api.simulate` trains throwaway agents against the same environment without
  * touching the player's own agent or spending their episode budget, which is what
  * makes those questions askable at all.
+ *
+ * The sweep is 132 training runs and about a second of main-thread work on a
+ * desktop, several on a phone. `api.simulate` stays synchronous on purpose —
+ * `r.solved` on a Promise would silently read `undefined` in every snippet a
+ * player has written — so the starter yields between rows instead, which keeps
+ * each task short enough for the page to repaint. The sample size stays at twelve
+ * seeds: the claims the tables settle are about distributions, and fewer seeds
+ * would make the printed rates noisy.
  */
 
 const STARTER_CODE = `// One agent is an anecdote. Sweep it.
 
 const SEEDS = 12;
 const EPISODES = 400;
+// Each row trains twelve agents, which is real work. Pausing between rows
+// lets the page repaint instead of freezing until the whole sweep is done.
+const breathe = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 log('epsilon   solved   mean goal rate   cheese eaten   reward');
 for (const epsilon of [0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8]) {
@@ -45,6 +56,7 @@ for (const epsilon of [0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8]) {
       (100 * goal / SEEDS).toFixed(0).padStart(15) + '%',
       (cheese / SEEDS).toFixed(1).padStart(14),
       (reward / SEEDS).toFixed(1).padStart(8));
+  await breathe();
 }
 
 log('');
@@ -65,6 +77,7 @@ for (const epsilon of [0.1, 0.3, 0.5, 0.9]) {
       (solved + '/' + SEEDS).padStart(6),
       (reward / SEEDS).toFixed(1).padStart(8),
       (cheese / SEEDS).toFixed(1).padStart(14));
+  await breathe();
 }
 
 log('');

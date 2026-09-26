@@ -19,6 +19,7 @@ import { trailCaption } from "./why-cards";
  */
 export function VisualLane() {
   const qTable = useAcademyStore((s) => s.qTable);
+  const visits = useAcademyStore((s) => s.visits);
   const rewards = useAcademyStore((s) => s.rewards);
   const optimal = useAcademyStore((s) => s.optimal);
   const history = useAcademyStore((s) => s.history);
@@ -31,8 +32,8 @@ export function VisualLane() {
   const toggleOptimal = useAcademyStore((s) => s.toggleOptimal);
 
   const values = useMemo(
-    () => (showHeatmap ? cellValues(qTable) : null),
-    [showHeatmap, qTable],
+    () => (showHeatmap ? cellValues(qTable, visits) : null),
+    [showHeatmap, qTable, visits],
   );
 
   const wanted = useMemo(
@@ -101,6 +102,7 @@ export function VisualLane() {
       <div className="border-t border-border pt-4">
         <QValueHeatmap
           qTable={qTable}
+          visits={visits}
           state={focus.state}
           label={focus.label}
           episodesUsed={episodesUsed}

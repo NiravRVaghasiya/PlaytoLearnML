@@ -7,6 +7,7 @@ import {
   REWARD_KNOBS,
   farmValue,
   roundTripValue,
+  straightExitValue,
   type OptimalPolicy,
   type RewardConfig,
 } from "./ml";
@@ -32,6 +33,15 @@ const signed = (value: number) =>
  * is what decides whether the agent will ever leave, and it is not obvious from
  * looking at two sliders. At the defaults it reads exactly +0.0, which is not a
  * coincidence: the game is balanced on that zero.
+ *
+ * The three values below it are all measured from the start, so they can be read
+ * against each other: pacing by the cheese forever (the farming loop is worth the
+ * same from the start as from the cheese, because the start is two moves away —
+ * one off, one on, exactly like the loop), walking straight out, and the best
+ * policy there is. The last one is V*(start) from value iteration: the value of
+ * whatever the best policy does — the exit, the cheese loop, the pit — which is
+ * exactly why it cannot stand in for the exit. It used to be labelled "Walking
+ * out", and once farming won it printed the farming figure twice.
  */
 export function RewardEditor({
   rewards,
@@ -41,6 +51,7 @@ export function RewardEditor({
 }: RewardEditorProps) {
   const roundTrip = roundTripValue(rewards);
   const farm = farmValue(rewards);
+  const walkOut = straightExitValue(rewards);
   const changed = (Object.keys(DEFAULT_REWARDS) as Array<keyof RewardConfig>)
     .filter((key) => rewards[key] !== DEFAULT_REWARDS[key])
     .length;
@@ -94,7 +105,11 @@ export function RewardEditor({
             <dd className="font-mono tabular-nums">{signed(farm)}</dd>
           </div>
           <div className="flex items-baseline justify-between gap-2">
-            <dt className="text-text-muted">Walking out is worth</dt>
+            <dt className="text-text-muted">Walking straight out is worth</dt>
+            <dd className="font-mono tabular-nums">{signed(walkOut)}</dd>
+          </div>
+          <div className="flex items-baseline justify-between gap-2">
+            <dt className="text-text-muted">The best policy is worth</dt>
             <dd className="font-mono tabular-nums">
               {signed(optimal.valueAtStart)}
             </dd>

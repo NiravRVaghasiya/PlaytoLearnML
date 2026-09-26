@@ -10,6 +10,7 @@ import {
   REFERENCE_EPSILON,
   farmValue,
   roundTripValue,
+  straightExitValue,
   type EpisodeRecord,
   type Evaluation,
   type OptimalPolicy,
@@ -52,6 +53,14 @@ export type AcademyEvent =
       episodesUsed: number;
       epsilon: number;
       rewards: RewardConfig;
+      /**
+       * Whether there is enough training to name a verdict. The store holds the
+       * non-hacking failures back until `DIAGNOSE_AFTER` episodes, and the card
+       * follows the same rule: at ε 0.1 the first 100 episodes look exactly like
+       * "not exploring enough", and the same run graduates by episode 400.
+       * Omitted means yes, which is what a caller outside the store wants.
+       */
+      diagnosed?: boolean;
     }
   | { kind: "forgot" };
 
@@ -157,7 +166,16 @@ export function whyCardFor(event: AcademyEvent): WhyCardContent {
 
     case "trained": {
       const { evaluation, batch, episodesUsed, epsilon, rewards } = event;
-      const { report, optimal, outcome } = evaluation;
+      const { report, optimal } = evaluation;
+      const diagnosed = event.diagnosed ?? true;
+      // Reward hacking is proved by value iteration, so it never waits; every
+      // other failure verdict waits for the evidence the failure strip waits for.
+      const outcome =
+        diagnosed ||
+        evaluation.outcome === "reward-hacking" ||
+        evaluation.outcome === "competent"
+          ? evaluation.outcome
+          : "untrained";
 
       const goals = batch.filter((record) => record.ending === "goal").length;
       const traps = batch.filter((record) => record.ending === "trap").length;
@@ -200,7 +218,9 @@ export function whyCardFor(event: AcademyEvent): WhyCardContent {
                   roundTripValue(rewards),
                 )}. Repeat that forever and it is worth ${signed(
                   farmValue(rewards),
-                )} — more than the exit, which pays once and is nine steps away.`
+                )} — more than heading straight out, which is worth ${signed(
+                  straightExitValue(rewards),
+                )} because the exit pays once and is nine moves away.`
               : optimal.behaviour === "quit"
                 ? `The pit is two steps from home and the exit is nine, and you have priced them so the pit wins.`
                 : `Nothing you are paying for happens at the exit.`
@@ -268,7 +288,9 @@ export function whyCardFor(event: AcademyEvent): WhyCardContent {
         } cells to the start, discounted by ${DISCOUNT} each hop. ${
           episodesUsed >= MAX_EPISODES
             ? `That is the last of the ${MAX_EPISODES} episodes, though — change something.`
-            : `Another ${EPISODE_BATCH} episodes will move it.`
+            : diagnosed
+              ? `Another ${EPISODE_BATCH} episodes will move it.`
+              : `One batch is not evidence of anything yet — train another and the game will say whether it is getting there, and if not, why.`
         }`,
         tone: "info",
       };

@@ -17,6 +17,7 @@ import {
   MATH_EQUATION,
   MATH_NOTES,
   MAX_EPISODES,
+  episodesForScore,
 } from "./ml";
 import { SLUG, episodesLeft, useAcademyStore } from "./store";
 import { EpsilonSlider } from "./EpsilonSlider";
@@ -24,14 +25,22 @@ import { RewardEditor } from "./RewardEditor";
 import { VisualLane } from "./VisualLane";
 import { CodeLane } from "./CodeLane";
 
+/**
+ * The engine's rule, stated in this game's terms: ★1 completed, ★2 a best score of
+ * at least HIGH_SCORE_THRESHOLD, ★3 that plus a code-lane clear. The episode
+ * count in ★2 is the inverse of the scorer (`episodesForScore`), not a second
+ * threshold that could drift from it.
+ */
 const STAR_CRITERIA = [
   `Get the agent reaching the exit in ${Math.round(
     COMPETENCE_RATE * 100,
   )}% of rollouts`,
   `Score ${Math.round(
     HIGH_SCORE_THRESHOLD * 100,
-  )}% or better by graduating in few episodes`,
-  "Graduate an agent from the code lane",
+  )}% or better: graduate within ${episodesForScore(
+    HIGH_SCORE_THRESHOLD,
+  )} episodes`,
+  "Graduate an agent by training it from the code lane",
 ];
 
 function Controls() {
