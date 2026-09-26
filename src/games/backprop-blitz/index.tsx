@@ -15,9 +15,12 @@ import {
   MATH_EQUATION,
   MATH_NOTES,
   PARAM_IDS,
+  PEEK_FACTOR,
   SCENARIOS,
   STEP_COUNT,
   TRAINING_STEPS,
+  compareRuns,
+  lossText,
   nodeById,
 } from "./ml";
 import { SLUG, scenario, useBlitzStore } from "./store";
@@ -25,19 +28,31 @@ import { CorrectnessMeter } from "./CorrectnessMeter";
 import { VisualLane } from "./VisualLane";
 import { CodeLane } from "./CodeLane";
 
+/**
+ * Exactly the progression engine's rule: one star for a clear, two for a best
+ * score at or above `HIGH_SCORE_THRESHOLD`, three for that plus a code-lane
+ * clear. The third line used to promise "clear all three scenarios", which the
+ * engine never checks — it awards the third star for a code-lane clear and
+ * nothing else.
+ */
 const STAR_CRITERIA = [
   "Match every node gradient in a scenario",
   `Score ${Math.round(
     HIGH_SCORE_THRESHOLD * 100,
-  )}% or better by routing a scenario with no wrong turns`,
-  "Clear all three scenarios, including the one with the shut gate",
+  )}% or better by routing with no wrong turns and no peeking at the real trace`,
+  "Clear a scenario from the code lane",
 ];
+
+/** The peek's price as the caption states it, from the number the score uses. */
+const peekCap = `${Math.round(PEEK_FACTOR * 100)}%`;
 
 function Controls() {
   const evaluation = useBlitzStore((s) => s.evaluation);
   const showTruth = useBlitzStore((s) => s.showTruth);
   const phase = useBlitzStore((s) => s.phase);
   const clearedIds = useBlitzStore((s) => s.clearedIds);
+  const peekedIds = useBlitzStore((s) => s.peekedIds);
+  const current = useBlitzStore(scenario);
   const routing = useBlitzStore((s) => s.routing);
   const toggleTruth = useBlitzStore((s) => s.toggleTruth);
   const nextScenario = useBlitzStore((s) => s.nextScenario);
@@ -79,6 +94,15 @@ function Controls() {
         >
           {showTruth ? "Hide the real trace" : "Show the real trace"}
         </Button>
+        {/* The cost is stated before the button is pressed, as Dimension Diver
+            does for its hint: a penalty discovered afterwards would be a trap. */}
+        <p className="mt-1.5 text-xs text-text-muted">
+          {peekedIds.includes(current.id)
+            ? `You looked before clearing this scenario, so its score is capped at ${peekCap}.`
+            : phase === "cleared"
+              ? "Cleared — reading the trace now costs nothing."
+              : `The reference gradient at every node. Looking before you clear caps this scenario's score at ${peekCap}.`}
+        </p>
 
         <Button
           variant="ghost"
@@ -174,7 +198,9 @@ export default function BackpropBlitz() {
       goodDirection: "up",
       caption:
         correctness.coincidences.length > 0
-          ? `${correctness.coincidences.length} wrong rule got the right answer`
+          ? `${correctness.coincidences.length} wrong rule${
+              correctness.coincidences.length === 1 ? "" : "s"
+            } got the right answer`
           : `${correctness.rulesRight} of ${answered} choices`,
       state:
         correctness.coincidences.length > 0 ? "warn" : undefined,
@@ -204,12 +230,18 @@ export default function BackpropBlitz() {
       format: "decimal",
       precision: 4,
       goodDirection: "down",
+      // Beating the real gradients is possible on one example and is luck, not
+      // correctness (see `describeTraining`), so the caption says so rather than
+      // leaving a lower number to read as a better answer.
       caption:
-        evaluation.mineRun === null
+        evaluation.mineRun === null || evaluation.truthRun === null
           ? `${TRAINING_STEPS} steps, once you finish`
           : evaluation.mineRun.diverged
             ? "diverged — the gradient pointed uphill"
-            : `real gradients reach ${evaluation.truthRun?.final.toFixed(4) ?? "?"}`,
+            : evaluation.outcome === "broken" &&
+                compareRuns(evaluation.mineRun, evaluation.truthRun) === "lower"
+              ? `real gradients reach ${lossText(evaluation.truthRun.final)} — lower is luck here, not a right rule`
+              : `real gradients reach ${lossText(evaluation.truthRun.final)}`,
       state: evaluation.mineRun?.diverged ? "bad" : undefined,
     },
     {

@@ -1,5 +1,5 @@
 import type { NamedFailure } from "@/engine/types";
-import { clamp } from "@/lib/utils";
+import { clamp, seededRandom } from "@/lib/utils";
 
 /**
  * Backprop Blitz — the chain rule, executed by hand.
@@ -168,11 +168,16 @@ export const SCENARIOS: readonly Scenario[] = [
       "z comes out negative, so the ReLU outputs zero — and it passes zero gradient backward. Everything behind it learns nothing at all this step.",
   },
   {
+    // The copy used to say "Overshooting… d is positive". These leaves give
+    // y = 0 against t = 3, so d = −3: an UNDERSHOOT, the opposite of the claim.
+    // The leaves stay (they were tuned so every wrong rule is distinguishable)
+    // and the words were rewritten to what the forward pass actually computes —
+    // every sentence below is asserted against `forward`/`autograd` in the tests.
     id: "negative",
-    title: "Overshooting the target",
+    title: "Undershooting the target",
     leaves: { x: -1.5, w1: 2, b1: 4, w2: -1.5, b2: 0.5, t: 3 },
     lesson:
-      "The prediction lands above the target, so d is positive and the gradients change sign. Watch which way the weights move.",
+      "The prediction lands below the target, so d is negative and every gradient near the output flips sign compared with the first scenario. Then w₂ is negative, which flips the path through v back again: the two gradients arriving at h have opposite signs and partly cancel. The sign of a gradient is not the sign of the error — watch which way each weight moves.",
   },
 ] as const;
 
@@ -498,7 +503,11 @@ export const ACCUMULATE_RULES: readonly Rule[] = [
     id: "acc-first",
     op: "accumulate",
     label: "keep the first to arrive",
-    detail: "Forgetting the second path exists at all — the skip connection's.",
+    // The walk routes s before v, so the first contribution to reach h is the
+    // skip connection's. An earlier draft said the skip path was the one
+    // forgotten, which is backwards against the numbers on screen.
+    detail:
+      "Forgetting that a second path exists at all. The first gradient to reach h comes back along the skip connection, from s — keep only that and everything that came through v and w₂ is dropped.",
     correct: false,
     misconception: "branch-dropped",
     apply: (g) => [g],
@@ -563,6 +572,40 @@ export function buildSteps(): Step[] {
 export const STEPS = buildSteps();
 export const STEP_COUNT = STEPS.length;
 
+/**
+ * The order a step's options are SHOWN in, which is not the order they are stored.
+ *
+ * Every rule table above lists the correct rule first, because that is the
+ * readable way to write it down — and for a while the view rendered them in that
+ * order, so "always pick the top radio" cleared every scenario at 100%. The answer
+ * key was positional. So the view shuffles, deterministically per (scenario,
+ * step): stable across renders and reloads, reproducible in tests, and different
+ * from one scenario to the next so that no position can be memorised.
+ *
+ * Only the view uses this. `STEPS` and `api.steps()` keep the stored order on
+ * purpose: the code lane's greedy searches break ties toward the first option they
+ * try, and a tie at a coincidence (relu-always with the gate open) must still
+ * resolve to the real rule rather than to the lucky one.
+ */
+export function displayOrder(
+  options: readonly Rule[],
+  scenarioId: string,
+  stepIndex: number,
+): Rule[] {
+  // FNV-1a over the key, so each (scenario, step) gets its own stream.
+  let hash = 2166136261;
+  for (const char of `${scenarioId}:${stepIndex}`) {
+    hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
+  }
+  const random = seededRandom(hash >>> 0);
+  const order = [...options];
+  for (let index = order.length - 1; index > 0; index -= 1) {
+    const swap = Math.floor(random() * (index + 1));
+    [order[index], order[swap]] = [order[swap]!, order[index]!];
+  }
+  return order;
+}
+
 // ── Replaying the player's choices ────────────────────────────────────────
 
 /** Rule id chosen per step index. */
@@ -606,17 +649,24 @@ export function replay(leaves: Values, routing: Routing): PlayerTrace {
 
     if (step.kind === "accumulate") {
       const parts = pending[step.nodeId] ?? [];
+      // Only once every consumer has actually sent something. Combining one
+      // arrival as if it were both would settle a number the player never built.
+      if (parts.length < fanOut(step.nodeId)) return;
       grads[step.nodeId] = rule.combine ? rule.combine(parts) : 0;
       settled.push(step.nodeId);
       return;
     }
 
-    // Single-consumer nodes settle as soon as their one contribution exists.
-    if (grads[step.nodeId] === undefined) {
-      const parts = pending[step.nodeId] ?? [];
-      grads[step.nodeId] = parts.reduce((total, part) => total + part, 0);
-      if (!settled.includes(step.nodeId)) settled.push(step.nodeId);
-    }
+    // Nothing has arrived here yet, so there is nothing to push on.
+    //
+    // This used to fall back to SUMMING whatever was pending, which had two quiet
+    // consequences. A node whose consumer was still unrouted settled at 0, a
+    // number nobody chose. And at the branch, skipping the accumulate step and
+    // routing h anyway silently applied the correct sum on the player's behalf —
+    // so the metric read 100% without the one decision this graph exists to ask
+    // about. A gradient is settled by its consumer's route (single consumer) or by
+    // the accumulate step (value used twice), and by nothing else.
+    if (grads[step.nodeId] === undefined) return;
 
     const incoming = grads[step.nodeId] ?? 0;
     const inputValues = node.inputs.map((input) => values[input] ?? 0);
@@ -865,9 +915,18 @@ export interface TrainingRun {
  *
  * This is the answer to "so what?", and it needs more than one step to be an
  * answer at all. A wrong rule is not a one-off error, it is a wrong rule applied
- * again at every step, so the two trajectories separate — which is exactly how a
- * broken autograd behaves in practice: the network still trains, and it trains
- * worse, for reasons that never show up in a single number.
+ * again at every step, so the two trajectories separate — which is how a broken
+ * autograd behaves in practice: the network still trains, just not down the
+ * gradient of the network you built.
+ *
+ * What this does NOT reliably show is a worse final loss, and the copy used to
+ * claim it did. Measured over every single-wrong-rule routing: on one example
+ * with four learnable parameters there are many exact fits, and a wrong
+ * direction often stumbles into one sooner — in the undershoot scenario, keeping
+ * only the first branch gradient reaches 5e-20 against 0.016 for the truth, and
+ * in the shut scenario the real gradient cannot move w₁ or b₁ at all (the gate
+ * is shut, so their derivative is exactly zero) while an invented one can.
+ * `describeTraining` reports whichever of those actually happened.
  *
  * Pass `routing` as null to train with the real gradients.
  */
@@ -933,6 +992,69 @@ export interface Evaluation {
 const signed = (value: number) =>
   `${value >= 0 ? "+" : ""}${value.toFixed(3)}`;
 
+/** A loss for the copy: four decimals, or scientific once it is that small. */
+export const lossText = (value: number): string =>
+  value !== 0 && Math.abs(value) < 1e-4
+    ? value.toExponential(1)
+    : value.toFixed(4);
+
+/** How two 40-step runs compare. The copy branches on this, never on a guess. */
+export type RunComparison = "diverged" | "both-fit" | "same" | "lower" | "higher";
+
+/** Below this, a squared error on one example is an exact fit. */
+const FIT = 1e-6;
+
+export function compareRuns(mine: TrainingRun, truth: TrainingRun): RunComparison {
+  if (mine.diverged) return "diverged";
+  if (mine.final < FIT && truth.final < FIT) return "both-fit";
+  if (
+    Math.abs(mine.final - truth.final) <=
+    1e-9 + 1e-6 * Math.max(mine.final, truth.final)
+  ) {
+    return "same";
+  }
+  return mine.final < truth.final ? "lower" : "higher";
+}
+
+/**
+ * What 40 steps of descent along the player's gradient did, against the truth's.
+ *
+ * Every branch is a measured case, and the "lower" one exists because the earlier
+ * copy — "the two paths separate: yours reaches X" — was printing X below the true
+ * run's loss for nine of the single-wrong-rule routings and letting the sentence
+ * imply that was worse. The reason it happens is worth saying rather than hiding,
+ * and in the shut scenario it is a genuine lesson: the true derivative through a
+ * shut gate is zero, so the real run cannot move w₁ or b₁ at all — a dead unit —
+ * while a rule that invents gradient there can.
+ */
+function describeTraining(mineRun: TrainingRun, truthRun: TrainingRun): string {
+  const comparison = compareRuns(mineRun, truthRun);
+  const mine = lossText(mineRun.final);
+  const truth = lossText(truthRun.final);
+
+  switch (comparison) {
+    case "diverged":
+      return ` Left to run for ${TRAINING_STEPS} steps it does not converge at all — the loss runs away to infinity while the real gradients settle at ${truth}.`;
+    case "both-fit":
+      return ` Over ${TRAINING_STEPS} steps both runs fit this example exactly — yours reaches ${mine}, the real gradients ${truth}. One example and four learnable parameters leave many exact fits, so a wrong direction can still arrive at one. The final loss cannot see this mistake; the angle can.`;
+    case "same":
+      return ` Over ${TRAINING_STEPS} steps both runs land on the same loss, ${truth}: the wrong part of your gradient only pushes on parameters this example's loss does not currently depend on. The damage is invisible in the loss, and the angle is what gives it away.`;
+    case "lower": {
+      const z = forward(truthRun.params).z ?? 0;
+      const deadGate = z <= 0;
+      return ` Over ${TRAINING_STEPS} steps yours actually ends LOWER — ${mine} against ${truth} for the real gradients — and that is not a sign the rule is right.${
+        deadGate
+          ? ` The real gradients are held back by the ReLU: by the end of their run z is ${z.toFixed(
+              2,
+            )}, the gate is shut, and w₁ and b₁ receive exactly zero. That is the true derivative of this network — a dead unit learns nothing — and your rule is not the true derivative, so it is not held back the same way.`
+          : ""
+      } On a single example there are many settings of four parameters that fit it exactly, and a wrong direction can stumble into one sooner. Final loss here does not measure correctness; the angle does, and nothing promises the same luck on any other example.`;
+    }
+    case "higher":
+      return ` Over ${TRAINING_STEPS} steps the two paths separate: yours reaches ${mine}, the real gradients reach ${truth}.`;
+  }
+}
+
 /**
  * What a wrong gradient costs, stated only as strongly as the numbers allow.
  *
@@ -940,33 +1062,36 @@ const signed = (value: number) =>
  * usually false: at this learning rate anything within 90° of the truth still
  * descends, and on this graph a swapped multiply once produced a LOWER loss after
  * one step than the correct gradient did. So the copy reports what is actually
- * true, and the three cases turn out to be genuinely different lessons:
+ * true — the one-step claims are read off `mine` (the step actually taken) rather
+ * than inferred from the angle — and the cases turn out to be genuinely
+ * different lessons:
  *
- *   uphill (angle > 90°)  — descent becomes ascent and the run blows up.
+ *   uphill (angle > 90°)  — descent becomes ascent; usually the run blows up.
  *   rescaled (angle ~ 0)  — the direction is perfect and only the length is wrong,
  *                           which is a learning-rate bug wearing a disguise and the
  *                           hardest kind to ever notice.
  *   off-axis (in between) — still downhill, still wrong, and the two trajectories
- *                           separate over many steps.
+ *                           go different places over many steps.
  */
 function describeCost(
   angle: number,
   ratio: number,
+  mine: UpdateResult,
   mineRun: TrainingRun,
   truthRun: TrainingRun,
 ): string {
+  const before = mine.before.toFixed(4);
+  const after = mine.after.toFixed(4);
+  const training = describeTraining(mineRun, truthRun);
+
   if (angle > 90) {
     return ` And it points UPHILL: ${angle.toFixed(
       0,
-    )}° away from the true gradient, which is more than a right angle, so subtracting it increases the loss. ${
-      mineRun.diverged
-        ? `Left to run for ${TRAINING_STEPS} steps it does not converge at all — the loss runs away to infinity while the real gradients settle at ${truthRun.final.toFixed(
-            4,
-          )}.`
-        : `Over ${TRAINING_STEPS} steps it reaches ${mineRun.final.toFixed(
-            4,
-          )} against ${truthRun.final.toFixed(4)} for the real ones.`
-    }`;
+    )}° away from the true gradient, which is more than a right angle, so ${
+      mine.after > mine.before
+        ? `the first step along it raises the loss, from ${before} to ${after}.`
+        : `it runs up the slope — even though this particular step happened to land lower, at ${after}.`
+    }${training}`;
   }
 
   if (angle < 0.5 && Number.isFinite(ratio) && Math.abs(ratio - 1) > 0.02) {
@@ -976,16 +1101,25 @@ function describeCost(
   }
 
   if (angle < 0.5) {
-    return ` Oddly, the errors cancel on these particular numbers and your gradient comes out identical to the real one. That will not survive a different scenario.`;
+    return ` Oddly, the errors cancel on these particular numbers and your parameter gradient comes out identical to the real one — the wrong values never reach a weight here. That will not survive a scenario where they do.`;
   }
+
+  if (Number.isFinite(ratio) && ratio < 1e-9) {
+    return ` Your parameter gradient is zero — every weight receives exactly 0 — so descent along it cannot move anything, while the real gradient would.${training}`;
+  }
+
+  const moved =
+    mine.after < mine.before
+      ? `Still downhill, note — one step lowers the loss anyway, from ${before} to ${after}, which is exactly why a broken backward pass is so hard to catch.`
+      : mine.after > mine.before
+        ? `And the first step along it raises the loss, from ${before} to ${after}.`
+        : `A step along it leaves the loss where it was, at ${before}.`;
 
   return ` Your parameter gradient points ${angle.toFixed(
     0,
   )}° away from the real one and is ${
     Number.isFinite(ratio) ? `${ratio.toFixed(2)} times` : "wildly different in"
-  } its length. Still downhill, note — one step lowers the loss anyway, which is exactly why a broken backward pass is so hard to catch. Over ${TRAINING_STEPS} steps the two paths separate: yours reaches ${mineRun.final.toFixed(
-    4,
-  )}, the real gradients reach ${truthRun.final.toFixed(4)}.`;
+  } its length. ${moved}${training}`;
 }
 
 const MISCONCEPTION_NAMES: Record<MisconceptionId, string> = {
@@ -1050,7 +1184,10 @@ export function evaluate({
   const truthRun = train(leaves, null);
 
   if (correctness.fraction >= TARGET_FRACTION) {
-    // Fewer wrong turns is a better score; the walk itself is not a race.
+    // A wrong rule still standing in a cleared routing (a coincidence) costs
+    // here; wrong turns taken on the way are charged by the store, which is the
+    // only place that knows the walk rather than where it ended up. The walk
+    // itself is not a race.
     const cleanliness = clamp(correctness.rulesRight / STEP_COUNT, 0, 1);
     return {
       outcome: "cleared",
@@ -1112,7 +1249,7 @@ export function evaluate({
    * downhill still descends. The angle is the real damage, and 40 steps of descent
    * is where it becomes visible as a number the player cares about.
    */
-  const costLine = describeCost(angle, ratio, mineRun, truthRun);
+  const costLine = describeCost(angle, ratio, mineUpdate, mineRun, truthRun);
 
   return {
     outcome: "broken",
@@ -1127,6 +1264,8 @@ export function evaluate({
     score: clamp(correctness.fraction * 0.5, 0, 1),
     failure: {
       name,
+      // Assembled from optional clauses, so collapse the doubled spaces an
+      // empty one leaves behind.
       detail: `${
         culprit === null
           ? `${correctness.matched} of ${correctness.total} node gradients match the autograd trace.`
@@ -1138,7 +1277,9 @@ export function evaluate({
           ? ""
           : `That one choice is why ${poisoned} of ${
               correctness.total
-            } node gradients are now wrong: a backward pass is a chain, so everything behind the break inherits it. ${
+            } node gradients ${
+              poisoned === 1 ? "is" : "are"
+            } now wrong: a backward pass is a chain, so everything behind the break inherits it. ${
               worstParam === undefined
                 ? ""
                 : `${worstParam.label}'s gradient should be ${signed(
@@ -1149,9 +1290,59 @@ export function evaluate({
         wrongRuleCount > 1
           ? ` ${wrongRuleCount} of your rules are wrong, so no single misconception explains this one — the earliest is the one quoted above, and it is the one to fix first.`
           : ""
-      }${costLine} Fix the earliest red node and watch the rest go green on their own.`,
+      }${costLine} Fix the earliest red node and watch the rest go green on their own.`.replace(
+        / {2,}/g,
+        " ",
+      ),
     },
   };
+}
+
+// ── The recorded score ────────────────────────────────────────────────────
+//
+// Here rather than in the store so the copy that states these prices can compute
+// them from the same numbers (the store re-exports all three).
+
+/** Each wrong turn takes this much off the round. */
+export const WRONG_TURN_COST = 0.1;
+/** Revealing the real trace before clearing caps the round at this share. */
+export const PEEK_FACTOR = 0.7;
+
+/**
+ * What a cleared round is worth to progression, 0–1.
+ *
+ * Three things multiply the routing's own score (which already charges a wrong
+ * rule left standing in a cleared routing):
+ *
+ *   the walk     — each wrong turn costs `WRONG_TURN_COST`, floored at half.
+ *   the peek     — the real trace is the answer key for every node at once, so
+ *                  using it before clearing costs the same 0.7 as Dimension
+ *                  Diver's hint. The button says so before it is pressed.
+ *   the campaign — clearing more scenarios is worth more than clearing one.
+ *
+ * The campaign term used to be 0.7 + 0.3·k/3, tuned to land a perfect first clear
+ * exactly on the 0.8 two-star line — and IEEE-754 put it at 0.7999999999999999,
+ * one ulp short, so a flawless first scenario earned one star. It is now
+ * 0.8 + 0.2·k/3, which clears the line on purpose (0.867 for one clean scenario),
+ * and the result is rounded to six places so an exact 0.8 from the formula is an
+ * exact 0.8 in progression.
+ */
+export function roundScore({
+  routingScore,
+  wrongTurns,
+  peeked,
+  clearedCount,
+}: {
+  routingScore: number;
+  wrongTurns: number;
+  peeked: boolean;
+  clearedCount: number;
+}): number {
+  const walk = Math.max(0.5, 1 - WRONG_TURN_COST * wrongTurns);
+  const campaign =
+    0.8 + 0.2 * (clamp(clearedCount, 0, SCENARIOS.length) / SCENARIOS.length);
+  const raw = routingScore * walk * (peeked ? PEEK_FACTOR : 1) * campaign;
+  return Math.round(clamp(raw, 0, 1) * 1e6) / 1e6;
 }
 
 // ── Reveal the math ───────────────────────────────────────────────────────
@@ -1191,6 +1382,6 @@ The multiply is where the chain rule earns its keep. For c = a·b the derivative
 
 The ReLU is a switch that the forward pass already threw. Above zero it passes gradient untouched; at or below zero it passes exactly zero — not a little, zero. Which means a unit that was silent on this example contributes nothing to learning on this example, and everything behind it learns nothing through that path. That is the same fact that Convolution Kitchen calls a dead filter, seen from the other direction.
 
-And the branch. A value used in two places affects the loss through both routes, and the two effects add. Not average, not maximum, not whichever you noticed first — add. This is the multivariable chain rule and in code it is the difference between '+=' and '='. It is also the single most consequential character in a hand-written autograd engine: write '=' and every skip connection, every shared embedding, every reused feature map quietly drops half its gradient, the network still trains, and it trains worse than it should for reasons nobody can find.
+And the branch. A value used in two places affects the loss through both routes, and the two effects add. Not average, not maximum, not whichever you noticed first — add. This is the multivariable chain rule and in code it is the difference between '+=' and '='. It is also the single most consequential character in a hand-written autograd engine: write '=' and every skip connection, every shared embedding, every reused feature map quietly keeps only one of its paths. The network still trains — just not down the gradient of the network you built — and on a toy like this one the final loss can even come out lower than the real gradient's, which is exactly why nobody finds the bug by watching the loss. The angle between the two gradients is what gives it away.
 
 One more thing worth noticing while you play. Nothing in this backward pass knows what the network is FOR. Each node applies a local rule to the number that arrived and passes the result on. Blame gets assigned across an arbitrarily deep graph by nothing more than that, repeated — which is why the same fourteen lines of code differentiate a two-weight toy and a two-billion-parameter model.`;

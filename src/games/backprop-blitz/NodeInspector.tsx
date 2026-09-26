@@ -1,12 +1,13 @@
 "use client";
 
+import { useMemo } from "react";
 import { Check, X } from "lucide-react";
 import { Button } from "@/components";
 import { cx } from "@/lib/utils";
 import {
   STEPS,
   STEP_COUNT,
-  consumersOf,
+  displayOrder,
   nodeById,
   type Rule,
   type Step,
@@ -16,14 +17,20 @@ import {
 export interface NodeInspectorProps {
   step: Step;
   stepIndex: number;
+  /** Seeds the order the options are shown in. See `displayOrder`. */
+  scenarioId: string;
   /** The rule chosen at this step, if any. */
   chosen: string | null;
   /** Forward values, for showing the local derivative concretely. */
   values: Values;
   /** The gradient arriving at this node, if it has settled. */
   incoming: number | null;
-  /** Contributions waiting to be combined, for an accumulate step. */
-  pending: number[];
+  /**
+   * Contributions waiting to be combined, for an accumulate step, in the order
+   * they arrived — which is what "keep the first to arrive" means. `null` for a
+   * consumer that has not been routed yet, rather than a 0 nobody sent.
+   */
+  pending: Array<{ from: string; value: number | null }>;
   /** What the player's current choice sends onward. */
   outgoing: Array<{ to: string; mine: number | null; truth: number; correct: boolean }>;
   answeredCount: number;
@@ -51,6 +58,7 @@ const signed = (value: number) =>
 export function NodeInspector({
   step,
   stepIndex,
+  scenarioId,
   chosen,
   values,
   incoming,
@@ -63,6 +71,12 @@ export function NodeInspector({
 }: NodeInspectorProps) {
   const node = nodeById(step.nodeId);
   const chosenRule = step.options.find((option) => option.id === chosen);
+  // Shuffled per scenario and step, so no position is the answer. Stable across
+  // renders, so a keyboard user's place in the group never moves under them.
+  const options = useMemo(
+    () => displayOrder(step.options, scenarioId, stepIndex),
+    [step.options, scenarioId, stepIndex],
+  );
 
   return (
     <section aria-labelledby="inspector-heading" className="flex flex-col gap-3">
@@ -117,12 +131,12 @@ export function NodeInspector({
           </dt>
           <dd className="font-mono tabular-nums">
             {step.kind === "accumulate"
-              ? consumersOf(step.nodeId)
+              ? pending
                   .map(
-                    (consumer, index) =>
-                      `${nodeById(consumer).label} ${signed(
-                        pending[index] ?? 0,
-                      )}`,
+                    (part) =>
+                      `${nodeById(part.from).label} ${
+                        part.value === null ? "not routed yet" : signed(part.value)
+                      }`,
                   )
                   .join(" · ")
               : incoming === null
@@ -159,7 +173,7 @@ export function NodeInspector({
             ? "How do the arriving gradients combine?"
             : "How does the gradient transform here?"}
         </legend>
-        {step.options.map((option) => (
+        {options.map((option) => (
           <RuleOption
             key={option.id}
             option={option}
@@ -196,13 +210,26 @@ export function NodeInspector({
                   <th scope="row" className="py-1 text-left font-normal">
                     {nodeById(entry.to).label}
                   </th>
+                  {/* Nothing sent is not a wrong number: muted, not red, and
+                      said in words to a screen reader rather than as a dash. */}
                   <td
                     className={cx(
                       "py-1 text-right font-mono tabular-nums",
-                      entry.correct ? "text-correct" : "text-wrong",
+                      entry.mine === null
+                        ? "text-text-muted"
+                        : entry.correct
+                          ? "text-correct"
+                          : "text-wrong",
                     )}
                   >
-                    {entry.mine === null ? "—" : signed(entry.mine)}
+                    {entry.mine === null ? (
+                      <>
+                        <span aria-hidden="true">—</span>
+                        <span className="sr-only">nothing sent yet</span>
+                      </>
+                    ) : (
+                      signed(entry.mine)
+                    )}
                   </td>
                   <td className="py-1 text-right font-mono tabular-nums text-text-muted">
                     {signed(entry.truth)}

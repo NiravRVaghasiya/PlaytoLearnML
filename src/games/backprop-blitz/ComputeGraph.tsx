@@ -17,6 +17,8 @@ export interface ComputeGraphProps {
   focusedNode: string;
   /** The edge to animate a packet along, or null. */
   packetEdge: EdgeView | null;
+  /** Changes with every choice, so each one remounts the packet and it flies again. */
+  packetKey: string;
   truth: Values;
   showTruth: boolean;
   onSelectNode: (id: string) => void;
@@ -55,6 +57,7 @@ export function ComputeGraph({
   edges,
   focusedNode,
   packetEdge,
+  packetKey,
   truth,
   showTruth,
   onSelectNode,
@@ -82,171 +85,186 @@ export function ComputeGraph({
 
   return (
     <figure className="m-0">
-      <svg
-        viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
-        className="w-full rounded-md border border-border bg-surface-2"
-        role="img"
-        aria-label={description}
+      {/* Never drawn narrower than 640px. The graph is 860 units wide with 8–12px
+          labels, and scaled to a 360px phone those rendered at about 3px — the
+          numbers that are this game's content, unreadable. Below 640 it scrolls
+          sideways instead of shrinking, which is also roughly the scale a small
+          laptop draws it at. Focusable so the scroll is reachable by keyboard. */}
+      <div
+        role="region"
+        aria-label="Computation graph, scrolls sideways on narrow screens"
+        tabIndex={0}
+        className="overflow-x-auto rounded-md focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
       >
-        {/* Edges first, so nodes sit on top of them. */}
-        {edges.map((edge) => {
-          const from = nodeById(edge.from);
-          const to = nodeById(edge.to);
-          const x1 = px(to.x);
-          const y1 = py(to.y);
-          const x2 = px(from.x);
-          const y2 = py(from.y);
-          const midX = (x1 + x2) / 2;
-          const midY = (y1 + y2) / 2;
+        <svg
+          viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
+          className="w-full min-w-[640px] rounded-md border border-border bg-surface-2"
+          role="img"
+          aria-label={description}
+        >
+          {/* Edges first, so nodes sit on top of them. */}
+          {edges.map((edge) => {
+            const from = nodeById(edge.from);
+            const to = nodeById(edge.to);
+            const x1 = px(to.x);
+            const y1 = py(to.y);
+            const x2 = px(from.x);
+            const y2 = py(from.y);
+            const midX = (x1 + x2) / 2;
+            const midY = (y1 + y2) / 2;
 
-          const stroke = !edge.routed
-            ? "var(--border)"
-            : edge.correct
-              ? "var(--correct)"
-              : "var(--wrong)";
+            const stroke = !edge.routed
+              ? "var(--border)"
+              : edge.correct
+                ? "var(--correct)"
+                : "var(--wrong)";
 
-          return (
-            <g key={edge.key}>
-              <line
-                x1={x1}
-                y1={y1}
-                x2={x2}
-                y2={y2}
-                stroke={stroke}
-                strokeWidth={edge.routed ? 2.5 : 1.25}
-                strokeDasharray={edge.routed && !edge.correct ? "5 3" : undefined}
-                opacity={edge.routed ? 0.95 : 0.5}
-              />
-              {edge.routed ? (
-                <>
-                  <rect
-                    x={midX - 24}
-                    y={midY - 9}
-                    width={48}
-                    height={17}
-                    rx={3}
-                    fill="var(--bg)"
-                    stroke={stroke}
-                    strokeWidth={0.75}
-                  />
-                  <text
-                    x={midX}
-                    y={midY + 3}
-                    textAnchor="middle"
-                    className="fill-[var(--text)] text-[9px] font-medium tabular-nums"
-                  >
-                    {edge.correct ? "" : "✗ "}
-                    {edge.mine!.toFixed(2)}
-                  </text>
-                  {showTruth && !edge.correct ? (
+            return (
+              <g key={edge.key}>
+                <line
+                  x1={x1}
+                  y1={y1}
+                  x2={x2}
+                  y2={y2}
+                  stroke={stroke}
+                  strokeWidth={edge.routed ? 2.5 : 1.25}
+                  strokeDasharray={edge.routed && !edge.correct ? "5 3" : undefined}
+                  opacity={edge.routed ? 0.95 : 0.5}
+                />
+                {edge.routed ? (
+                  <>
+                    <rect
+                      x={midX - 24}
+                      y={midY - 9}
+                      width={48}
+                      height={17}
+                      rx={3}
+                      fill="var(--bg)"
+                      stroke={stroke}
+                      strokeWidth={0.75}
+                    />
                     <text
                       x={midX}
-                      y={midY + 18}
+                      y={midY + 3}
                       textAnchor="middle"
-                      className="fill-[var(--correct)] text-[8px] tabular-nums"
+                      className="fill-[var(--text)] text-[9px] font-medium tabular-nums"
                     >
-                      should be {edge.truth.toFixed(2)}
+                      {edge.correct ? "" : "✗ "}
+                      {edge.mine!.toFixed(2)}
                     </text>
-                  ) : null}
-                </>
-              ) : null}
-            </g>
-          );
-        })}
+                    {showTruth && !edge.correct ? (
+                      <text
+                        x={midX}
+                        y={midY + 18}
+                        textAnchor="middle"
+                        className="fill-[var(--correct)] text-[8px] tabular-nums"
+                      >
+                        should be {edge.truth.toFixed(2)}
+                      </text>
+                    ) : null}
+                  </>
+                ) : null}
+              </g>
+            );
+          })}
 
-        {packetEdge !== null && !reducedMotion ? (
-          <GradientPacket
-            from={{
-              x: px(nodeById(packetEdge.from).x),
-              y: py(nodeById(packetEdge.from).y),
-            }}
-            to={{
-              x: px(nodeById(packetEdge.to).x),
-              y: py(nodeById(packetEdge.to).y),
-            }}
-            value={packetEdge.mine ?? 0}
-            correct={packetEdge.correct}
-          />
-        ) : null}
+          {NODES.map((node) => {
+            const isFocus = node.id === focusedNode;
+            const hasGrad = routedNodes.has(node.id);
+            const grad = grads[node.id];
+            const expected = truth[node.id] ?? 0;
+            const wrong =
+              hasGrad && grad !== undefined && Math.abs(grad - expected) > 1e-9;
+            const routable = stepNodes.has(node.id);
 
-        {NODES.map((node) => {
-          const isFocus = node.id === focusedNode;
-          const hasGrad = routedNodes.has(node.id);
-          const grad = grads[node.id];
-          const expected = truth[node.id] ?? 0;
-          const wrong =
-            hasGrad && grad !== undefined && Math.abs(grad - expected) > 1e-9;
-          const routable = stepNodes.has(node.id);
-
-          return (
-            <g key={node.id}>
-              <circle
-                cx={px(node.x)}
-                cy={py(node.y)}
-                r={NODE_R}
-                fill={
-                  node.op === "param"
-                    ? "color-mix(in srgb, var(--class-a) 20%, var(--surface))"
-                    : node.op === "input" || node.op === "target"
-                      ? "var(--surface)"
-                      : "color-mix(in srgb, var(--primary) 14%, var(--surface))"
-                }
-                stroke={
-                  isFocus
-                    ? "var(--primary)"
-                    : wrong
-                      ? "var(--wrong)"
-                      : hasGrad
-                        ? "var(--correct)"
-                        : "var(--border)"
-                }
-                strokeWidth={isFocus ? 3 : hasGrad ? 2 : 1}
-              />
-              <text
-                x={px(node.x)}
-                y={py(node.y) - 2}
-                textAnchor="middle"
-                className="fill-[var(--text)] text-[12px] font-semibold"
-              >
-                {node.label}
-              </text>
-              <text
-                x={px(node.x)}
-                y={py(node.y) + 10}
-                textAnchor="middle"
-                className="fill-[var(--text-muted)] text-[8px] tabular-nums"
-              >
-                {values[node.id]?.toFixed(2) ?? "?"}
-              </text>
-
-              {/* The gradient, under the node. This is the number that matters. */}
-              {hasGrad ? (
-                <text
-                  x={px(node.x)}
-                  y={py(node.y) + NODE_R + 12}
-                  textAnchor="middle"
-                  className={`text-[9px] font-semibold tabular-nums ${
-                    wrong ? "fill-[var(--wrong)]" : "fill-[var(--correct)]"
-                  }`}
-                >
-                  {wrong ? "✗" : "✓"} {grad!.toFixed(2)}
-                </text>
-              ) : null}
-
-              {routable ? (
+            return (
+              <g key={node.id}>
                 <circle
                   cx={px(node.x)}
                   cy={py(node.y)}
-                  r={NODE_R + 4}
-                  fill="transparent"
-                  className="cursor-pointer"
-                  onClick={() => onSelectNode(node.id)}
+                  r={NODE_R}
+                  fill={
+                    node.op === "param"
+                      ? "color-mix(in srgb, var(--class-a) 20%, var(--surface))"
+                      : node.op === "input" || node.op === "target"
+                        ? "var(--surface)"
+                        : "color-mix(in srgb, var(--primary) 14%, var(--surface))"
+                  }
+                  stroke={
+                    isFocus
+                      ? "var(--primary)"
+                      : wrong
+                        ? "var(--wrong)"
+                        : hasGrad
+                          ? "var(--correct)"
+                          : "var(--border)"
+                  }
+                  strokeWidth={isFocus ? 3 : hasGrad ? 2 : 1}
                 />
-              ) : null}
-            </g>
-          );
-        })}
-      </svg>
+                <text
+                  x={px(node.x)}
+                  y={py(node.y) - 2}
+                  textAnchor="middle"
+                  className="fill-[var(--text)] text-[12px] font-semibold"
+                >
+                  {node.label}
+                </text>
+                <text
+                  x={px(node.x)}
+                  y={py(node.y) + 10}
+                  textAnchor="middle"
+                  className="fill-[var(--text-muted)] text-[8px] tabular-nums"
+                >
+                  {values[node.id]?.toFixed(2) ?? "?"}
+                </text>
+
+                {/* The gradient, under the node. This is the number that matters. */}
+                {hasGrad ? (
+                  <text
+                    x={px(node.x)}
+                    y={py(node.y) + NODE_R + 12}
+                    textAnchor="middle"
+                    className={`text-[9px] font-semibold tabular-nums ${
+                      wrong ? "fill-[var(--wrong)]" : "fill-[var(--correct)]"
+                    }`}
+                  >
+                    {wrong ? "✗" : "✓"} {grad!.toFixed(2)}
+                  </text>
+                ) : null}
+
+                {routable ? (
+                  <circle
+                    cx={px(node.x)}
+                    cy={py(node.y)}
+                    r={NODE_R + 4}
+                    fill="transparent"
+                    className="cursor-pointer"
+                    onClick={() => onSelectNode(node.id)}
+                  />
+                ) : null}
+              </g>
+            );
+          })}
+
+          {/* After the nodes, so it is painted over them while it travels. It
+              used to sit underneath, where the node it was heading for hid it. */}
+          {packetEdge !== null && !reducedMotion ? (
+            <GradientPacket
+              key={packetKey}
+              from={{
+                x: px(nodeById(packetEdge.from).x),
+                y: py(nodeById(packetEdge.from).y),
+              }}
+              to={{
+                x: px(nodeById(packetEdge.to).x),
+                y: py(nodeById(packetEdge.to).y),
+              }}
+              value={packetEdge.mine ?? 0}
+              correct={packetEdge.correct}
+            />
+          ) : null}
+        </svg>
+      </div>
 
       <figcaption className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-text-muted">
         <span>
@@ -264,43 +282,51 @@ export function ComputeGraph({
         <span>node shows its forward value; the number below it is its gradient</span>
       </figcaption>
 
-      {/* The graph as a table, because the numbers are the content. */}
-      <table className="sr-only-live">
-        <caption>Every node with its forward value and its gradient</caption>
-        <thead>
-          <tr>
-            <th scope="col">Node</th>
-            <th scope="col">Operation</th>
-            <th scope="col">Value</th>
-            <th scope="col">Your gradient</th>
-            <th scope="col">Autograd</th>
-            <th scope="col">Match</th>
-          </tr>
-        </thead>
-        <tbody>
-          {NODES.map((node) => {
-            const hasGrad = routedNodes.has(node.id);
-            const grad = grads[node.id];
-            const expected = truth[node.id] ?? 0;
-            return (
-              <tr key={node.id}>
-                <th scope="row">{node.label}</th>
-                <td>{node.op}</td>
-                <td>{values[node.id]?.toFixed(3) ?? "unknown"}</td>
-                <td>{hasGrad ? grad!.toFixed(4) : "not routed yet"}</td>
-                <td>{showTruth ? expected.toFixed(4) : "hidden"}</td>
-                <td>
-                  {!hasGrad
-                    ? "—"
-                    : Math.abs(grad! - expected) <= 1e-9
-                      ? "matches"
-                      : "does not match"}
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
+      {/* The graph as a table, because the numbers are the content.
+
+          The clipping lives on a wrapper div, not on the table. A table's used
+          width is at least its min-content width and `overflow` does not apply
+          to table boxes, so `sr-only-live` on the <table> itself left a
+          411px-wide invisible table in the layout — and a phone scrolled
+          sideways to reach nothing. */}
+      <div className="sr-only-live">
+        <table>
+          <caption>Every node with its forward value and its gradient</caption>
+          <thead>
+            <tr>
+              <th scope="col">Node</th>
+              <th scope="col">Operation</th>
+              <th scope="col">Value</th>
+              <th scope="col">Your gradient</th>
+              <th scope="col">Autograd</th>
+              <th scope="col">Match</th>
+            </tr>
+          </thead>
+          <tbody>
+            {NODES.map((node) => {
+              const hasGrad = routedNodes.has(node.id);
+              const grad = grads[node.id];
+              const expected = truth[node.id] ?? 0;
+              return (
+                <tr key={node.id}>
+                  <th scope="row">{node.label}</th>
+                  <td>{node.op}</td>
+                  <td>{values[node.id]?.toFixed(3) ?? "unknown"}</td>
+                  <td>{hasGrad ? grad!.toFixed(4) : "not routed yet"}</td>
+                  <td>{showTruth ? expected.toFixed(4) : "hidden"}</td>
+                  <td>
+                    {!hasGrad
+                      ? "—"
+                      : Math.abs(grad! - expected) <= 1e-9
+                        ? "matches"
+                        : "does not match"}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
     </figure>
   );
 }

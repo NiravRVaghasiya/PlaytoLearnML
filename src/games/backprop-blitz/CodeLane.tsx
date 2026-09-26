@@ -19,7 +19,7 @@ import { createCodeApi } from "./store";
  * 0° from the true gradient and differ only in length.
  */
 
-const STARTER_CODE = `// What does each broken rule actually cost?
+export const STARTER_CODE = `// What does each broken rule actually cost?
 
 const steps = api.steps();
 log('scenario:', api.scenario().title);

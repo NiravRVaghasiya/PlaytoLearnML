@@ -142,6 +142,17 @@ export async function run({ page, check }) {
     (await main.innerText()).match(/Step \d of \d · node \w+/)?.[0] ?? "",
   );
 
+  // The rule tables list the correct rule first, and the view used to render them
+  // in that order — "top radio every time" cleared every scenario. The view now
+  // shuffles per scenario and step, so position says nothing.
+  const firstOption =
+    (await main.locator('input[type="radio"][name="step-0"]').first().getAttribute("id")) ?? "";
+  check(
+    "the right rule is not simply the first option listed",
+    firstOption !== "" && firstOption !== "rule-0-square-2d",
+    firstOption,
+  );
+
   const before = await metricNumber(page);
   await pick(page, /g × 2d/);
   const after = await metricNumber(page);

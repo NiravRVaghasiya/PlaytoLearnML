@@ -15,6 +15,7 @@ import {
   evaluate,
   nodeById,
   replay,
+  roundScore,
   ruleById,
   train,
   type EdgeGrads,
@@ -58,10 +59,34 @@ export interface BlitzState {
   routing: Routing;
   /** Which step the inspector is showing. */
   focused: number;
-  /** Steps the player answered wrongly at least once, for scoring. */
+  /**
+   * Wrong turns: steps the player walked on from with a wrong rule still in
+   * place, this round. Charged by `roundScore`.
+   *
+   * Counted when the inspector LEAVES a step (Next, Back, or clicking another
+   * node), not when a radio is checked. The first version counted every wrong
+   * radio ever checked, which sounds stricter and is wrong twice over: a native
+   * radio group checks each option as the arrow keys pass through it, so it
+   * would have charged keyboard players for moving through the list, and it
+   * charged the thing the game asks for — try a rule, read the tick or cross,
+   * change it. Walking on with a mistake is the wrong turn.
+   */
   fumbled: number[];
   /** Scenario ids cleared this session. */
   clearedIds: string[];
+  /**
+   * Scenario ids whose real trace was revealed before they were cleared. Session
+   * wide, like `clearedIds`, so "Start this scenario again" cannot launder a peek
+   * — the same rule Dimension Diver applies to its PCA hint.
+   */
+  peekedIds: string[];
+  /**
+   * What this round has already sent to progression, so clearing the same round
+   * again (re-choosing a rule, or running the starter snippet, which walks
+   * cleared → broken → cleared a dozen times) records nothing new unless it is
+   * genuinely better, or is the round's first code-lane clear.
+   */
+  recorded: { score: number; code: boolean } | null;
 
   evaluation: Evaluation;
   phase: Phase;
@@ -73,7 +98,12 @@ export interface BlitzState {
 
   setLane: (lane: Lane) => void;
   focusStep: (index: number) => void;
-  choose: (stepIndex: number, ruleId: string) => void;
+  /**
+   * `source` is where the choice came from — the radio buttons, or `api.choose`
+   * — so XP and the code-lane star follow the action rather than whichever tab
+   * happens to be visible.
+   */
+  choose: (stepIndex: number, ruleId: string, source?: Lane) => void;
   clearStep: (stepIndex: number) => void;
   toggleTruth: () => void;
   nextScenario: () => void;
@@ -146,49 +176,81 @@ function freshRound(scenarioIndex: number) {
     phase: "routing" as Phase,
     failure: null,
     showTruth: false,
+    recorded: null,
   };
+}
+
+// The recorded score lives in ml.ts, beside `evaluate`, so the why-cards can
+// quote its real price without importing the store that imports them.
+export { PEEK_FACTOR, WRONG_TURN_COST, roundScore } from "./ml";
+
+/** `fumbled` plus `stepIndex`, if the rule standing there is a wrong one. */
+function withWrongTurn(state: BlitzState, stepIndex: number): number[] {
+  const chosen = state.routing[stepIndex];
+  const rule = chosen === undefined ? undefined : ruleById(chosen);
+  if (rule === undefined || rule.correct || state.fumbled.includes(stepIndex)) {
+    return state.fumbled;
+  }
+  return [...state.fumbled, stepIndex];
 }
 
 export const useBlitzStore = create<BlitzState>((set, get) => ({
   ...freshRound(0),
   clearedIds: [],
+  peekedIds: [],
   whyCard: whyCardFor({ kind: "briefing", scenario: SCENARIOS[0]! }),
   lane: "visual" as Lane,
 
   setLane: (lane) => set({ lane }),
 
-  focusStep: (index) =>
-    set({ focused: clamp(Math.round(index), 0, STEP_COUNT - 1) }),
+  focusStep: (index) => {
+    if (!Number.isFinite(index)) return;
+    const state = get();
+    const next = clamp(Math.round(index), 0, STEP_COUNT - 1);
+    if (next === state.focused) return;
+    // Leaving a step is committing to it: a wrong rule still standing is a
+    // wrong turn. See `fumbled`.
+    set({ focused: next, fumbled: withWrongTurn(state, state.focused) });
+  },
 
   toggleTruth: () => {
-    const next = !get().showTruth;
+    const state = get();
+    const next = !state.showTruth;
+    const current = scenario(state);
     set({
       showTruth: next,
+      // Revealing after the clear is reading the answer, not using it.
+      peekedIds:
+        next && state.phase !== "cleared" && !state.peekedIds.includes(current.id)
+          ? [...state.peekedIds, current.id]
+          : state.peekedIds,
       whyCard: next
         ? whyCardFor({ kind: "revealed" })
-        : get().whyCard,
+        : state.whyCard,
     });
   },
 
-  choose: (stepIndex, ruleId) => {
+  choose: (stepIndex, ruleId, source = "visual") => {
     const state = get();
     const step = STEPS[stepIndex];
     const rule = ruleById(ruleId);
     if (step === undefined || rule === undefined) return;
     if (!step.options.some((option) => option.id === ruleId)) return;
+    // Choosing what is already chosen changes nothing, so it records nothing —
+    // with one exception. A snippet that re-asserts a routing the buttons already
+    // cleared has cleared it from the code lane, and returning here would drop the
+    // round's first code-lane clear (the third star) without a word. It falls
+    // through once, re-evaluates to the same score, and is recorded as code.
+    const firstCodeClear =
+      source === "code" &&
+      state.phase === "cleared" &&
+      state.recorded !== null &&
+      !state.recorded.code;
+    if (state.routing[stepIndex] === ruleId && !firstCodeClear) return;
 
     const routing: Routing = { ...state.routing, [stepIndex]: ruleId };
     const leaves = scenario(state).leaves;
     const evaluation = evaluate({ leaves, routing });
-
-    // A step is "fumbled" the first time a wrong rule is committed to it. Recorded
-    // rather than inferred from the final routing, because the score is about the
-    // walk the player actually took, not the state they ended up in — fixing a
-    // mistake is exactly what should happen and it should still have cost something.
-    const fumbled =
-      !rule.correct && !state.fumbled.includes(stepIndex)
-        ? [...state.fumbled, stepIndex]
-        : state.fumbled;
 
     const cleared = evaluation.outcome === "cleared";
     const broken = evaluation.outcome === "broken";
@@ -202,16 +264,38 @@ export const useBlitzStore = create<BlitzState>((set, get) => ({
     // reference. Moving the panel away is moving the answer away. It also meant the
     // radio never settled into a checked state, which is confusing with a keyboard
     // and outright broken for a screen reader.
+    const clearedIds =
+      cleared && !state.clearedIds.includes(current.id)
+        ? [...state.clearedIds, current.id]
+        : state.clearedIds;
+
+    // What this clear is worth, and whether progression has already heard it.
+    const isCode = source === "code";
+    const score = cleared
+      ? roundScore({
+          routingScore: evaluation.score,
+          wrongTurns: state.fumbled.length,
+          peeked: state.peekedIds.includes(current.id),
+          clearedCount: clearedIds.length,
+        })
+      : 0;
+    const previous = state.recorded;
+    const worthRecording =
+      cleared &&
+      (previous === null || score > previous.score || (isCode && !previous.code));
+
     set({
       routing,
-      fumbled,
       evaluation,
       phase: cleared ? "cleared" : broken ? "broken" : "routing",
       failure: evaluation.failure,
-      clearedIds:
-        cleared && !state.clearedIds.includes(current.id)
-          ? [...state.clearedIds, current.id]
-          : state.clearedIds,
+      clearedIds,
+      recorded: worthRecording
+        ? {
+            score: Math.max(score, previous?.score ?? 0),
+            code: (previous?.code ?? false) || isCode,
+          }
+        : previous,
       whyCard: whyCardFor({
         kind: "chose",
         step,
@@ -220,26 +304,17 @@ export const useBlitzStore = create<BlitzState>((set, get) => ({
         evaluation,
         scenario: current,
         leaves,
+        routing,
       }),
     });
 
-    if (cleared) {
-      const clearedCount =
-        state.clearedIds.includes(current.id)
-          ? state.clearedIds.length
-          : state.clearedIds.length + 1;
+    if (worthRecording) {
       useProgression.getState().recordResult({
         slug: SLUG,
-        // Clearing every scenario is worth more than clearing one, so the score
-        // carries the campaign as well as the round.
-        score: clamp(
-          evaluation.score * (0.7 + 0.3 * (clearedCount / SCENARIOS.length)),
-          0,
-          1,
-        ),
-        lane: state.lane,
+        score,
+        lane: source,
         completed: true,
-        codeLaneCleared: state.lane === "code",
+        codeLaneCleared: isCode,
       });
     }
   },
@@ -338,10 +413,12 @@ export function createCodeApi(): BlitzCodeApi {
 
   return {
     choose: (stepIndex, ruleId) => {
-      const step = STEPS[stepIndex];
+      // `STEPS["2"]` and `STEPS[1.5]` are both things JavaScript will happily
+      // index, so the step has to be an actual integer before it is looked up.
+      const step = Number.isInteger(stepIndex) ? STEPS[stepIndex] : undefined;
       if (step === undefined) {
         throw new Error(
-          `No step ${stepIndex}. There are ${STEP_COUNT}, numbered 0 to ${
+          `No step ${String(stepIndex)}. There are ${STEP_COUNT}, numbered 0 to ${
             STEP_COUNT - 1
           }.`,
         );
@@ -350,19 +427,26 @@ export function createCodeApi(): BlitzCodeApi {
         throw new Error(
           `Step ${stepIndex} (${
             nodeById(step.nodeId).label
-          }) does not offer "${ruleId}". Options: ${step.options
+          }) does not offer "${String(ruleId)}". Options: ${step.options
             .map((option) => option.id)
             .join(", ")}.`,
         );
       }
-      store.getState().choose(stepIndex, ruleId);
+      store.getState().choose(stepIndex, ruleId, "code");
     },
 
     chooseAll: (ruleId) => {
+      if (ruleById(ruleId) === undefined) {
+        throw new Error(
+          `No rule "${String(ruleId)}". Rules: ${[
+            ...new Set(STEPS.flatMap((step) => step.options.map((option) => option.id))),
+          ].join(", ")}.`,
+        );
+      }
       let applied = 0;
       STEPS.forEach((step, index) => {
         if (step.options.some((option) => option.id === ruleId)) {
-          store.getState().choose(index, ruleId);
+          store.getState().choose(index, ruleId, "code");
           applied += 1;
         }
       });

@@ -2,6 +2,7 @@
 
 import { useMemo } from "react";
 import {
+  SCENARIOS,
   STEPS,
   autograd,
   consumersOf,
@@ -49,12 +50,22 @@ export function VisualLane() {
   const step = STEPS[focused]!;
   const chosen = routing[focused] ?? null;
 
-  /** Contributions waiting at a fan-out node, in consumer order. */
+  /**
+   * Contributions waiting at a fan-out node, in the order they ARRIVE — which is
+   * the walk order of the consumers, s before v. Listed in graph order they read
+   * "v, s", and "keep the first to arrive" then silently kept the second one on
+   * screen. An unrouted consumer shows as not routed rather than as a 0.
+   */
   const pending = useMemo(() => {
     if (step.kind !== "accumulate") return [];
-    return consumersOf(step.nodeId).map(
-      (consumer) => mine.edges[edgeKey(consumer, step.nodeId)] ?? 0,
-    );
+    const walkIndex = (id: string) =>
+      STEPS.findIndex((candidate) => candidate.kind === "route" && candidate.nodeId === id);
+    return consumersOf(step.nodeId)
+      .sort((a, b) => walkIndex(a) - walkIndex(b))
+      .map((consumer) => ({
+        from: consumer,
+        value: mine.edges[edgeKey(consumer, step.nodeId)] ?? null,
+      }));
   }, [step, mine.edges]);
 
   const incoming = useMemo(() => {
@@ -93,12 +104,17 @@ export function VisualLane() {
     });
   }, [chosen, step, mine, truth]);
 
-  /** Animate a packet along the edge the last routing produced. */
+  /**
+   * Animate a packet along the edge the last routing produced — if it produced
+   * one. A rule chosen at a node whose own gradient has not arrived sends
+   * nothing, and a packet there would fly a red "0.0" nobody computed.
+   */
   const packetEdge = useMemo(() => {
     if (chosen === null || step.kind !== "route") return null;
     const first = nodeById(step.nodeId).inputs[0];
     if (first === undefined) return null;
-    return edges.find((edge) => edge.key === edgeKey(step.nodeId, first)) ?? null;
+    const edge = edges.find((candidate) => candidate.key === edgeKey(step.nodeId, first));
+    return edge !== undefined && edge.routed ? edge : null;
   }, [chosen, step, edges]);
 
   return (
@@ -108,7 +124,7 @@ export function VisualLane() {
           <h2 className="text-sm font-semibold">
             {current.title}
             <span className="ml-2 font-normal text-text-muted">
-              scenario {scenarioIndex + 1} of 3
+              scenario {scenarioIndex + 1} of {SCENARIOS.length}
             </span>
           </h2>
           <span className="text-xs text-text-muted">
@@ -122,6 +138,7 @@ export function VisualLane() {
           edges={edges}
           focusedNode={step.nodeId}
           packetEdge={packetEdge}
+          packetKey={`${current.id}-${focused}-${chosen ?? ""}`}
           truth={truth.grads}
           showTruth={showTruth}
           onSelectNode={(id) => {
@@ -141,6 +158,7 @@ export function VisualLane() {
         <NodeInspector
           step={step}
           stepIndex={focused}
+          scenarioId={current.id}
           chosen={chosen}
           values={mine.values}
           incoming={incoming}
