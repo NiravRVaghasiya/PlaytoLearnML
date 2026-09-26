@@ -408,6 +408,8 @@ Build the top-right quadrant first (high impact, low effort).
 
 ## 5. Technical Architecture
 
+> As built, the 2D libraries and the backend differ from this table. See §9.1.
+
 | Layer | Choice | Why |
 |---|---|---|
 | **Framework** | React (Next.js for SEO/blog) | Component reuse across 14 games |
@@ -432,6 +434,8 @@ Build the top-right quadrant first (high impact, low effort).
 ---
 
 ## 6. Website Structure & Navigation
+
+> As built: the roster, the games and the Concept Library exist; the rest of this map does not yet. See §9.1.
 
 ```
 🏠 Home / "The ML Continent" (visual skill-tree map)
@@ -483,6 +487,52 @@ Build the top-right quadrant first (high impact, low effort).
 5. **Content partnerships** — co-branded modules; affiliate hand-off to deeper courses.
 
 **Inspiration benchmarks:** Teachable Machine (onboarding), TensorFlow Playground (NN intuition), GAN Lab (adversarial viz), Brilliant.org (interactive-first + freemium), Kaggle Learn (dataset-driven progression).
+
+---
+
+## 9. As Built — Where the Implementation Deliberately Differs
+
+This section records where the shipped build departs from the sections above.
+Every entry below is also justified in a comment at the point in the code named.
+The game entries in §2 stay the statement of *what* each game teaches, and none of
+these departures changes a game's concept or core intuition. Where the two
+disagree on *how*, trust this section and the code comment it cites.
+
+### 9.1 Platform (§4, §5, §6, §8)
+
+| Spec says | As built |
+|---|---|
+| §5 Data viz: D3 + Highcharts; creative canvas: p5.js; game engine: Phaser.js | Every 2D view is **SVG**, with D3 for scales and shapes. None of Highcharts, p5.js or Phaser was ever imported, and all three have been removed from `package.json`. The rule is *when the numbers are the content, use SVG*: an SVG figure is in the accessibility tree, and a canvas would have to be rebuilt a second time for screen readers (CLAUDE.md, "Tech stack"). Three.js is used for Gradient Descent Skier and Dimension Diver, and React Flow for Neuron Forge and Decision Tree Architect. |
+| §5 Python-in-browser for the code lane | Pyodide is self-hosted under `/pyodide/` (`scripts/setup-pyodide.mjs`), and only Feature Forge's code lane is Python, with pandas. The other thirteen code lanes are JavaScript. |
+| §5 Backend: Supabase/Firebase for auth, XP and leaderboards; `progression` service (Supabase) | There is **no backend**. Progression is per-browser localStorage, with cross-tab merge (`src/engine/progression.ts`). A Supabase adapter exists and is tested, but nothing calls it, because there is no sign-in flow. There are no leaderboards. |
+| §4 Skill-tree map; completing a game unlocks adjacent territories. §6 Play: games grouped by category, with lock/unlock states | The home page is a roster **grouped by category** (`src/app/page.tsx`), not a map. **Every game is open.** The `requires` graph exists in `src/lib/catalog.ts`, and `isUnlocked()` implements it, but nothing gates on it; the home page tells players to play in any order. |
+| §4 Mastery stars, XP and levels, concept badges shareable to LinkedIn | Stars, XP and levels are built as specified (★2 at a normalised score of 0.8; ★3 for a clear made through the code lane's api). A concept badge is earned at ★2 and shown in that game's footer, but badges can't be shared. |
+| §4 Unlockables: real datasets (Titanic, MNIST, Iris), harder scenarios, cosmetic lab themes | Not built. Every game generates its data in code from a fixed seed; `public/datasets/` is empty. |
+| §6 My Lab, Leaderboards, Classrooms, Sandbox | Not built. The Concept Library (`/concepts`, eight explainers) is built. 11 of the 14 games link into it from their WhyCards; Agent Academy, Confusion Matrix Chef and Dimension Diver have no concept page yet. |
+| §6 First-run flow: auto-start Gradient Descent Skier, then prompt to sign up | Nothing auto-starts. The home page's **"Start here"** goes to **Sort-It Arcade**: Beginner and Easy, no prerequisites, first in the §7 Phase-1 build order, and the root of most of the `requires` graph (`START_SLUG`, pinned by `catalog.test.ts`). There is no signup. |
+| §8 Freemium tiers | Not built. All 14 games and both lanes are free and open. |
+
+### 9.2 Per game
+
+Paths are relative to `src/games/`.
+
+| Game | Spec says | As built | Justified in |
+|---|---|---|---|
+| Data Detox | "Small decision tree in TF.js" | A small dense TF.js classifier. TensorFlow.js has no decision-tree learner, and trees are Decision Tree Architect's lesson. | `data-detox/ml.ts` header |
+| Data Detox | Score = accuracy − time penalty; `timeElapsed` | The penalty is small and capped (at most 0.04), and `timeElapsed` counts only time with the game on screen: the clock pauses while the tab is hidden or the player is reading a Concept Library page a WhyCard linked to. Reading the explanations is never charged. | `data-detox/ml.ts` (`MAX_TIME_PENALTY`), `data-detox/store.ts` (`useAttemptClock`) |
+| Feature Forge | "Legendary" combos "give bonus multipliers" | Each legendary combo **adds** 0.05 to the normalised score, capped at 0.2, and only once the lift has cleared `TARGET_LIFT` (6 points). Added rather than multiplied, so it reads straight off the score and can raise a winning forge but never turn a short one into a win. | `feature-forge/ml.ts` (`evaluateForge`) |
+| Sort-It Arcade | `GameState { points[] … }` | Points are split into a training set and a held-out set, and held-out accuracy stays hidden until the player checks. A named "you overfit" needs numbers from points the player never fitted. | `sort-it-arcade/store.ts` header |
+| Decision Tree Architect | "TF.js decision-forest for reference scoring" | A greedy CART reference written out in TypeScript, sharing `giniOf` / `bestSplitOn` with the player's tree. No TF.js tree learner runs in the browser. | `decision-tree-architect/ml.ts` header |
+| Confusion Matrix Chef | Highcharts/D3 | D3 and SVG for the ROC curve. | `confusion-matrix-chef/RocCurve.tsx` |
+| Neuron Forge | Win = "loss below threshold"; puzzles linear → circle → spiral → XOR | Win = **held-out accuracy** at or above each puzzle's target (linear 94%, circle 85%, XOR 84%, spiral 82%), under the neuron budget. A loss threshold would reward memorising the flipped labels. The order is linear → circle → **XOR → spiral**, so difficulty climbs monotonically. | `neuron-forge/index.tsx` (metric docblock), `neuron-forge/ml.ts` (`PATTERNS`) |
+| Neuron Forge | One failure mode, "Insufficient capacity" (`catalog.ts`) | Checked most-specific first: No non-linearity; then a measured collapse (Dying ReLU, Saturated activations, Training collapsed); then **Optimisation failure**, for a network that did not collapse and contains the puzzle's minimal solution but still missed; and only then Insufficient capacity. Each points at a different control, and calling a network that already holds the answer under-capacity would send the player to add neurons. | `neuron-forge/ml.ts` (header, `evaluate`) |
+| Backprop Blitz | `<ComputeGraph>` in p5.js/WebGL; `Edge { from, to, weight }` | SVG graph. Weights are graph nodes rather than edge attributes, because the lesson is that a weight *receives* a gradient. | `backprop-blitz/ml.ts` header |
+| Convolution Kitchen | Optional webcam; `Kernel { weights, stride, padding }` | No webcam. Stride is fixed at 1 and padding at "valid", and both are explained in the Math drawer instead. Layer 2 is depthwise, so it stays hand-designable. | `convolution-kitchen/ml.ts` header |
+| Gradient Descent Skier | "Reach the global minimum before the timer"; a 3D landscape | A **step budget** (120 gradient steps) replaces the wall-clock timer, so the game is not a reaction test. The 3D terrain has a fixed camera, and an equal top-down contour view takes over without WebGL. | `gradient-descent-skier/store.ts` (`stepsRemaining`), `LossTerrain.tsx` header |
+| Overfit Tower Defense | `<GameCanvas>` (Phaser) | SVG battlefield. | `overfit-tower-defense/Battlefield.tsx` |
+| Hyperparameter Heist | "Real objective surface in TF.js" | A closed-form surrogate surface, so "random beats grid" can be verified over hundreds of runs, and a Gaussian process with Expected Improvement written in plain arithmetic. | `hyperparameter-heist/ml.ts` header |
+| Dimension Diver | Rotate the cloud; "PCA / t-SNE / UMAP intuition" | Rotation is driven by yaw/pitch/roll **sliders**, not dragging, so it is keyboard-operable. The projection basis is derived from the angles. There is no t-SNE or UMAP; the third cloud shows where linear projection runs out. | `dimension-diver/ml.ts` header |
+| Agent Academy | "Tabular Q-learning (or DQN) in TF.js"; `<GridWorld>` (Phaser); cheese reward "near a trap" | Tabular Q-learning in plain TypeScript (no TF.js), drawn in SVG. The grid is deterministic. Reward hacking comes from a punishing step cost with the trap two steps from the start, because a trap beside the cheese costs nothing in a deterministic grid. | `agent-academy/ml.ts` header |
 
 ---
 
