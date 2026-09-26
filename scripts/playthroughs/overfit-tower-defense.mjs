@@ -124,12 +124,13 @@ export async function run({ page, check, metricText }) {
     /Bias/.test(await page.locator("body").innerText()),
   );
   // The announcement is debounced (~600ms), so poll for it rather than reading
-  // once and racing the timer.
+  // once and racing the timer. Any polite region, not only the first: the shell
+  // may announce the why-card headline in a region of its own.
   const announced = await page
     .waitForFunction(
       () =>
-        /gap/i.test(
-          document.querySelector('[aria-live="polite"]')?.textContent ?? "",
+        [...document.querySelectorAll('[aria-live="polite"]')].some((region) =>
+          /gap/i.test(region.textContent ?? ""),
         ),
       null,
       { timeout: 10000 },
@@ -142,11 +143,64 @@ export async function run({ page, check, metricText }) {
     (await page.locator('[aria-live="polite"]').first().innerText()).slice(0, 60),
   );
 
+  // ── Retry during a deployment must not let the old fit resolve the new run ──
+  console.log("\nRetry mid-training");
+  await page.getByRole("button", { name: /Deploy against wave 1/ }).click();
+  const stop = page.getByRole("button", { name: "Stop training" });
+  await stop
+    .waitFor({ state: "visible", timeout: 25000 })
+    .catch(() => {});
+  // Read immediately before the click: if the fit has already finished, a
+  // Retry now only restarts a resolved run, and the check below would pass
+  // without the race it exists for ever happening.
+  const retriedMidFit = await stop.isVisible();
+  await page.getByRole("button", { name: "Retry", exact: true }).click();
+  check(
+    "Retry was pressed while the deployment was still training",
+    retriedMidFit,
+    retriedMidFit ? "" : "training finished before Retry could be pressed",
+  );
+  // Give the abandoned fit time to wind down and try to land.
+  await page
+    .getByRole("button", { name: /Deploy against wave 1/ })
+    .waitFor({ state: "visible", timeout: 60000 });
+  await page.waitForTimeout(3000);
+  check(
+    "the stale fit did not clear the fresh run's wave 1",
+    retriedMidFit &&
+      (await page.getByRole("button", { name: /Send wave 2/ }).count()) === 0 &&
+      (await core.getAttribute("aria-valuenow")) === "100" &&
+      (await page.getByRole("button", { name: /Deploy against wave 1/ }).isVisible()),
+    `core aria-valuenow=${await core.getAttribute("aria-valuenow")}`,
+  );
+
   // ── the code lane: the sweep that shows the U-shape ──
   console.log("\nCode lane: a real regularization sweep");
   await page.getByRole("radio", { name: /code/i }).click();
   const editor = page.getByLabel("Defence script");
   check("code lane editor present", await editor.isVisible());
+
+  // A wave counts once. A second deploy, or a trial after the resolve, used to
+  // re-open it so it could be counted again.
+  await editor.fill(
+    [
+      "api.restart();",
+      "api.setComplexity(8); api.setTowers({ l1: 0, l2: 1, dropout: 0 });",
+      "await api.deploy();",
+      "const hp = Math.round(api.coreHp());",
+      "let refused = false;",
+      "try { await api.deploy(); } catch (e) { refused = true; }",
+      "await api.trial();",
+      "log('ONCE', refused, api.phase(), hp === Math.round(api.coreHp()));",
+    ].join("\n"),
+  );
+  await page.getByRole("button", { name: "Run", exact: true }).click();
+  await outputRegion.getByText(/ONCE/).waitFor({ timeout: 300000 });
+  check(
+    "a resolved wave cannot be deployed again, even after a trial",
+    /ONCE true resolved true/.test(await outputRegion.innerText()),
+    (await outputRegion.innerText()).split("\n").find((l) => l.startsWith("ONCE")) ?? "",
+  );
 
   // Jump to the famine wave, where regularization has the most to prove.
   await editor.fill(

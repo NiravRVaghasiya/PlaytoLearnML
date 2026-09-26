@@ -11,6 +11,7 @@ import {
   MAX_COMPLEXITY,
   MAX_TOWERS_PER_TYPE,
   MIN_COMPLEXITY,
+  TOWER_TYPES,
   WAVES,
   evaluateRun,
   generateDataset,
@@ -25,7 +26,7 @@ import {
   type Wave,
   type WaveResult,
 } from "./ml";
-import { whyCardFor } from "./why-cards";
+import { whyCardFor, type DefenseEvent, type WaveRecord } from "./why-cards";
 
 export const SLUG = "overfit-tower-defense";
 
@@ -79,6 +80,30 @@ export interface TowerDefenseState {
   whyCard: WhyCardContent | null;
   lane: Lane;
 
+  /**
+   * Which training run is current. Bumped by `beginTraining` and by `restart`,
+   * and handed back by the trainer when a fit resolves, so a fit that was
+   * running when the player pressed Retry can never resolve the fresh run's
+   * wave. Before this, it did: the stale fit finished, `resolveWave` applied its
+   * numbers to the new run, and wave 1 cleared itself.
+   */
+  attempt: number;
+  /**
+   * The phase a training run started from, restored when it ends. A trial
+   * started after a wave resolved must leave the wave resolved — it used to drop
+   * the run back to "tuning", which re-opened the wave to a second Deploy and
+   * counted it twice.
+   */
+  phaseBeforeTraining: Phase;
+  /** Every wave resolved in this run, for the victory card. */
+  history: WaveRecord[];
+  /**
+   * True while every wave of this run was deployed by `api.deploy()`. Mastery's
+   * third star is "clear a run from the code lane", so it is earned by the path
+   * that did the work, not by which tab was open when the rail's button was hit.
+   */
+  runFromCode: boolean;
+
   // ── actions ──────────────────────────────────────────────────────────
   setLane: (lane: Lane) => void;
   /** The bias-variance knob (spec: `<ComplexitySlider>`). */
@@ -90,8 +115,10 @@ export interface TowerDefenseState {
   /** Set every tower count at once — the code lane's entry point. */
   setTowers: (counts: Partial<Record<TowerType, number>>) => void;
 
-  beginTraining: () => void;
-  recordProgress: (sample: ProgressSample) => void;
+  /** Returns the run's `attempt` token, for the calls that end it. */
+  beginTraining: () => number;
+  /** A live sample. Dropped unless `attempt` is the run that is training. */
+  recordProgress: (sample: ProgressSample, attempt?: number) => void;
   /**
    * Record a measurement WITHOUT resolving the wave.
    *
@@ -100,18 +127,35 @@ export interface TowerDefenseState {
    * and if every trial cost the core its health the game would punish exactly the
    * habit it wants to teach.
    */
-  finishTrial: (measured: {
-    trainAccuracy: number;
-    validationAccuracy: number;
-  }) => void;
-  /** Resolve the wave against the trained model. */
-  resolveWave: (measured: {
-    trainAccuracy: number;
-    validationAccuracy: number;
-  }) => WaveResult;
+  finishTrial: (measured: Measured, attempt?: number) => void;
+  /**
+   * Resolve the wave against the trained model.
+   *
+   * Only an open wave resolves: null — and no change — when the wave has already
+   * resolved, the run is over, or `attempt` names a superseded run. That makes a
+   * second Deploy, or the starter snippet run twice, unable to count a wave twice.
+   */
+  resolveWave: (
+    measured: Measured,
+    attempt?: number,
+    options?: { fromCode?: boolean },
+  ) => WaveResult | null;
+  /**
+   * The fit did not finish — the player stopped it, or it failed (`failed`).
+   * Nothing is scored and the phase is restored either way; the card says which.
+   */
+  abortTraining: (
+    attempt: number,
+    ended: { epochsRun: number; deploy: boolean; failed?: boolean },
+  ) => void;
   nextWave: () => void;
   /** Start the run over, keeping the current tuning. */
   restart: () => void;
+}
+
+export interface Measured {
+  trainAccuracy: number;
+  validationAccuracy: number;
 }
 
 // ── selectors: primitives and stable references only ─────────────────────
@@ -148,6 +192,42 @@ export function towerCount(state: TowerDefenseState, type: TowerType): number {
  * array reference, and memoise this themselves.
  */
 
+function countsOf(towers: Tower[]): Record<TowerType, number> {
+  const count = (type: TowerType) =>
+    towers.find((tower) => tower.type === type)?.strength ?? 0;
+  return { l1: count("l1"), l2: count("l2"), dropout: count("dropout") };
+}
+
+/**
+ * The why-card for a bulk tower change, from what actually changed.
+ *
+ * `setTowers({ l1: 3 })` used to announce "L2 tower 0 deployed" with L2's
+ * mechanism, whatever the script had set.
+ */
+function towerChangeEvent(
+  before: Tower[],
+  after: Tower[],
+  wave: Wave,
+): DefenseEvent {
+  const from = countsOf(before);
+  const to = countsOf(after);
+  const regularization = regularizationOf(after);
+  if (totalTowers(after) === 0) return { kind: "towers-cleared", wave };
+
+  const changed = TOWER_TYPES.filter((type) => from[type] !== to[type]);
+  const [only] = changed;
+  if (changed.length === 1 && only !== undefined) {
+    return {
+      kind: to[only] > from[only] ? "tower-added" : "tower-removed",
+      type: only,
+      count: to[only],
+      regularization,
+      wave,
+    };
+  }
+  return { kind: "towers-set", counts: to, regularization, wave };
+}
+
 function withTowerCount(
   towers: Tower[],
   type: TowerType,
@@ -175,6 +255,7 @@ function freshRun(complexity: number, towers: Tower[]) {
   return {
     wave: 1,
     phase: "tuning" as Phase,
+    phaseBeforeTraining: "tuning" as Phase,
     coreHp: CORE_MAX_HP,
     wavesCleared: 0,
     modelComplexity: complexity,
@@ -183,6 +264,8 @@ function freshRun(complexity: number, towers: Tower[]) {
     ...untrained(),
     lastEvaluation: null,
     failure: null,
+    history: [] as WaveRecord[],
+    runFromCode: true,
   };
 }
 
@@ -190,6 +273,7 @@ export const useTowerDefenseStore = create<TowerDefenseState>((set, get) => ({
   ...freshRun(DEFAULT_COMPLEXITY, []),
   whyCard: whyCardFor({ kind: "run-start", wave: waveAt(1) }),
   lane: "visual" as Lane,
+  attempt: 0,
 
   setLane: (lane) => set({ lane }),
 
@@ -202,7 +286,10 @@ export const useTowerDefenseStore = create<TowerDefenseState>((set, get) => ({
     set({
       modelComplexity: next,
       ...untrained(),
-      phase: state.phase === "resolved" ? "resolved" : "tuning",
+      // The phase is left alone. Retuning after a wave resolves, or after the
+      // run ends, must not re-open a wave that has already been fought: moving
+      // the slider on the victory screen used to hand back a Deploy button for
+      // wave 5, and a sixth "cleared" wave.
       whyCard: whyCardFor({
         kind: "complexity-changed",
         complexity: next,
@@ -283,20 +370,17 @@ export const useTowerDefenseStore = create<TowerDefenseState>((set, get) => ({
     set({
       towers,
       ...untrained(),
-      whyCard: whyCardFor({
-        kind: totalTowers(towers) === 0 ? "towers-cleared" : "tower-added",
-        type: "l2",
-        count: towerCount({ ...state, towers }, "l2"),
-        regularization: regularizationOf(towers),
-        wave: waveAt(state.wave),
-      }),
+      whyCard: whyCardFor(
+        towerChangeEvent(state.towers, towers, waveAt(state.wave)),
+      ),
     });
   },
 
-  finishTrial: ({ trainAccuracy, validationAccuracy }) => {
+  finishTrial: ({ trainAccuracy, validationAccuracy }, attempt) => {
     const state = get();
+    if (attempt !== undefined && attempt !== state.attempt) return;
     set({
-      phase: "tuning",
+      phase: state.phase === "training" ? state.phaseBeforeTraining : state.phase,
       trainAccuracy,
       validationAccuracy,
       whyCard: whyCardFor({
@@ -311,7 +395,12 @@ export const useTowerDefenseStore = create<TowerDefenseState>((set, get) => ({
 
   beginTraining: () => {
     const state = get();
+    const attempt = state.attempt + 1;
     set({
+      attempt,
+      // A second beginTraining while one is in flight keeps the original phase.
+      phaseBeforeTraining:
+        state.phase === "training" ? state.phaseBeforeTraining : state.phase,
       phase: "training",
       ...untrained(),
       whyCard: whyCardFor({
@@ -321,9 +410,13 @@ export const useTowerDefenseStore = create<TowerDefenseState>((set, get) => ({
         regularization: regularizationOf(state.towers),
       }),
     });
+    return attempt;
   },
 
-  recordProgress: (sample) => {
+  recordProgress: (sample, attempt) => {
+    const current = get();
+    if (current.phase !== "training") return;
+    if (attempt !== undefined && attempt !== current.attempt) return;
     set((state) => ({
       epoch: sample.epoch,
       progress: [...state.progress, sample],
@@ -333,9 +426,34 @@ export const useTowerDefenseStore = create<TowerDefenseState>((set, get) => ({
     }));
   },
 
-  resolveWave: ({ trainAccuracy, validationAccuracy }) => {
+  abortTraining: (attempt, { epochsRun, deploy, failed = false }) => {
     const state = get();
+    if (attempt !== state.attempt || state.phase !== "training") return;
     const wave = waveAt(state.wave);
+    set({
+      phase: state.phaseBeforeTraining,
+      // The live samples were from a half-trained model. Leaving them on the
+      // meters would present them as a measurement of this configuration.
+      ...untrained(),
+      whyCard: whyCardFor(
+        failed
+          ? { kind: "fit-failed", wave, deploy }
+          : { kind: "stopped", wave, epochsRun, deploy },
+      ),
+    });
+  },
+
+  resolveWave: ({ trainAccuracy, validationAccuracy }, attempt, options) => {
+    const state = get();
+    if (attempt !== undefined && attempt !== state.attempt) return null;
+    const open =
+      state.phase === "training"
+        ? state.phaseBeforeTraining === "tuning"
+        : state.phase === "tuning";
+    if (!open) return null;
+
+    const wave = waveAt(state.wave);
+    const fromCode = options?.fromCode === true;
 
     const result = scoreWave({
       wave,
@@ -348,8 +466,22 @@ export const useTowerDefenseStore = create<TowerDefenseState>((set, get) => ({
     const coreHp = Math.max(0, state.coreHp - result.damage);
     const destroyed = coreHp <= 0;
     const lastWave = state.wave >= WAVES.length;
-    const wavesCleared = destroyed ? state.wavesCleared : state.wavesCleared + 1;
+    const wavesCleared = destroyed
+      ? state.wavesCleared
+      : Math.min(WAVES.length, state.wavesCleared + 1);
     const finished = !destroyed && lastWave;
+    const runFromCode = state.runFromCode && fromCode;
+    const history: WaveRecord[] = [
+      ...state.history,
+      {
+        wave: wave.index,
+        damage: result.damage,
+        overfitDamage: result.overfitDamage,
+        underfitDamage: result.underfitDamage,
+        complexity: state.modelComplexity,
+        towers: countsOf(state.towers),
+      },
+    ];
 
     const evaluation = evaluateRun({
       result,
@@ -368,6 +500,9 @@ export const useTowerDefenseStore = create<TowerDefenseState>((set, get) => ({
       coreHp,
       wavesCleared,
       phase,
+      phaseBeforeTraining: phase,
+      history,
+      runFromCode,
       lastResult: result,
       lastEvaluation: evaluation,
       failure: evaluation.failure,
@@ -380,6 +515,7 @@ export const useTowerDefenseStore = create<TowerDefenseState>((set, get) => ({
         finished,
         regularization: regularizationOf(state.towers),
         complexity: state.modelComplexity,
+        history,
       }),
     });
 
@@ -387,9 +523,9 @@ export const useTowerDefenseStore = create<TowerDefenseState>((set, get) => ({
       useProgression.getState().recordResult({
         slug: SLUG,
         score: evaluation.score,
-        lane: state.lane,
+        lane: runFromCode ? "code" : "visual",
         completed: true,
-        codeLaneCleared: state.lane === "code",
+        codeLaneCleared: runFromCode,
       });
     }
 
@@ -403,6 +539,7 @@ export const useTowerDefenseStore = create<TowerDefenseState>((set, get) => ({
     set({
       wave: wave.index,
       phase: "tuning",
+      phaseBeforeTraining: "tuning",
       dataset: generateDataset(wave.trainPoints, wave.noiseRate, DATA_SEED),
       ...untrained(),
       failure: null,
@@ -414,6 +551,8 @@ export const useTowerDefenseStore = create<TowerDefenseState>((set, get) => ({
     const state = get();
     set({
       ...freshRun(state.modelComplexity, state.towers),
+      // Retires any fit still in flight: its result can no longer land here.
+      attempt: state.attempt + 1,
       whyCard: whyCardFor({ kind: "run-start", wave: waveAt(1) }),
     });
   },

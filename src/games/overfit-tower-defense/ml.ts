@@ -128,7 +128,12 @@ export interface Tower {
   strength: number;
 }
 
-/** Deliberately no cap: the punishment for over-defending is underfitting. */
+/**
+ * Six of each type. Not a limit on over-defending — six of everything is plenty
+ * to starve the model into underfitting, which is the real punishment for it —
+ * but the point where dropout reaches its 0.72 ceiling, and one pip per tower
+ * still fits the palette.
+ */
 export const MAX_TOWERS_PER_TYPE = 6;
 
 /** Per-tower contribution. Tuned by measurement — see the probe in the tests. */
@@ -167,6 +172,28 @@ export const TRAIN_BATCH = 32;
 export const LEARNING_RATE = 0.01;
 /** Fixed so the same build always trains the same way. */
 export const MODEL_SEED = 4242;
+
+/** Both accuracies are re-measured this often while a model trains. */
+export const SAMPLE_EVERY = 10;
+
+/** How a fit ended, read from the last epoch `useModel`'s `train` resolved with. */
+export type FitEnd =
+  | { kind: "complete" }
+  | { kind: "stopped"; epochsRun: number }
+  | { kind: "failed" };
+
+/**
+ * Null means the fit threw or never ran — `useModel` reports why in its
+ * `error`. That is not the player pressing Stop, and calling it "stopped at
+ * epoch 0" would tell them they did something they did not.
+ */
+export function fitEnd(last: { epoch: number } | null): FitEnd {
+  if (last === null) return { kind: "failed" };
+  const epochsRun = last.epoch + 1;
+  return epochsRun < TRAIN_EPOCHS
+    ? { kind: "stopped", epochsRun }
+    : { kind: "complete" };
+}
 
 /**
  * Build the model the player configured.
@@ -273,6 +300,34 @@ export interface Wave {
  * regularization is the only way through, and wave 5 then hands back plenty of
  * clean data so that the same towers now cause underfitting. A player who never
  * dials anything back loses on the last wave, which is the point.
+ *
+ * ── Why the starved waves still field underfit attackers ────────────────────
+ * With one underfit attacker against four overfit ones, the cheapest way through
+ * the famine was to destroy the model: a network that answers 50% everywhere has
+ * no gap at all, and its bias cost a quarter of what the best-generalising model
+ * paid in gap (15 damage against 32). The game rewarded a coin flip over the
+ * model with the best validation accuracy — the opposite of its lesson.
+ *
+ * So waves 3 and 4 carry two and three underfit attackers. Measured over 84
+ * configurations per wave, the least-damage model on every wave is now within a
+ * point of the best validation accuracy, and every coin-flip model takes more
+ * damage than the best real one. The overfit attackers still outnumber them,
+ * because scarce data is where memorising is the danger.
+ *
+ * ── Damage is the two error terms, not validation accuracy alone ─────────────
+ * By design, and the copy says so: the overfit attackers feed on the gap even
+ * when validation accuracy holds still, so two models with the SAME validation
+ * accuracy can take about 20 HP apart on the famine wave. Measured at
+ * complexity 12: no towers, train 0.956 / validation 0.592, takes 57.7; every
+ * tower up, 0.733 / 0.590, takes 36.7. The first one memorised its mislabelled
+ * points — training accuracy above the 0.88 ceiling — and that is charged as
+ * gap whether or not it cost anything on validation.
+ *
+ * A pure validation-shortfall formula was measured on the same grid and
+ * rejected. Making an unregularised 32-unit model lose while best play keeps
+ * the 43 HP the second star needs takes at least 5 HP per validation point on
+ * some wave (this formula is under 2), and even then best play clears the star
+ * line by 1–9 HP — so the 1–3 points of backend drift would decide runs.
  */
 export const WAVES: readonly Wave[] = [
   {
@@ -301,7 +356,7 @@ export const WAVES: readonly Wave[] = [
     trainPoints: 150,
     noiseRate: 0.1,
     overfitEnemies: 3,
-    underfitEnemies: 1,
+    underfitEnemies: 2,
     briefing:
       "150 points, one in ten mislabelled. A big unregularised model will start treating those mistakes as patterns.",
   },
@@ -311,9 +366,9 @@ export const WAVES: readonly Wave[] = [
     trainPoints: 90,
     noiseRate: 0.12,
     overfitEnemies: 4,
-    underfitEnemies: 1,
+    underfitEnemies: 3,
     briefing:
-      "90 points and 12% of the labels wrong. Nothing survives this unregularised — but note what you had to give up to hold it.",
+      "90 points and 12% of the labels wrong. This is where an unregularised model hurts most: it memorises the mistakes, and the gap costs more than any other wave — but strangle it and the underfit attackers are waiting too.",
   },
   {
     index: 5,
@@ -406,6 +461,18 @@ export function scoreWave({
   };
 }
 
+/**
+ * Which failure to NAME for a wave, given which error did the harm.
+ *
+ * A "balanced" wave is still one of the two. Falling through to overfitting on
+ * a tie told players with eighteen towers up and bias as the larger term to add
+ * regularization — the opposite of the fix. The larger damage term decides.
+ */
+export function failureSide(result: WaveResult): "overfit" | "underfit" {
+  if (result.dominant !== "balanced") return result.dominant;
+  return result.underfitDamage > result.overfitDamage ? "underfit" : "overfit";
+}
+
 export interface Evaluation {
   outcome: Outcome;
   /** 0–1, from surviving core HP and how many waves were cleared. */
@@ -413,6 +480,28 @@ export interface Evaluation {
   wavesCleared: number;
   coreHp: number;
   failure: NamedFailure | null;
+}
+
+/** Surviving matters more than surviving prettily, hence the weighting. */
+export const WAVES_WEIGHT = 0.65;
+export const HP_WEIGHT = 0.35;
+
+/**
+ * The run score: waves cleared, then core health.
+ *
+ * HP is counted in the whole points the core readout shows. Mastery's second
+ * star is a threshold on this score, and scoring 42.85 HP — displayed as "43" —
+ * below a star text that asks for 43 would be a promise broken by rounding.
+ */
+export function runScore(wavesCleared: number, coreHp: number): number {
+  const waveFraction = clamp(wavesCleared, 0, WAVES.length) / WAVES.length;
+  const hpFraction = clamp(Math.round(coreHp) / CORE_MAX_HP, 0, 1);
+  return clamp(waveFraction * WAVES_WEIGHT + hpFraction * HP_WEIGHT, 0, 1);
+}
+
+/** Core HP a finished run needs for its score to reach `threshold`. */
+export function hpForScore(threshold: number): number {
+  return Math.ceil(((threshold - WAVES_WEIGHT) / HP_WEIGHT) * CORE_MAX_HP);
 }
 
 const percent = (value: number) => `${Math.round(value * 100)}%`;
@@ -449,10 +538,7 @@ export function evaluateRun({
     };
   }
 
-  const hpFraction = clamp(coreHp / CORE_MAX_HP, 0, 1);
-  const waveFraction = wavesCleared / WAVES.length;
-  // Surviving matters more than surviving prettily, hence the weighting.
-  const score = clamp(waveFraction * 0.65 + hpFraction * 0.35, 0, 1);
+  const score = runScore(wavesCleared, coreHp);
 
   if (coreHp > 0 && finished) {
     return { outcome: "win", score, wavesCleared, coreHp, failure: null };
@@ -472,7 +558,7 @@ export function evaluateRun({
     .filter(Boolean)
     .join(", ");
 
-  if (result.dominant === "underfit") {
+  if (failureSide(result) === "underfit") {
     return {
       outcome: "underfitting",
       score,
@@ -559,6 +645,6 @@ export function buildModel(complexity, towers) {
 
 export const MATH_NOTES = `The first term wants to fit your ${FEATURE_COUNT} features to the labels. The second term wants the weights to stay small, and does not care about the labels at all. Regularization is that tug-of-war: λ decides who wins.
 
-L2 (‖W‖²) pushes every weight toward zero smoothly and rarely reaches it. L1 (‖W‖₁) pushes with constant force regardless of size, so weights that aren't earning their place hit exactly zero — which is why L1 can delete the ${NOISE_FEATURES} pure-noise features outright while L2 only shrinks them.
+L2 (‖W‖²) pushes every weight toward zero with a force that weakens as the weight shrinks. L1 (‖W‖₁) pushes with the same force however small the weight already is, so weights that aren't earning their place are driven close to zero — which is why L1 quiets the ${NOISE_FEATURES} pure-noise features far more than L2 does. Close to zero, not exactly: an exact zero needs a solver that can land on it, and Adam keeps stepping back and forth across it instead.
 
 The two readouts underneath are the diagnosis. A gap means the model learned things about your training set that were not true of the world. Bias means it never learned the training set in the first place. Both go up when you get it wrong, and they go up in response to opposite mistakes — which is why one meter could never tell you what to do next.`;

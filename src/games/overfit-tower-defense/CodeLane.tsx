@@ -63,10 +63,14 @@ function pct(x) { return (x * 100).toFixed(1).padStart(5) + '%'; }
 // shrinks the whole way - but bias starts climbing, and validation
 // accuracy peaks somewhere in the middle and then falls.
 //
-// That peak is the only thing you actually care about, and it is not at
-// either end. More regularization is not "safer".
+// That peak is what you select on, and it is not at either end. More
+// regularization is not "safer". (The wave itself charges the gap and the
+// bias separately, so glance at both columns for the one you pick.)
 //
 // Then commit the winner:  api.setTowers({ l2: best.l2 }); await api.deploy();`;
+
+/** Fifteen minutes. See the note where the lane is created. */
+export const MAX_RUN_MS = 900_000;
 
 export interface CodeLaneProps {
   trainer: TrainerApi;
@@ -90,27 +94,94 @@ export function CodeLane({ trainer }: CodeLaneProps) {
         store.getState().setComplexity(complexity);
       },
 
-      /** Set tower counts. Same state the palette writes. */
+      /**
+       * Set tower counts. Same state the palette writes.
+       *
+       * Each count must be a whole number the palette could show. NaN used to
+       * slip through as "no towers", silently standing a defence down.
+       */
       setTowers: (counts: Partial<Record<TowerType, number>>) => {
         if (typeof counts !== "object" || counts === null) {
-          throw new Error("setTowers needs an object like { l2: 3 }");
+          throw new TypeError("setTowers needs an object like { l2: 3 }");
         }
-        for (const key of Object.keys(counts)) {
+        for (const [key, value] of Object.entries(counts)) {
           if (!TOWER_TYPES.includes(key as TowerType)) {
-            throw new Error(
+            throw new RangeError(
               `unknown tower "${key}" — try ${TOWER_TYPES.join(", ")}`,
+            );
+          }
+          if (
+            typeof value !== "number" ||
+            !Number.isInteger(value) ||
+            value < 0 ||
+            value > MAX_TOWERS_PER_TYPE
+          ) {
+            throw new RangeError(
+              `${key} towers must be a whole number from 0 to ${MAX_TOWERS_PER_TYPE} — got ${String(value)}`,
             );
           }
         }
         store.getState().setTowers(counts);
       },
 
-      /** Train and measure. Costs the core nothing. */
-      trial: () => trainer.trial(),
-      /** Train and let the wave hit. This one counts. */
-      deploy: () => trainer.deploy(),
+      /**
+       * Train and measure. Costs the core nothing, and works in any phase —
+       * a trial after a wave resolves leaves it resolved.
+       */
+      trial: async () => {
+        const measured = await trainer.trial();
+        if (measured === null) {
+          throw new Error(
+            store.getState().phase === "training"
+              ? "api.trial() did not run: another training run is still in progress. Await each trial() or deploy() before the next."
+              : trainer.unscoredReason() === "failed"
+                ? "api.trial() did not finish: the fit ended with an error before the model could be measured. The error is shown with the controls."
+                : "api.trial() was stopped before the model finished training, so nothing was measured.",
+          );
+        }
+        return measured;
+      },
+      /**
+       * Train and let the wave hit. This one counts — once. Credited to the
+       * code lane, which is what mastery's third star asks for.
+       */
+      deploy: async () => {
+        const { phase, wave } = store.getState();
+        if (phase === "resolved") {
+          throw new Error(
+            `wave ${wave} has already been fought — call api.nextWave() before deploying again`,
+          );
+        }
+        if (phase === "won" || phase === "lost") {
+          throw new Error(`the run is over (${phase}) — call api.restart() to play again`);
+        }
+        if (phase === "training") {
+          throw new Error(
+            "api.deploy() did not run: another training run is still in progress. Await each trial() or deploy() before the next.",
+          );
+        }
+        const result = await trainer.deploy({ fromCode: true });
+        if (result === null) {
+          throw new Error(
+            trainer.unscoredReason() === "failed"
+              ? `api.deploy() did not finish: the fit ended with an error before the model could be measured, so wave ${wave} did not attack. The error is shown with the controls.`
+              : `api.deploy() was stopped before the model finished training — wave ${wave} did not attack.`,
+          );
+        }
+        return result;
+      },
       /** Advance after a resolved wave. */
-      nextWave: () => store.getState().nextWave(),
+      nextWave: () => {
+        const { phase, wave } = store.getState();
+        if (phase !== "resolved") {
+          throw new Error(
+            phase === "tuning"
+              ? `wave ${wave} has not been fought yet — await api.deploy() first`
+              : `no next wave from phase "${phase}"`,
+          );
+        }
+        store.getState().nextWave();
+      },
 
       complexity: () => store.getState().modelComplexity,
       parameters: () => parameterCount(store.getState().modelComplexity),
@@ -133,13 +204,26 @@ export function CodeLane({ trainer }: CodeLaneProps) {
       phase: () => store.getState().phase,
       lastResult: () => store.getState().lastResult,
 
-      restart: () => store.getState().restart(),
+      /** Start over. A fit still in flight is stopped and its result retired. */
+      restart: () => {
+        trainer.stop();
+        store.getState().restart();
+      },
     }),
     [store, trainer],
   );
 
-  // Five real fits in the starter snippet, so the budget is generous.
-  const lane = useCodeLane({ initialCode: STARTER_CODE, api, maxRunMs: 180000 });
+  // Five real fits in the starter snippet, and a full five-wave run is five
+  // more — minutes on a CPU backend. The budget exists to stop a runaway loop,
+  // never an honest experiment. It is checked on every api call
+  // (`budgetApiCalls`), because the api is where the time goes: without that,
+  // `for (;;) await api.trial()` never calls checkBudget() and never stops.
+  const lane = useCodeLane({
+    initialCode: STARTER_CODE,
+    api,
+    maxRunMs: MAX_RUN_MS,
+    budgetApiCalls: true,
+  });
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-3">

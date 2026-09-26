@@ -17,7 +17,9 @@ import {
   MATH_NOTES,
   MAX_COMPLEXITY,
   MIN_COMPLEXITY,
+  VALIDATION_POINTS,
   WAVES,
+  hpForScore,
   parameterCount,
   regularizationOf,
 } from "./ml";
@@ -35,10 +37,18 @@ import { VisualLane } from "./VisualLane";
 import { CodeLane } from "./CodeLane";
 import { useNeuronDefenseTrainer, type TrainerApi } from "./useTrainer";
 
+/**
+ * The engine's rule, stated for this game: ★1 survive the run, ★2 a best score
+ * of at least HIGH_SCORE_THRESHOLD, ★3 that plus a run cleared from the code
+ * lane. A finished run's score is fixed by the core HP it ends on, so the second
+ * star's HP is derived from the same formula rather than written down twice.
+ */
 const STAR_CRITERIA = [
   "Survive all five waves",
-  `Score ${Math.round(HIGH_SCORE_THRESHOLD * 100)}% or better by keeping the core healthy`,
-  "Clear a run from the code lane",
+  `Score ${Math.round(HIGH_SCORE_THRESHOLD * 100)}% or better — finish with ${hpForScore(
+    HIGH_SCORE_THRESHOLD,
+  )}+ HP in the core`,
+  "Clear a run with every wave deployed by api.deploy()",
 ];
 
 function Controls({ trainer }: { trainer: TrainerApi }) {
@@ -247,9 +257,11 @@ export default function OverfitTowerDefense() {
       value: validationAccuracy ?? Number.NaN,
       format: "percent",
       goodDirection: "up",
+      // Not "the number that matters": the wave charges the gap and the bias,
+      // so validation alone does not decide the damage (see WAVES in ml.ts).
       caption:
         trainAccuracy === null
-          ? "the number that matters"
+          ? `on ${VALIDATION_POINTS} points it never trains on`
           : `train ${Math.round(trainAccuracy * 100)}%`,
     },
     {
@@ -289,7 +301,13 @@ export default function OverfitTowerDefense() {
         recentGain: lastGain,
         starCriteria: STAR_CRITERIA,
       }}
-      onRetry={restart}
+      // A full restart, on purpose: the core is one pool of HP across all five
+      // waves, and surviving the run on it is the challenge. A fit still in
+      // flight is stopped, and its result is retired by the store's token.
+      onRetry={() => {
+        trainer.stop();
+        restart();
+      }}
       onNext={
         phase === "resolved"
           ? nextWave

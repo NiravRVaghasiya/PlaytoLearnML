@@ -22,7 +22,7 @@ const TOWERS: readonly TowerMeta[] = [
   {
     type: "l1",
     name: "L1",
-    effect: "drives useless weights to exactly zero",
+    effect: "pushes useless weights close to zero",
   },
   {
     type: "l2",
@@ -79,12 +79,13 @@ export function RegTowerPalette({
               </div>
 
               <div className="mt-1.5 flex items-center gap-1.5">
+                {/* 44×44 (DESIGN.md §9) around the same 14px icon. */}
                 <button
                   type="button"
                   onClick={() => onRemove(tower.type)}
                   disabled={disabled || count <= 0}
                   aria-label={`Remove a ${tower.name} tower, currently ${count}`}
-                  className="rounded border border-border p-1 hover:bg-surface focus-visible:ring-2 focus-visible:ring-primary focus-visible:outline-none disabled:opacity-40"
+                  className="inline-flex min-h-11 min-w-11 items-center justify-center rounded border border-border hover:bg-surface focus-visible:ring-2 focus-visible:ring-primary focus-visible:outline-none disabled:opacity-40"
                 >
                   <Minus aria-hidden="true" className="size-3.5" />
                 </button>
@@ -106,7 +107,7 @@ export function RegTowerPalette({
                   onClick={() => onAdd(tower.type)}
                   disabled={disabled || count >= MAX_TOWERS_PER_TYPE}
                   aria-label={`Add a ${tower.name} tower, currently ${count}`}
-                  className="ml-auto rounded border border-border p-1 hover:bg-surface focus-visible:ring-2 focus-visible:ring-primary focus-visible:outline-none disabled:opacity-40"
+                  className="ml-auto inline-flex min-h-11 min-w-11 items-center justify-center rounded border border-border hover:bg-surface focus-visible:ring-2 focus-visible:ring-primary focus-visible:outline-none disabled:opacity-40"
                 >
                   <Plus aria-hidden="true" className="size-3.5" />
                 </button>
