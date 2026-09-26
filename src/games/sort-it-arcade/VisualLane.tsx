@@ -4,6 +4,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { scaleLinear } from "d3";
 import { useSortItStore } from "./store";
 import { boundaryAt, trueBoundary } from "./ml";
+import { GRAB_RADIUS_PX, clientToUser, nearestKnotIndex } from "./field";
 
 /**
  * Sort-It Arcade — the no-code lane.
@@ -19,6 +20,14 @@ import { boundaryAt, trueBoundary } from "./ml";
  * Home / End keys, its own accessible name, and an `aria-valuetext` in plain
  * language. Pointer drag is an *additional* affordance, not the only one.
  *
+ * Nor is dragging the only pointer path (WCAG 2.2 §2.5.7): a single tap
+ * anywhere in the field moves the nearest handle to that height. Each handle
+ * owns the full-height column around it, so a press can't land on a
+ * neighbour. The column is always far taller than 44 CSS px, but with the
+ * wiggle's 25 handles on a phone-width field it is only about 12 px wide; the
+ * slider semantics (arrow keys, a screen reader's adjust gesture) are the
+ * precise path there — see `field.ts`.
+ *
  * Class identity never rests on colour alone (DESIGN.md §9): class A is a blue
  * circle, class B an orange triangle, and misclassified points carry a cross.
  * The whole field is summarised in text for anyone who can't see it at all.
@@ -27,6 +36,21 @@ import { boundaryAt, trueBoundary } from "./ml";
 /** Field padding inside the viewBox, in viewBox units. */
 const PAD = 6;
 const VIEW = 100;
+/**
+ * How far, in CSS px, a finger may travel between down and up and still count
+ * as a tap. Anything further is a swipe (most often the player scrolling past
+ * the field), and a swipe must not edit the model.
+ */
+const TAP_SLOP_PX = 10;
+
+/** A touch that landed off every handle, waiting to prove it is a tap. */
+interface PendingTap {
+  pointerId: number;
+  index: number;
+  height: number;
+  clientX: number;
+  clientY: number;
+}
 
 export function VisualLane() {
   const trainPoints = useSortItStore((s) => s.trainPoints);
@@ -41,6 +65,9 @@ export function VisualLane() {
   const [showTruth, setShowTruth] = useState(false);
   const svgRef = useRef<SVGSVGElement>(null);
   const draggingRef = useRef<number | null>(null);
+  const pendingTapRef = useRef<PendingTap | null>(null);
+  /** Handle elements by index, so a pointer press can focus the one it moves. */
+  const knotRefs = useRef<Array<SVGGElement | null>>([]);
 
   // D3 scales map field coordinates (0–1) into viewBox units. y is inverted so
   // "up" on screen means a larger y value, which is what players expect.
@@ -95,35 +122,106 @@ export function VisualLane() {
     return commands.join(" ");
   }, [xScale, yScale]);
 
-  /** Convert a pointer event to a field-space y value. */
-  const pointerToFieldY = useCallback(
-    (clientY: number): number | null => {
-      const svg = svgRef.current;
-      if (!svg) return null;
-      const rect = svg.getBoundingClientRect();
-      if (rect.height === 0) return null;
-      const viewY = ((clientY - rect.top) / rect.height) * VIEW;
-      return yScale.invert(viewY);
+  /**
+   * A pointer position in viewBox units, through the SVG's own transform so the
+   * letterboxing on a tall desktop column can't displace it (see `field.ts`).
+   */
+  const pointerToView = useCallback(
+    (clientX: number, clientY: number) =>
+      clientToUser(clientX, clientY, svgRef.current?.getScreenCTM() ?? null),
+    [],
+  );
+
+  /**
+   * One press handler for the whole field. It picks the knot whose column the
+   * press is in — never whichever hit circle happened to be painted on top —
+   * then either grabs it (the press is on the handle) or moves it to the
+   * pressed height (anywhere else in its column: the single-tap path).
+   *
+   * A finger that lands off every handle is held back until it lifts. On a
+   * phone the field is most of the screen's width, so a thumb scrolling past
+   * it lands on it routinely; moving a handle on touch-down turned every such
+   * swipe into an edit that wiped a cleared round's verdict. So for touch, an
+   * off-handle press only becomes a tap-to-place on release, and only if it
+   * barely moved. Mouse and pen keep the immediate move.
+   */
+  const handlePointerDown = useCallback(
+    (event: React.PointerEvent<SVGSVGElement>) => {
+      if (!event.isPrimary || event.button !== 0) return;
+      const view = pointerToView(event.clientX, event.clientY);
+      if (!view) return;
+
+      const index = nearestKnotIndex(xScale.invert(view.x), params.length);
+      const height = params[index];
+      if (height === undefined) return;
+
+      // CSS px per viewBox unit, so the grab radius is a real 22 px whatever
+      // size the field renders at.
+      const scale = event.currentTarget.getScreenCTM()?.a ?? 1;
+      const onHandle =
+        Math.abs(view.y - yScale(height)) * scale <= GRAB_RADIUS_PX;
+
+      if (!onHandle && event.pointerType === "touch") {
+        pendingTapRef.current = {
+          pointerId: event.pointerId,
+          index,
+          height: yScale.invert(view.y),
+          clientX: event.clientX,
+          clientY: event.clientY,
+        };
+        return;
+      }
+
+      draggingRef.current = index;
+      event.currentTarget.setPointerCapture(event.pointerId);
+      knotRefs.current[index]?.focus({ preventScroll: true });
+      if (!onHandle) setKnot(index, yScale.invert(view.y));
     },
-    [yScale],
+    [params, pointerToView, setKnot, xScale, yScale],
   );
 
   const handlePointerMove = useCallback(
     (event: React.PointerEvent<SVGSVGElement>) => {
+      const pending = pendingTapRef.current;
+      if (
+        pending?.pointerId === event.pointerId &&
+        Math.hypot(
+          event.clientX - pending.clientX,
+          event.clientY - pending.clientY,
+        ) > TAP_SLOP_PX
+      ) {
+        // Travelled too far to be a tap: a swipe, which edits nothing.
+        pendingTapRef.current = null;
+      }
+
       const index = draggingRef.current;
       if (index === null) return;
-      const y = pointerToFieldY(event.clientY);
-      if (y !== null) setKnot(index, y);
+      const view = pointerToView(event.clientX, event.clientY);
+      if (view) setKnot(index, yScale.invert(view.y));
     },
-    [pointerToFieldY, setKnot],
+    [pointerToView, setKnot, yScale],
   );
 
   const endDrag = useCallback((event: React.PointerEvent<SVGSVGElement>) => {
     draggingRef.current = null;
+    pendingTapRef.current = null;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
   }, []);
+
+  /** A release completes a held-back touch tap, then ends any drag. */
+  const handlePointerUp = useCallback(
+    (event: React.PointerEvent<SVGSVGElement>) => {
+      const pending = pendingTapRef.current;
+      if (pending?.pointerId === event.pointerId) {
+        setKnot(pending.index, pending.height);
+        knotRefs.current[pending.index]?.focus({ preventScroll: true });
+      }
+      endDrag(event);
+    },
+    [endDrag, setKnot],
+  );
 
   const onKnotKeyDown = useCallback(
     (event: React.KeyboardEvent, index: number) => {
@@ -133,8 +231,10 @@ export function VisualLane() {
         ArrowDown: () => nudgeKnot(index, -step),
         PageUp: () => nudgeKnot(index, step * 4),
         PageDown: () => nudgeKnot(index, -step * 4),
-        Home: () => setKnot(index, 1),
-        End: () => setKnot(index, 0),
+        // ARIA slider pattern: Home is the minimum (aria-valuemin, the bottom
+        // of the field), End the maximum.
+        Home: () => setKnot(index, 0),
+        End: () => setKnot(index, 1),
       };
       const handler = handlers[event.key];
       if (handler) {
@@ -152,7 +252,8 @@ export function VisualLane() {
     <div className="flex h-full min-h-0 flex-col gap-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-sm text-text-muted">
-          Drag a handle, or focus one and use the arrow keys.
+          Drag a handle, or tap the field to move the nearest handle to that
+          height. A focused handle also takes the arrow keys.
         </p>
         <label className="inline-flex min-h-11 cursor-pointer items-center gap-2 text-sm">
           <input
@@ -170,9 +271,14 @@ export function VisualLane() {
         viewBox={`0 0 ${VIEW} ${VIEW}`}
         role="group"
         aria-label="Classification field"
-        className="min-h-0 w-full flex-1 touch-none rounded-md bg-bg"
+        className="min-h-0 w-full flex-1 cursor-ns-resize touch-none rounded-md bg-bg"
+        onPointerDown={handlePointerDown}
+        // The press handler focuses the handle it moved. Without this, the
+        // browser's own mousedown focusing would then move focus to whatever was
+        // under the pointer — the field's focusable ancestor, or a neighbour.
+        onMouseDown={(event) => event.preventDefault()}
         onPointerMove={handlePointerMove}
-        onPointerUp={endDrag}
+        onPointerUp={handlePointerUp}
         onPointerCancel={endDrag}
         onPointerLeave={endDrag}
       >
@@ -225,6 +331,12 @@ export function VisualLane() {
               {wrong ? (
                 <g
                   className="flash-wrong"
+                  // Flash when a point BECOMES wrong, then hold still. Some
+                  // crosses stay up for a whole round, and an endless blink
+                  // with no way to stop it fails WCAG 2.2.2 — the cross itself
+                  // carries the meaning. The cross mounts when the point turns
+                  // wrong, so each new mistake still gets its pulse.
+                  style={{ animationIterationCount: 3 }}
                   stroke="var(--wrong)"
                   strokeWidth={0.7}
                   strokeLinecap="round"
@@ -250,6 +362,9 @@ export function VisualLane() {
         {knots.map((knot) => (
           <g
             key={knot.index}
+            ref={(element) => {
+              knotRefs.current[knot.index] = element;
+            }}
             role="slider"
             tabIndex={0}
             aria-label={`Boundary handle ${knot.index + 1} of ${knots.length}`}
@@ -261,13 +376,10 @@ export function VisualLane() {
             )} of 100. Field accuracy ${Math.round(accuracy * 100)} percent.`}
             aria-orientation="vertical"
             onKeyDown={(event) => onKnotKeyDown(event, knot.index)}
-            onPointerDown={(event) => {
-              draggingRef.current = knot.index;
-              svgRef.current?.setPointerCapture(event.pointerId);
-            }}
-            className="cursor-ns-resize focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)]"
+            className="focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)]"
           >
-            {/* Oversized transparent hit area: 44px-equivalent target. */}
+            {/* Sizes the focus ring. Pointer targeting is by column at the SVG
+                level (see handlePointerDown), not by this circle. */}
             <circle
               cx={xScale(knot.x)}
               cy={yScale(knot.y)}

@@ -4,7 +4,11 @@ import { useEffect } from "react";
 import { Sparkles, Wand2 } from "lucide-react";
 import { Button, DatasetChip, type MetricSpec } from "@/components";
 import { GameShell } from "@/engine/GameShell";
-import { levelFromXp, useProgression } from "@/engine/progression";
+import {
+  HIGH_SCORE_THRESHOLD,
+  levelFromXp,
+  useProgression,
+} from "@/engine/progression";
 import { getGameMeta } from "@/lib/catalog";
 import {
   KNOT_COUNTS,
@@ -30,9 +34,16 @@ const CAPACITY_OPTIONS: ReadonlyArray<{
   { type: "wiggle", label: "Wiggle", detail: `${KNOT_COUNTS.wiggle} params` },
 ];
 
+/**
+ * Exactly the engine's rule (`starsFor`): ★1 completed, ★2 best score at or
+ * above `HIGH_SCORE_THRESHOLD`, ★3 that and a code-lane clear. The threshold is
+ * imported rather than restated, so the copy can't drift from the rule. It
+ * happens to equal `WIN_SCORE` here, which means the first two stars arrive
+ * together — a round can only be cleared at a score that already earns ★2.
+ */
 const STAR_CRITERIA = [
   "Clear a round",
-  `Score ${Math.round(WIN_SCORE * 100)}% or better`,
+  `Score ${Math.round(HIGH_SCORE_THRESHOLD * 100)}% or better`,
   "Clear a round from the code lane",
 ];
 
@@ -87,7 +98,8 @@ function Controls() {
       <div className="flex flex-col gap-2 border-t border-border pt-4">
         <Button
           variant="primary"
-          onClick={check}
+          // Wrapped: `check(source)` would otherwise receive the click event.
+          onClick={() => check()}
           icon={<Sparkles className="size-4" />}
         >
           Check generalization
@@ -164,6 +176,9 @@ export default function SortItArcade() {
       label: "Score",
       value: score,
       format: "percent",
+      // One decimal, because the bar is a hard line: a 79.6% score rounded to
+      // "80%" beside "need 80%" reads as a clear that didn't happen.
+      precision: 1,
       goodDirection: "up",
       caption: `need ${Math.round(WIN_SCORE * 100)}%`,
       state: won ? "good" : undefined,

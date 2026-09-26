@@ -21,7 +21,7 @@ import { clamp, seededRandom } from "@/lib/utils";
  * while getting *worse* on held-out data — which is exactly what overfitting is,
  * and why the failure can be named honestly.
  *
- * The best achievable accuracy is therefore about `1 - NOISE_RATE` (≈88%), not
+ * The best achievable accuracy is therefore about `1 - NOISE_RATE` (≈92%), not
  * 100%. A player who reaches 95% on the training set has, by construction,
  * fitted noise.
  */
@@ -104,17 +104,26 @@ export const PENALTY_PER_EXTRA_PARAM = 0.008;
 /**
  * Train − test gap that justifies the word "overfitting".
  *
- * Observed wiggle gaps run 0.117–0.148 depending on where the greedy fit starts,
- * so a 0.12 threshold made the verdict depend on the player's route to it. 0.10
- * sits below the whole range while staying well above the curve's 0.037–0.070.
+ * A 0.12 threshold made the wiggle's verdict depend on the player's route to it.
+ * At 0.10, on the shipped rounds: the flat-start wiggle's gap runs 0.105–0.182,
+ * so "Fit it for me" on a fresh wiggle is always named, as are about 95% of
+ * fits from random starts (gaps 0.06–0.23). Refining a fitted curve is the
+ * exception — win with the curve, switch to Wiggle, Fit — because the extra
+ * knots only add bends to a boundary that already follows the truth. That gap
+ * runs 0.02–0.12: named on two rounds, a near-miss on the other six, where
+ * held-out accuracy falls by under 3 points or even rises. Calling those
+ * overfitting would be false; the 0.184 penalty still sinks them, and the
+ * near-miss card says "fewer parameters". The curve, over 400 fits per round
+ * from near-truth and random starts, stays at or below 0.09 on seven rounds and
+ * crosses 0.10 on 3 random starts in 200 on the eighth. `sort-it-arcade.test.ts`
+ * re-checks that route-robustness, because the curve being branded "memorised
+ * the noise" is the one false verdict this game must never hand out routinely.
  */
 export const OVERFIT_GAP = 0.1;
 /**
- * Train accuracy below which a maxed-out model is genuinely underfitting.
- * Sits between what 2 parameters can reach (~75%) and what 5 can (~90%).
+ * How close to what the optimizer reaches from the current knots a boundary
+ * must be to count as "fitted" — i.e. nothing nearby improves it much.
  */
-export const UNDERFIT_ACCURACY = 0.78;
-/** How close to its own ceiling a boundary must be to count as "fitted". */
 export const CAPACITY_TOLERANCE = 0.03;
 /** Score needed to clear the round. */
 export const WIN_SCORE = 0.8;
@@ -125,7 +134,7 @@ export const WIN_SCORE = 0.8;
  * The true class boundary: one full sine period, up then down.
  *
  * A straight line cannot follow "up then down" at all, so 2 parameters genuinely
- * underfit. 5 parameters can trace it. 17 parameters have capacity to spare —
+ * underfit. 5 parameters can trace it. 25 parameters have capacity to spare —
  * and spend it on noise.
  */
 export function trueBoundary(x: number): number {
@@ -201,12 +210,25 @@ export function generateTestPoints(seed: number): Point[] {
  * look better on the training set isn't tempting, and the round teaches nothing.
  *
  * About a quarter of all seeds fail this bar, almost always because the wiggle
- * doesn't overfit hard enough. `sort-it-arcade.test.ts` re-checks every seed
- * here on each run, so a change to the tuning constants can't silently break
- * the lesson.
+ * doesn't overfit hard enough.
+ *
+ * Two more screens were added after the lesson was found to hold on only one
+ * route through it:
+ *
+ * - **A straight line must not be able to clear the round**, checked by an
+ *   exhaustive search rather than the optimizer's own line. 20260801 (round 1)
+ *   and 20260805 were dropped: a hand-placed line reached 80% on the first and
+ *   79.5% on the second, where "Fit it for me" found only 77.5% and 79%.
+ * - **The curve must win from any reasonable start**, not only from a flat
+ *   line. 20260808 was dropped: its held-out sample is intrinsically harder
+ *   than its training sample, so about 40% of ordinary 5-parameter fits were
+ *   branded "memorised the noise" while scoring below the true boundary itself.
+ *
+ * `sort-it-arcade.test.ts` re-checks every seed here against all three on each
+ * run, so a change to the tuning constants can't silently break the lesson.
  */
 export const ROUND_SEEDS = [
-  20260801, 20260802, 20260804, 20260805, 20260808, 20260809, 20260810,
+  20260826, 20260802, 20260804, 20260838, 20260823, 20260809, 20260810,
   20260811,
 ] as const;
 
@@ -299,6 +321,15 @@ export function resampleParams(params: number[], count: number): number[] {
  * It maximises *training* accuracy with no regularization, exactly like an
  * unregularised learner. Given capacity it will fit the noise, which is how the
  * game earns the right to say "you overfit".
+ *
+ * ── Only recount what a knot can move ────────────────────────────────────────
+ * A point's side depends on just the two knots either side of it (see
+ * `boundaryAt`), so trying a new height for knot i can only re-classify the
+ * points in segments i − 1 and i. Those are recounted; the rest keep their
+ * count. The result is the same integer, divided by the same n, as a full
+ * `accuracyOf` — every comparison, and so every fitted knot, is identical — but
+ * a 25-knot fit touches about a twelfth of the points per candidate. It was the
+ * difference between a 70 ms and a few-ms "Fit it for me" on a wiggle.
  */
 export function fitKnots(
   points: Point[],
@@ -308,18 +339,31 @@ export function fitKnots(
   const fitted = [...params];
   if (points.length === 0) return fitted;
 
+  const movedBy = pointsEachKnotMoves(points, fitted.length);
+  const correctAmong = (subset: readonly Point[]) => {
+    let correct = 0;
+    for (const point of subset) {
+      if (classifyPoint(fitted, point) === point.label) correct += 1;
+    }
+    return correct;
+  };
+
   for (let pass = 0; pass < passes; pass += 1) {
     let improved = false;
 
     for (let index = 0; index < fitted.length; index += 1) {
       const original = fitted[index]!;
+      const affected = movedBy[index]!;
+      // Correct points this knot cannot change, whatever height it takes.
+      const fixed = correctAmong(points) - correctAmong(affected);
       let bestHeight = original;
-      let bestAccuracy = accuracyOf(points, fitted);
+      let bestAccuracy = (fixed + correctAmong(affected)) / points.length;
 
       for (let step = 0; step <= steps; step += 1) {
         const candidate = step / steps;
         fitted[index] = candidate;
-        const candidateAccuracy = accuracyOf(points, fitted);
+        const candidateAccuracy =
+          (fixed + correctAmong(affected)) / points.length;
         if (candidateAccuracy > bestAccuracy) {
           bestAccuracy = candidateAccuracy;
           bestHeight = candidate;
@@ -337,9 +381,193 @@ export function fitKnots(
   return fitted;
 }
 
-/** Best training accuracy this parameter count can reach on these points. */
+/**
+ * For each knot, the points whose side it can change: those in the segment to
+ * its left and the segment to its right. The segment arithmetic is copied from
+ * `boundaryAt` exactly, so a point at a knot's x lands in the same segment the
+ * classifier puts it in.
+ */
+function pointsEachKnotMoves(points: Point[], knotCount: number): Point[][] {
+  // One or zero knots: the boundary is flat, and every knot moves every point.
+  if (knotCount < 2) return Array.from({ length: knotCount }, () => points);
+
+  const span = 1 / (knotCount - 1);
+  const movedBy: Point[][] = Array.from({ length: knotCount }, () => []);
+  for (const point of points) {
+    const position = clamp(point.x, 0, 1);
+    const segment = Math.min(knotCount - 2, Math.floor(position / span));
+    movedBy[segment]!.push(point);
+    movedBy[segment + 1]!.push(point);
+  }
+  return movedBy;
+}
+
+/**
+ * Training accuracy the greedy fit reaches from one particular start.
+ *
+ * NOT the ceiling of the model class — coordinate descent stops at the first
+ * local optimum it finds, so this depends on where it began. Use
+ * `capacityCeiling` for any claim about what a parameter count "can do".
+ */
 export function capacityOf(points: Point[], params: number[]): number {
   return accuracyOf(points, fitKnots(points, params));
+}
+
+// ── The capacity ceiling ───────────────────────────────────────────────────
+
+/**
+ * Grid for the exhaustive straight-line search: both knots swept over 0–1 in
+ * steps of 1/200, so every one of the 201² lines is scored.
+ */
+export const LINE_GRID_STEPS = 200;
+
+/**
+ * Seeded random starts added to the flat start when estimating the ceiling of a
+ * curve or a wiggle. Greedy coordinate descent from a single start is route-
+ * dependent — from "every handle at the bottom" it can stall 12 points below
+ * what the same five parameters reach from a flat line — so the ceiling takes
+ * the best of several routes rather than trusting one.
+ */
+export const CEILING_RESTARTS = 4;
+
+/**
+ * The exact best a straight line can do, over every line on the grid.
+ *
+ * Scoring all 201² lines point by point is 8M comparisons — 130 ms in V8 on a
+ * click. It doesn't need to be. Fix the left knot and raise the right one: the
+ * boundary only rises, so each point is predicted "above" (class 1) up to some
+ * right-knot height and "below" after it — one flip. Find each point's flip,
+ * and a running sum gives the count of correct points for every right-knot
+ * height at once. Roughly 150k steps instead of 8M.
+ *
+ * The flip is located with the classifier's own arithmetic
+ * (`left + (right − left)·x`, exactly `boundaryAt` for two knots), not with a
+ * rearranged formula, so the counts match `accuracyOf` on every line — the
+ * test suite checks this against the brute force.
+ */
+function bestLineAccuracy(points: Point[]): number {
+  const n = points.length;
+  const steps = LINE_GRID_STEPS;
+  // `edges` holds +1/−1 steps; its running sum at j is the number of correct
+  // points when the right knot sits at j / steps.
+  const edges = new Int32Array(steps + 2);
+  let best = 0;
+
+  for (let a = 0; a <= steps; a += 1) {
+    const left = a / steps;
+    edges.fill(0);
+
+    for (const point of points) {
+      const x = clamp(point.x, 0, 1);
+      const above = (j: number) =>
+        point.y >= left + (j / steps - left) * x;
+
+      // Last right-knot index still predicting class 1 (−1 if none). Start
+      // from the algebraic estimate, then settle it with the real comparison;
+      // `above` is monotone in j, and the walk is bounded by the grid.
+      let last =
+        x > 0
+          ? Math.floor(steps * (left + (point.y - left) / x))
+          : above(0)
+            ? steps
+            : -1;
+      last = Math.max(-1, Math.min(steps, last));
+      while (last < steps && above(last + 1)) last += 1;
+      while (last >= 0 && !above(last)) last -= 1;
+
+      if (point.label === 1) {
+        // Correct while predicted above: j = 0..last.
+        if (last >= 0) {
+          edges[0]! += 1;
+          edges[last + 1]! -= 1;
+        }
+      } else if (last < steps) {
+        // Correct once predicted below: j = last+1..steps.
+        edges[last + 1]! += 1;
+        edges[steps + 1]! -= 1;
+      }
+    }
+
+    let correct = 0;
+    for (let j = 0; j <= steps; j += 1) {
+      correct += edges[j]!;
+      if (correct > best) best = correct;
+    }
+  }
+
+  return best / n;
+}
+
+/** Best greedy fit over the flat start and `CEILING_RESTARTS` seeded ones. */
+function multiStartCeiling(points: Point[], knotCount: number): number {
+  let best = capacityOf(
+    points,
+    Array.from({ length: knotCount }, () => 0.5),
+  );
+  // Seeded on the knot count so the estimate is deterministic per capacity.
+  const random = seededRandom(0x5eed + knotCount * 7919);
+  for (let attempt = 0; attempt < CEILING_RESTARTS; attempt += 1) {
+    const start = Array.from({ length: knotCount }, () => random());
+    best = Math.max(best, capacityOf(points, start));
+  }
+  return best;
+}
+
+/**
+ * Ceilings are deterministic per (sample, knot count) and cost a few
+ * milliseconds each — several times that on a slow phone — so they are
+ * computed once. The key is the sample's content, not
+ * its array identity: the store re-derives `trainPoints` on every handle move.
+ * Bounded so a test run that screens hundreds of samples can't grow it forever.
+ */
+const ceilingCache = new Map<string, number>();
+const CEILING_CACHE_LIMIT = 64;
+
+function sampleKey(points: Point[], knotCount: number): string {
+  let key = `${knotCount}|${points.length}`;
+  for (const point of points) key += `|${point.x},${point.y},${point.label}`;
+  return key;
+}
+
+/**
+ * The best training accuracy `knotCount` knots can reach on these points,
+ * computed without reference to any player — the model class's own ceiling.
+ * Memoised per (sample, knot count).
+ */
+export function independentCeiling(points: Point[], knotCount: number): number {
+  if (points.length === 0 || knotCount < MIN_PARAMS) return 0;
+
+  const key = sampleKey(points, knotCount);
+  const cached = ceilingCache.get(key);
+  if (cached !== undefined) return cached;
+
+  const ceiling =
+    knotCount === MIN_PARAMS
+      ? bestLineAccuracy(points)
+      : multiStartCeiling(points, knotCount);
+  if (ceilingCache.size >= CEILING_CACHE_LIMIT) {
+    const oldest = ceilingCache.keys().next().value;
+    if (oldest !== undefined) ceilingCache.delete(oldest);
+  }
+  ceilingCache.set(key, ceiling);
+  return ceiling;
+}
+
+/**
+ * The best training accuracy `params.length` knots can reach on these points,
+ * INDEPENDENT of where the player's knots happen to be.
+ *
+ * This is the number behind "X% is the best N parameters can do", so it has to
+ * be a property of the model class, not of the player's route. The line is
+ * searched exhaustively; curves and wiggles take the best of several greedy
+ * starts. The player's own fit is always included as one more candidate, so the
+ * ceiling can never sit below a number the player can already see.
+ */
+export function capacityCeiling(points: Point[], params: number[]): number {
+  return Math.max(
+    independentCeiling(points, params.length),
+    capacityOf(points, params),
+  );
 }
 
 // ── Evaluation ─────────────────────────────────────────────────────────────
@@ -354,8 +582,13 @@ export interface Evaluation {
   /** trainAccuracy − testAccuracy. The overfitting signal. */
   generalizationGap: number;
   paramCount: number;
-  /** Best training accuracy achievable at this parameter count. */
+  /**
+   * Best training accuracy achievable at this parameter count, whatever the
+   * starting knots — see `capacityCeiling`.
+   */
   bestAtThisComplexity: number;
+  /** The score `bestAtThisComplexity` would earn: this capacity at its best. */
+  ceilingScore: number;
   outcome: Outcome;
   failure: NamedFailure | null;
 }
@@ -367,13 +600,25 @@ export interface Evaluation {
  *
  * - **Overfitting** requires both a train/test gap above `OVERFIT_GAP` *and*
  *   spare capacity to have memorised with. A 2-parameter straight line cannot
- *   memorise 120 points; when it shows a gap that is sampling variance, not
+ *   memorise 200 points; when it shows a gap that is sampling variance, not
  *   overfitting, and saying otherwise would teach the wrong word. Never claimed
  *   on training accuracy alone.
- * - **Underfitting** is claimed only when the boundary is already at the ceiling
- *   of what its parameter count can achieve *and* that ceiling is poor. A
- *   badly-placed 17-knot boundary is an unfitted model, not an underfitting one,
- *   so it returns `near-miss` with a nudge to keep adjusting.
+ * - **Underfitting** needs two separate facts. The boundary must be *fitted* —
+ *   within `CAPACITY_TOLERANCE` of what the optimizer reaches from where it
+ *   stands, so a flat, unfitted line is never accused. And the model class must
+ *   be *too simple* — even its ceiling, found without reference to the player's
+ *   route (`capacityCeiling`), sorts too few points to clear the round before
+ *   any penalty is charged. Judging the second fact from the player's own start
+ *   was the old bug: a curve stalled in a greedy local optimum was told "75% is
+ *   the best 5 parameters can do" on a round where five parameters reach 88%.
+ *   That boundary is unfitted, not underfit, so it returns `near-miss`, and the
+ *   copy quotes the real ceiling.
+ *
+ *   "Too simple" is an accuracy test, not a score test. The wiggle's ceiling
+ *   *score* is under the bar too, but only because of its penalty: 25
+ *   parameters are too costly, never too simple. And it replaces a fixed
+ *   accuracy cut-off (78%) that sat exactly on the best line on three rounds,
+ *   so the most carefully placed line there escaped the name.
  */
 export function evaluate(
   trainPoints: Point[],
@@ -385,7 +630,20 @@ export function evaluate(
   const penalty = penaltyFor(params);
   const score = scoreFor(trainAccuracy, params);
   const generalizationGap = trainAccuracy - testAccuracy;
-  const bestAtThisComplexity = capacityOf(trainPoints, params);
+  // Where the optimizer gets to from the player's own knots: the test for
+  // "already fitted" (a local optimum nothing nearby improves on).
+  const fromHere = capacityOf(trainPoints, params);
+  // The class's ceiling, whatever the start — the test for "too simple".
+  const bestAtThisComplexity = Math.max(
+    independentCeiling(trainPoints, params.length),
+    fromHere,
+  );
+  // What the model class would score at its very best. Below the bar means no
+  // amount of adjusting at this capacity can clear the round.
+  const ceilingScore = scoreFor(bestAtThisComplexity, params);
+  // Even the class's best fit sorts too few points, penalty aside.
+  const tooSimple = bestAtThisComplexity < WIN_SCORE;
+  const fitted = trainAccuracy >= fromHere - CAPACITY_TOLERANCE;
 
   const asPercent = (value: number) => `${Math.round(value * 100)}%`;
 
@@ -402,10 +660,7 @@ export function evaluate(
         testAccuracy,
       )} on ${testPoints.length} points it never saw. ${params.length} parameters memorised the noise.`,
     };
-  } else if (
-    trainAccuracy < UNDERFIT_ACCURACY &&
-    trainAccuracy >= bestAtThisComplexity - CAPACITY_TOLERANCE
-  ) {
+  } else if (fitted && tooSimple) {
     outcome = "underfit";
     failure = {
       name: "Underfitting",
@@ -427,6 +682,7 @@ export function evaluate(
     generalizationGap,
     paramCount: params.length,
     bestAtThisComplexity,
+    ceilingScore,
     outcome,
     failure,
   };

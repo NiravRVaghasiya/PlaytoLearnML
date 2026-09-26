@@ -83,21 +83,43 @@ export interface SortItState {
   failure: NamedFailure | null;
   whyCard: WhyCardContent | null;
   lastEvaluation: Evaluation | null;
+  /**
+   * The CURRENT boundary has been checked and cleared the round. Every edit to
+   * the boundary resets it, so it never vouches for a boundary it didn't judge.
+   */
   won: boolean;
+  /**
+   * Which lane's call recorded the current boundary's clear, or null. This is
+   * what makes `check()` safe to call twice — the same clear is never counted
+   * twice — while still letting a code-lane `api.check()` earn the third star on
+   * a boundary first cleared from the visual lane (the starter snippet's
+   * `autoFit()` is a no-op on a curve that is already fitted).
+   */
+  clearedFrom: Lane | null;
   lane: Lane;
 
   // ── actions ──────────────────────────────────────────────────────────
   setLane: (lane: Lane) => void;
-  /** Swap model capacity: line (2 params) → curve (4) → wiggle (10). */
+  /** Swap model capacity: line (2 params) → curve (5) → wiggle (25). */
   setBoundaryType: (type: BoundaryType) => void;
-  /** Move one knot. This is the player fitting the classifier by hand. */
+  /**
+   * Move one knot. This is the player fitting the classifier by hand. A
+   * non-integer index or a non-finite height is ignored rather than stored:
+   * a NaN knot would reach the renderer and take the whole route down.
+   */
   setKnot: (index: number, y: number) => void;
   /** Keyboard-sized nudge. */
   nudgeKnot: (index: number, delta: number) => void;
   /** Run the real optimizer — the same operation the dragging performs. */
   autoFit: () => void;
-  /** Score the round against the held-out set and name any failure. */
-  check: () => Evaluation;
+  /**
+   * Score the round against the held-out set and name any failure.
+   *
+   * `source` is the lane the *call* came from — the code lane's `api.check()`
+   * passes "code" — so the third star follows the action, not whichever tab
+   * happens to be showing. The rail's button is visual even in the code tab.
+   */
+  check: (source?: Lane) => Evaluation;
   /** Same points, boundary back to a flat line. */
   reset: () => void;
   /** Load a specific round from the vetted seed list. */
@@ -166,6 +188,7 @@ function freshRound(round: number) {
     whyCard: whyCardFor({ kind: "reset" }),
     lastEvaluation: null,
     won: false,
+    clearedFrom: null,
     ...derive(trainPoints, params),
   };
 }
@@ -178,6 +201,8 @@ export const useSortItStore = create<SortItState>((set, get) => ({
 
   setBoundaryType: (type) => {
     const { boundary, trainPoints } = get();
+    // `Object.hasOwn`, not `in`: "toString" is `in` every object literal.
+    if (!Object.hasOwn(KNOT_COUNTS, type)) return;
     if (type === boundary.type) return;
 
     // Sample the current boundary at the new knot positions, so changing
@@ -193,6 +218,7 @@ export const useSortItStore = create<SortItState>((set, get) => ({
       testAccuracy: null,
       failure: null,
       won: false,
+      clearedFrom: null,
       whyCard: whyCardFor({
         kind: "complexity-changed",
         from: boundary.type,
@@ -205,10 +231,16 @@ export const useSortItStore = create<SortItState>((set, get) => ({
 
   setKnot: (index, y) => {
     const { boundary, trainPoints, accuracy } = get();
+    if (!Number.isInteger(index) || !Number.isFinite(y)) return;
     if (index < 0 || index >= boundary.params.length) return;
 
+    const height = Math.min(1, Math.max(0, y));
+    // Nothing moved (a press that didn't drag, Home on a handle already at the
+    // bottom): leave the verdict alone rather than wiping it for no reason.
+    if (height === boundary.params[index]) return;
+
     const params = [...boundary.params];
-    params[index] = Math.min(1, Math.max(0, y));
+    params[index] = height;
 
     const next = derive(trainPoints, params);
 
@@ -217,6 +249,8 @@ export const useSortItStore = create<SortItState>((set, get) => ({
       ...next,
       testAccuracy: null,
       failure: null,
+      won: false,
+      clearedFrom: null,
       whyCard: whyCardFor({
         kind: "boundary-moved",
         accuracy: next.accuracy,
@@ -234,8 +268,24 @@ export const useSortItStore = create<SortItState>((set, get) => ({
   },
 
   autoFit: () => {
-    const { boundary, trainPoints } = get();
+    const { boundary, trainPoints, accuracy } = get();
     const params = fitKnots(trainPoints, boundary.params);
+
+    // Already at a local optimum: the boundary is unchanged, so the verdict on
+    // it still stands. Explain that instead of un-clearing a cleared round —
+    // running the starter snippet twice must not cost the player anything.
+    if (params.every((height, index) => height === boundary.params[index])) {
+      set({
+        whyCard: whyCardFor({
+          kind: "auto-fitted",
+          accuracy,
+          params: params.length,
+          unchanged: true,
+        }),
+      });
+      return;
+    }
+
     const next = derive(trainPoints, params);
 
     set({
@@ -243,6 +293,8 @@ export const useSortItStore = create<SortItState>((set, get) => ({
       ...next,
       testAccuracy: null,
       failure: null,
+      won: false,
+      clearedFrom: null,
       whyCard: whyCardFor({
         kind: "auto-fitted",
         accuracy: next.accuracy,
@@ -251,26 +303,34 @@ export const useSortItStore = create<SortItState>((set, get) => ({
     });
   },
 
-  check: () => {
-    const { trainPoints, testPoints, boundary, lane } = get();
+  check: (source = "visual") => {
+    const { trainPoints, testPoints, boundary, clearedFrom } = get();
     const evaluation = evaluate(trainPoints, testPoints, boundary.params);
+    const win = evaluation.outcome === "win";
+    // Record a clear once per boundary — unless this call is the first from the
+    // code lane, which is worth recording for the third star. Any edit to the
+    // boundary resets `clearedFrom`.
+    const record =
+      win &&
+      (clearedFrom === null || (source === "code" && clearedFrom !== "code"));
 
     set({
       testAccuracy: evaluation.testAccuracy,
       failure: evaluation.failure,
-      won: evaluation.outcome === "win",
+      won: win,
+      clearedFrom: win ? (record ? source : clearedFrom) : null,
       lastEvaluation: evaluation,
       whyCard: whyCardFor({ kind: "checked", evaluation }),
     });
 
-    if (evaluation.outcome === "win") {
+    if (record) {
       // Third mastery star is the code-lane challenge (spec §4).
       useProgression.getState().recordResult({
         slug: SLUG,
         score: evaluation.score,
-        lane,
+        lane: source,
         completed: true,
-        codeLaneCleared: lane === "code",
+        codeLaneCleared: source === "code",
       });
     }
 
@@ -287,6 +347,7 @@ export const useSortItStore = create<SortItState>((set, get) => ({
       testAccuracy: null,
       failure: null,
       won: false,
+      clearedFrom: null,
       lastEvaluation: null,
       whyCard: whyCardFor({ kind: "reset" }),
     });

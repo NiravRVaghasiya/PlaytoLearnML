@@ -20,9 +20,20 @@ import { KNOT_COUNTS, type BoundaryType } from "./ml";
  * coordinate-descent optimizer from `ml.ts`. That makes the pedagogy contract's
  * second point explicit — the player can watch the algorithm perform the same
  * search their hands were doing.
+ *
+ * Every verb checks its arguments and throws a named error the output panel can
+ * show. The store would quietly ignore a bad value, which is safe but silent —
+ * and a player who typed `api.setKnot(1)` deserves to be told the height is
+ * missing, not left wondering why nothing moved.
  */
 
-const STARTER_CODE = `// Fit a decision boundary. Every call below drives the same
+function shown(value: unknown): string {
+  if (typeof value === "string") return `"${value}"`;
+  if (typeof value === "number") return String(value);
+  return value === undefined ? "nothing" : typeof value;
+}
+
+export const STARTER_CODE = `// Fit a decision boundary. Every call below drives the same
 // game state the visual lane does — flip the toggle and look.
 
 // 1. Choose your model's capacity: 'line' (2), 'curve' (5), 'wiggle' (25).
@@ -45,52 +56,79 @@ log('held-out accuracy', result.testAccuracy.toFixed(3));
 log('generalization gap', result.generalizationGap.toFixed(3));
 log('verdict', result.outcome);
 
-// Try it with 'wiggle'. Training accuracy goes UP and the verdict
-// gets worse. That gap is the whole lesson.`;
+// Try it with 'wiggle'. Training accuracy goes UP, the generalization
+// gap widens, and the verdict gets worse: 20 more parameters cost more
+// score than they buy. Add api.reset() before api.autoFit() to fit the
+// wiggle from a flat line, and it memorises enough noise to be named
+// Overfitting.`;
+
+/**
+ * The code lane's verbs, bound to a store. A plain function rather than inline
+ * in the component so the argument checks can be unit-tested without React.
+ */
+export function createSortItApi(store: typeof useSortItStore = useSortItStore) {
+  return {
+    /** Swap model capacity. Same action as the capacity buttons. */
+    setBoundaryType: (type: BoundaryType) => {
+      // `Object.hasOwn`, not `in`: `'toString' in KNOT_COUNTS` is true.
+      if (typeof type !== "string" || !Object.hasOwn(KNOT_COUNTS, type)) {
+        throw new TypeError(
+          `setBoundaryType(type): unknown boundary type ${shown(type)}. Use 'line', 'curve' or 'wiggle'.`,
+        );
+      }
+      store.getState().setBoundaryType(type);
+    },
+    /** Move one knot. Same action as dragging handle `index`. */
+    setKnot: (index: number, height: number) => {
+      const count = store.getState().boundary.params.length;
+      if (!Number.isInteger(index) || index < 0 || index >= count) {
+        throw new RangeError(
+          `setKnot(index, height): index must be a whole number from 0 to ${
+            count - 1
+          }, got ${shown(index)}.`,
+        );
+      }
+      if (typeof height !== "number" || !Number.isFinite(height)) {
+        throw new TypeError(
+          `setKnot(index, height): height must be a number from 0 to 1, got ${shown(height)}.`,
+        );
+      }
+      if (height < 0 || height > 1) {
+        throw new RangeError(
+          `setKnot(index, height): height must be from 0 (bottom) to 1 (top), got ${height}.`,
+        );
+      }
+      store.getState().setKnot(index, height);
+    },
+    /** Current knot heights. */
+    knots: () => [...store.getState().boundary.params],
+    /** Run the real optimizer from ml.ts. */
+    autoFit: () => {
+      store.getState().autoFit();
+    },
+    /** Live training accuracy — the same number the metric shows. */
+    trainAccuracy: () => store.getState().accuracy,
+    /** Complexity penalty currently being charged. */
+    penalty: () => store.getState().penalty,
+    /** Parameter count. */
+    complexity: () => store.getState().boundary.complexityCost,
+    /** accuracy − penalty. */
+    score: () => store.getState().score,
+    /** Score against the held-out set and name any failure. */
+    check: () => store.getState().check("code"),
+    /** Flatten the boundary and clear the verdict. */
+    reset: () => {
+      store.getState().reset();
+    },
+  };
+}
+
+export type SortItApi = ReturnType<typeof createSortItApi>;
 
 export function CodeLane() {
-  const store = useSortItStore;
-
-  // The api is memoised on the store reference, not on state, so it stays
-  // stable while still reading current state at call time.
-  const api = useMemo(
-    () => ({
-      /** Swap model capacity. Same action as the capacity buttons. */
-      setBoundaryType: (type: BoundaryType) => {
-        if (!(type in KNOT_COUNTS)) {
-          throw new Error(
-            `Unknown boundary type "${type}". Use 'line', 'curve' or 'wiggle'.`,
-          );
-        }
-        store.getState().setBoundaryType(type);
-      },
-      /** Move one knot. Same action as dragging handle `index`. */
-      setKnot: (index: number, height: number) => {
-        store.getState().setKnot(index, height);
-      },
-      /** Current knot heights. */
-      knots: () => [...store.getState().boundary.params],
-      /** Run the real optimizer from ml.ts. */
-      autoFit: () => {
-        store.getState().autoFit();
-      },
-      /** Live training accuracy — the same number the metric shows. */
-      trainAccuracy: () => store.getState().accuracy,
-      /** Complexity penalty currently being charged. */
-      penalty: () => store.getState().penalty,
-      /** Parameter count. */
-      complexity: () => store.getState().boundary.complexityCost,
-      /** accuracy − penalty. */
-      score: () => store.getState().score,
-      /** Score against the held-out set and name any failure. */
-      check: () => store.getState().check(),
-      /** Flatten the boundary and clear the verdict. */
-      reset: () => {
-        store.getState().reset();
-      },
-    }),
-    [store],
-  );
+  // Memoised on nothing: the store is a module singleton, and the verbs read
+  // current state at call time, so one instance serves the whole mount.
+  const api = useMemo(() => createSortItApi(), []);
 
   const lane = useCodeLane({ initialCode: STARTER_CODE, api });
 
