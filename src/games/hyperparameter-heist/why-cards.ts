@@ -1,20 +1,32 @@
 import type { WhyCardContent } from "@/components";
 import {
+  BATCH_SIZE,
   BAYESIAN_SEED_TRIALS,
   BUDGET,
+  CRACK_RATE_RUNS,
   CRACK_THRESHOLD,
   DIALS,
   DIAL_COUNT,
   LEARNING_RATE,
+  WEIGHT_DECAY,
   bestTrial,
   describePoint,
   dialInfluence,
   distinctValuesTried,
+  gridBest,
   gridLevels,
+  randomCrackRate,
   temperatureOf,
   type Strategy,
   type Trial,
 } from "./ml";
+
+/**
+ * The Concept Library page this game's coverage lesson belongs to. Its section
+ * "Why learning rate dominates" is about exactly this safe: a log-scaled dial
+ * that decides the run, and a grid that sees too few values of it.
+ */
+const LEARNING_RATE_HREF = "/concepts/learning-rate";
 
 /**
  * "Why did that happen?" copy for Hyperparameter Heist.
@@ -58,6 +70,15 @@ export type HeistEvent =
 
 const percent = (value: number) => `${Math.round(value * 100)}%`;
 const points = (value: number) => `${(value * 100).toFixed(1)}%`;
+/** "4×" for a whole ratio, "3.5×" otherwise — never rounded into a bigger claim. */
+const ratioText = (ratio: number) =>
+  `${Number.isInteger(ratio) ? ratio : ratio.toFixed(1)}×`;
+/** An objective difference, in accuracy points — see `swing` in ml.ts. */
+const swing = (value: number) => `${Math.round(value * 100)} points`;
+/** "1 try", "3 tries" — a strategy that stops at the crack often spends only one. */
+const tries = (count: number) => `${count} ${count === 1 ? "try" : "tries"}`;
+const learningRates = (count: number) =>
+  `${count} learning rate${count === 1 ? "" : "s"}`;
 
 const TEMPERATURE_WORDS: Record<string, string> = {
   freezing: "freezing",
@@ -103,6 +124,8 @@ export function whyCardFor(event: HeistEvent): WhyCardContent {
             DIALS[LEARNING_RATE]!.name
           } at ${levels} values — the same ${levels} values, over and over, while the other dials cycle around it. ${triesLeft} tries left. Run it and see what it finds.`,
           tone: "warn",
+          conceptHref: LEARNING_RATE_HREF,
+          conceptLabel: "Why learning rate dominates",
         };
       }
 
@@ -164,6 +187,8 @@ export function whyCardFor(event: HeistEvent): WhyCardContent {
             DIALS[LEARNING_RATE]!.name
           } value${lrSeen === 1 ? "" : "s"}.`,
           tone: "bad",
+          conceptHref: LEARNING_RATE_HREF,
+          conceptLabel: "Why learning rate dominates",
         };
       }
 
@@ -186,6 +211,14 @@ export function whyCardFor(event: HeistEvent): WhyCardContent {
               : "Keep track of coverage rather than of near misses."
         }`,
         tone: temperature === "hot" ? "good" : "info",
+        // A freezing reading is the learning-rate lesson in miniature, so that
+        // card is the one that points at the concept page.
+        ...(temperature === "freezing"
+          ? {
+              conceptHref: LEARNING_RATE_HREF,
+              conceptLabel: "Why learning rate dominates",
+            }
+          : {}),
       };
     }
 
@@ -194,51 +227,116 @@ export function whyCardFor(event: HeistEvent): WhyCardContent {
       const best = bestTrial(trials)!;
       const lrSeen = distinctValuesTried(trials, LEARNING_RATE);
       const influence = dialInfluence();
+      const levels = gridLevels(budget);
+      const spare = budget - trials.length;
+      const opened = cracked ? ` — open, with ${tries(spare)} to spare.` : "";
 
       if (strategy === "grid") {
         return {
           key: "grid-run",
-          title: `Grid spent ${added.length} tries and saw ${lrSeen} learning rates`,
+          title: `Grid spent ${tries(added.length)} and saw ${learningRates(lrSeen)}`,
           body: `Best ${points(best.objectiveValue)}${
-            cracked ? " — open." : `, against the ${percent(CRACK_THRESHOLD)} needed.`
-          } That is the grid's whole story: ${budget} readings, ${lrSeen} distinct values of the dial that controls ${percent(
+            cracked ? opened : `, against the ${percent(CRACK_THRESHOLD)} needed.`
+          } That is the grid's whole story: ${budget} readings, ${lrSeen} distinct values of the dial that swings this safe's objective by ${swing(
             influence[LEARNING_RATE] ?? 0,
-          )} of this safe's range. It also spent ${
-            budget / Math.max(1, gridLevels(budget))
-          } tries varying ${DIALS[2]!.name} and ${
-            DIALS[3]!.name
-          }, which between them move the objective by under ${percent(
-            (influence[2] ?? 0) + (influence[3] ?? 0),
+          )} on its own. Every one of those tries also had to vary ${
+            DIALS[BATCH_SIZE]!.name
+          } and ${
+            DIALS[WEIGHT_DECAY]!.name
+          }, which between them move the objective by only ${swing(
+            (influence[BATCH_SIZE] ?? 0) + (influence[WEIGHT_DECAY] ?? 0),
           )}. A full factorial cannot choose to skip those — varying everything equally is what makes it a grid.`,
           tone: cracked ? "good" : "bad",
+          conceptHref: LEARNING_RATE_HREF,
+          conceptLabel: "Why learning rate dominates",
         };
       }
 
       if (strategy === "random") {
+        // Judged against the numbers, never assumed. A single random draw loses
+        // to the grid a real fraction of the time, and a card that said "it wins"
+        // over a run that visibly lost would be teaching the reverse of its own
+        // lesson — that one run is evidence of anything.
+        const grid = gridBest(budget);
+        const gridCracks = grid >= CRACK_THRESHOLD;
+        const resolution =
+          lrSeen > levels
+            ? `${ratioText(lrSeen / Math.max(1, levels))} the grid's resolution`
+            : "no more resolution than the grid";
+        const rate = randomCrackRate(budget);
+        const title = `Random spent ${tries(added.length)} and saw ${learningRates(lrSeen)}`;
+        const onAverage = `over ${CRACK_RATE_RUNS} simulated from-scratch random runs on this budget, ${percent(
+          rate,
+        )} open the safe${gridCracks ? "" : ", and a full grid never does"}`;
+
+        // A run stops at the crack, so a draw can open the safe on its first
+        // try or two — before it has seen more learning rates than the grid.
+        // That is luck, and the card says so instead of crediting the strategy.
+        if (cracked && lrSeen <= levels) {
+          return {
+            key: "random-run-early",
+            title,
+            body: `Best ${points(best.objectiveValue)}${opened} It opened on try ${
+              best.index
+            }, having seen ${learningRates(lrSeen)} — no more than the ${levels} a full grid sees in all ${budget} tries — so coverage had no time to matter. That was a lucky draw, not the strategy paying off: ${onAverage}. One run of anything is luck, which is why the code lane settles the comparison over many seeds rather than on one draw.`,
+            tone: "good",
+            conceptHref: LEARNING_RATE_HREF,
+            conceptLabel: "Why learning rate dominates",
+          };
+        }
+
+        if (cracked) {
+          return {
+            key: "random-run",
+            title,
+            body: `Best ${points(best.objectiveValue)}${opened} ${
+              gridCracks
+                ? `The grid opens it too, but only after spending its whole budget.`
+                : `A full grid spends all ${budget} and tops out at ${points(grid)}, having seen ${learningRates(levels)}.`
+            } That is ${resolution} on the dial that decides the answer. Nothing clever happened here — no draw knew about any other. It wins because it stops spending budget on combinations of dials that were never going to matter.`,
+            tone: "good",
+            conceptHref: LEARNING_RATE_HREF,
+            conceptLabel: "Why learning rate dominates",
+          };
+        }
+
         return {
-          key: "random-run",
-          title: `Random spent ${added.length} tries and saw ${lrSeen} learning rates`,
-          body: `Best ${points(best.objectiveValue)}${
-            cracked ? " — open." : `, against ${percent(CRACK_THRESHOLD)}.`
-          } Same budget as the grid, ${
-            lrSeen > gridLevels(budget)
-              ? `${(lrSeen / Math.max(1, gridLevels(budget))).toFixed(0)}× the resolution`
-              : "different coverage"
-          } on the dial that decides the answer. Nothing clever happened here — no draw knew about any other. It wins because it stops spending budget on combinations of dials that were never going to matter.`,
-          tone: cracked ? "good" : "warn",
+          key: "random-run-unlucky",
+          title,
+          body: `Best ${points(best.objectiveValue)}, against ${percent(
+            CRACK_THRESHOLD,
+          )} — ${
+            best.objectiveValue > grid
+              ? `still above the grid's best of ${points(grid)}`
+              : `below the grid's best of ${points(grid)} this time`
+          }, with ${resolution}. This draw was unlucky: ${onAverage}. One run of anything is luck, which is why the code lane settles the comparison over many seeds rather than on one draw.`,
+          tone: "warn",
+          conceptHref: LEARNING_RATE_HREF,
+          conceptLabel: "Why learning rate dominates",
         };
       }
 
+      // Counted by try number, not by how many this batch added: after some
+      // manual tries, part of the warm-up has already been spent.
+      const modelled = added.filter(
+        (trial) => trial.index > BAYESIAN_SEED_TRIALS,
+      ).length;
       return {
         key: "bayesian-run",
-        title: `Bayesian spent ${added.length} tries, ${
-          added.length - BAYESIAN_SEED_TRIALS > 0
-            ? `${Math.max(0, added.length - BAYESIAN_SEED_TRIALS)} of them modelled`
-            : "all of them on warm-up"
+        title: `Bayesian spent ${tries(added.length)}, ${
+          modelled > 0
+            ? `${modelled} of them modelled`
+            : added.length === 1
+              ? "on warm-up"
+              : "all of them on warm-up"
         }`,
         body: `Best ${points(best.objectiveValue)}${
-          cracked ? " — open." : `, against ${percent(CRACK_THRESHOLD)}.`
-        } Watch where the tries went: clustered where the surrogate expected improvement, sparse where earlier readings had already ruled the region out. That is the difference from random — not better luck on any one try, but never spending a try twice on the same conclusion.`,
+          cracked ? opened : `, against ${percent(CRACK_THRESHOLD)}.`
+        } ${
+          cracked && modelled > 0 && modelled <= 2
+            ? `The first ${BAYESIAN_SEED_TRIALS} readings were enough for the surrogate to point at the right region: it opened the safe on modelled try ${modelled}. `
+            : "Watch where the tries went: clustered where the surrogate expected improvement, sparse where earlier readings had already ruled the region out. "
+        }That is the difference from random — not better luck on any one try, but never spending a try twice on the same conclusion.`,
         tone: cracked ? "good" : "warn",
       };
     }

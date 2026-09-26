@@ -12,6 +12,7 @@ import {
 import { getGameMeta } from "@/lib/catalog";
 import {
   BAYESIAN_SEED_TRIALS,
+  BUDGET,
   CRACK_THRESHOLD,
   DIALS,
   LEARNING_RATE,
@@ -21,11 +22,13 @@ import {
   describePoint,
   distinctValuesTried,
   gridLevels,
+  latestCrackScoring,
   suggestNext,
 } from "./ml";
 import {
   SLUG,
   bestObjective,
+  crackedOn,
   lastTemperature,
   triesLeft,
   triesUsed,
@@ -37,10 +40,23 @@ import { StrategyToggle } from "./StrategyToggle";
 import { VisualLane } from "./VisualLane";
 import { CodeLane } from "./CodeLane";
 
+/**
+ * Exactly the progression engine's rule: one star for a crack, two for a best
+ * score of at least HIGH_SCORE_THRESHOLD, three for that AND a code-lane clear.
+ *
+ * The try number in the second line is derived from the scoring formula rather
+ * than written down, so it cannot drift from what actually earns the star. The
+ * code-lane clear is a crack made by a code-lane call (`api.try()`,
+ * `api.trySuggestion()`, `api.runStrategy()`), not by any click while the code
+ * tab happens to be open.
+ */
 const STAR_CRITERIA = [
   "Crack the safe inside the budget",
-  `Score ${Math.round(HIGH_SCORE_THRESHOLD * 100)}% or better by cracking it early`,
-  "Crack it from the code lane",
+  `Score ${Math.round(HIGH_SCORE_THRESHOLD * 100)}% or better — open it by try ${latestCrackScoring(
+    HIGH_SCORE_THRESHOLD,
+    BUDGET,
+  )} of ${BUDGET}`,
+  "Crack it with a code-lane call (api.try, api.runStrategy)",
 ];
 
 function Controls() {
@@ -51,7 +67,7 @@ function Controls() {
   const phase = useHeistStore((s) => s.phase);
   const used = useHeistStore(triesUsed);
   const left = useHeistStore(triesLeft);
-  const best = useHeistStore(bestObjective);
+  const opened = useHeistStore(crackedOn);
 
   const setDial = useHeistStore((s) => s.setDial);
   const setDials = useHeistStore((s) => s.setDials);
@@ -71,12 +87,7 @@ function Controls() {
 
   return (
     <div className="flex flex-col gap-4">
-      <BudgetCounter
-        used={used}
-        budget={budget}
-        bestObjective={best}
-        crackThreshold={CRACK_THRESHOLD}
-      />
+      <BudgetCounter used={used} budget={budget} crackedOn={opened} />
 
       <div className="border-t border-border pt-4">
         <StrategyToggle
@@ -138,18 +149,21 @@ function Controls() {
                 onClick={() => runToBudget(strategy)}
                 icon={<FastForward className="size-4" />}
               >
-                Spend all {left} on {strategy}
+                Spend up to {left} on {strategy}
               </Button>
             ) : null}
           </>
         ) : (
+          // Honest about what it is: the same safe with a fresh budget. The
+          // surface does not move between attempts; only the random strategy's
+          // draw does.
           <Button
             variant="primary"
             className="w-full"
             onClick={reset}
             icon={<RotateCcw className="size-4" />}
           >
-            New safe
+            Crack it again
           </Button>
         )}
 
@@ -200,8 +214,12 @@ export default function HyperparameterHeist() {
 
   // Deliberately NOT computed here: what the current dials would score. It is one
   // call to objectiveAt away, and showing it would hand the player unlimited free
-  // readings — which is the one thing the compute budget exists to prevent. The
-  // only way to learn a value in this game is to spend a try on it.
+  // readings — which is the one thing the compute budget exists to prevent. In
+  // the visual lane the only way to learn a value is to spend a try on it. The
+  // code lane does expose `api.objectiveAt` and `api.simulate`, because settling
+  // "random beats grid" needs hundreds of free runs; a player can use those to
+  // look up the answer, and that is a known, accepted trade for being able to run
+  // the experiment at all.
 
   /**
    * The live metric (pedagogy contract #3): the best objective found so far, which
@@ -290,7 +308,7 @@ export default function HyperparameterHeist() {
       }}
       onRetry={reset}
       onNext={phase === "cracked" ? reset : undefined}
-      nextLabel={phase === "cracked" ? "Another safe" : undefined}
+      nextLabel={phase === "cracked" ? "Crack it again" : undefined}
     />
   );
 }

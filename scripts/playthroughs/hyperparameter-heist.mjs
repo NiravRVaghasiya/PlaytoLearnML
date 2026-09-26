@@ -150,7 +150,9 @@ export async function run({ page, check, metricText }) {
     /full factorial|thorough/i.test(await whyRegion.innerText()),
   );
 
-  await page.getByRole("button", { name: /Spend all .* on grid/ }).click();
+  // "Spend up to": a strategy run stops the moment the safe opens. The grid
+  // never opens it, so here it still spends everything.
+  await page.getByRole("button", { name: /Spend up to .* on grid/ }).click();
   await page.waitForTimeout(500);
 
   check(
@@ -216,7 +218,7 @@ export async function run({ page, check, metricText }) {
 
   // ── Bayesian mode surfaces the acquisition function ──
   console.log("\nBayesian mode surfaces the acquisition suggestion");
-  await page.getByRole("button", { name: /New safe/ }).click();
+  await page.getByRole("button", { name: /Crack it again/ }).click();
   await page.waitForTimeout(300);
   await page.getByRole("radio", { name: /Bayesian/ }).check();
   await page.waitForTimeout(300);
@@ -238,7 +240,7 @@ export async function run({ page, check, metricText }) {
     `aria-valuenow=${await budgetBar.getAttribute("aria-valuenow")}`,
   );
 
-  await page.getByRole("button", { name: /Spend all .* on bayesian/ }).click();
+  await page.getByRole("button", { name: /Spend up to .* on bayesian/ }).click();
   await page.waitForTimeout(1500);
   check(
     "Bayesian search cracks the safe",
@@ -252,6 +254,18 @@ export async function run({ page, check, metricText }) {
     /open/i.test(await whyRegion.innerText()),
     (await whyRegion.innerText()).split("\n")[0] ?? "",
   );
+  const spentOnBayes = Number(await budgetBar.getAttribute("aria-valuenow"));
+  const openedOn = Number(
+    (await page.locator("body").innerText()).match(/Open on try (\d+)/)?.[1] ??
+      NaN,
+  );
+  check(
+    // The run stops at the crack, so the tries left are the score's tries to
+    // spare, and the readout names the try that actually opened it.
+    "the run stops at the crack, and the readout names that try",
+    Number.isFinite(openedOn) && openedOn === spentOnBayes && spentOnBayes < 16,
+    `opened on ${openedOn}, spent ${spentOnBayes} of 16`,
+  );
 
   // ── the code lane settles the claim over many runs ──
   console.log("\nCode lane: the comparison, over many runs");
@@ -259,6 +273,7 @@ export async function run({ page, check, metricText }) {
   const editor = page.getByLabel("Cracking script");
   check("code lane editor present", await editor.isVisible());
 
+  const budgetBeforeSnippet = await budgetBar.getAttribute("aria-valuenow");
   await editor.fill(
     [
       "const RUNS = 40;",
@@ -312,8 +327,8 @@ export async function run({ page, check, metricText }) {
   );
   check(
     "simulating strategies costs the player no budget",
-    (await budgetBar.getAttribute("aria-valuenow")) === "16",
-    `aria-valuenow=${await budgetBar.getAttribute("aria-valuenow")} (run already finished)`,
+    (await budgetBar.getAttribute("aria-valuenow")) === budgetBeforeSnippet,
+    `aria-valuenow ${budgetBeforeSnippet} -> ${await budgetBar.getAttribute("aria-valuenow")}`,
   );
   check(
     "XP bar present",

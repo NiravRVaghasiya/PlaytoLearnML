@@ -1,9 +1,12 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { HIGH_SCORE_THRESHOLD, useProgression } from "@/engine/progression";
+import { createJsExecutor } from "@/engine/useCodeLane";
 import {
   BASE_SCORE,
   BATCH_SIZE,
   BAYESIAN_SEED_TRIALS,
   BUDGET,
+  CRACK_RATE_RUNS,
   CRACK_THRESHOLD,
   DIALS,
   DIAL_COUNT,
@@ -12,6 +15,7 @@ import {
   MOMENTUM,
   WEIGHT_DECAY,
   bestTrial,
+  crackScore,
   describePoint,
   dialInfluence,
   distinctValuesTried,
@@ -19,10 +23,13 @@ import {
   evaluateRun,
   expectedImprovement,
   fitSurrogate,
+  gridBest,
   gridLevels,
   gridPoints,
   haltonPoints,
+  latestCrackScoring,
   objectiveAt,
+  randomCrackRate,
   randomPoints,
   runStrategy,
   standardNormalCdf,
@@ -34,12 +41,17 @@ import {
   type Trial,
 } from "./ml";
 import {
+  RANDOM_SEED,
   bestObjective,
+  crackedOn,
   lastTemperature,
+  randomSeedFor,
   triesLeft,
   triesUsed,
   useHeistStore,
 } from "./store";
+import { whyCardFor } from "./why-cards";
+import { STARTER_CODE, createCodeApi } from "./code-api";
 
 /** How many runs to average a stochastic strategy over. */
 const RUNS = 120;
@@ -737,4 +749,403 @@ describe("the store's heist flow", () => {
     expect(store.getState().phase).toBe("cracking");
     expect(store.getState().failure).toBeNull();
   });
+});
+
+describe("the visual lane's random run", () => {
+  const store = useHeistStore;
+
+  beforeEach(() => {
+    store.getState().reset();
+  });
+
+  it("opens the safe on the first attempt, as random search usually does", () => {
+    // The old fixed seed was one of the ~20% of draws that never crack, so every
+    // player's first random run lost to the grid while the copy said it won.
+    const trials = runStrategy("random", BUDGET, randomSeedFor(0));
+    expect(bestTrial(trials)!.objectiveValue).toBeGreaterThanOrEqual(CRACK_THRESHOLD);
+    expect(bestTrial(trials)!.objectiveValue).toBeGreaterThan(gridBest(BUDGET));
+  });
+
+  it("draws afresh on each attempt, reproducibly", () => {
+    const attempt = store.getState().attempt;
+    store.getState().runToBudget("random");
+    const first = store.getState().trials.map((trial) => trial.params);
+    expect(first[0]).toEqual(randomPoints(BUDGET, randomSeedFor(attempt))[0]);
+
+    store.getState().reset();
+    expect(store.getState().attempt).toBe(attempt + 1);
+    store.getState().runToBudget("random");
+    const second = store.getState().trials.map((trial) => trial.params);
+    expect(second[0]).not.toEqual(first[0]);
+    expect(randomSeedFor(0)).toBe(RANDOM_SEED);
+  });
+
+  it("stops spending the moment the safe opens", () => {
+    // A tuner with a target stops too, and every try it did not need is score.
+    store.getState().setStrategy("bayesian");
+    store.getState().runToBudget("bayesian");
+    const state = store.getState();
+    expect(state.phase).toBe("cracked");
+    expect(crackedOn(state)).toBe(state.trials.length);
+    expect(triesLeft(state)).toBeGreaterThan(0);
+    // The budget readout and the score agree about which try opened it.
+    expect(state.evaluation!.score).toBeCloseTo(
+      crackScore(crackedOn(state)!, BUDGET),
+      12,
+    );
+  });
+});
+
+describe("the random run's WhyCard", () => {
+  // Found by search rather than written down, like CRACKING_POINT.
+  const UNLUCKY_SEED = (() => {
+    for (let seed = 1; seed < 5000; seed += 1) {
+      const trials = runStrategy("random", BUDGET, seed);
+      if (bestTrial(trials)!.objectiveValue < CRACK_THRESHOLD) return seed;
+    }
+    throw new Error("every random run cracks");
+  })();
+
+  const cardFor = (trials: Trial[], cracked: boolean) =>
+    whyCardFor({
+      kind: "strategy-run",
+      strategy: "random",
+      trials,
+      added: trials,
+      budget: BUDGET,
+      cracked,
+    });
+
+  it("does not claim a win for a draw that lost", () => {
+    const card = cardFor(runStrategy("random", BUDGET, UNLUCKY_SEED), false);
+    expect(card.body).not.toMatch(/It wins/);
+    expect(card.body).toMatch(/unlucky/i);
+    expect(card.tone).toBe("warn");
+  });
+
+  it("quotes the crack rate it measured, not one it assumed", () => {
+    let cracked = 0;
+    for (let seed = 1; seed <= CRACK_RATE_RUNS; seed += 1) {
+      const best = bestTrial(runStrategy("random", BUDGET, seed))!;
+      if (best.objectiveValue >= CRACK_THRESHOLD) cracked += 1;
+    }
+    expect(randomCrackRate(BUDGET)).toBe(cracked / CRACK_RATE_RUNS);
+    expect(randomCrackRate(BUDGET)).toBeGreaterThan(0.6);
+
+    const card = cardFor(runStrategy("random", BUDGET, UNLUCKY_SEED), false);
+    expect(card.body).toContain(
+      `${Math.round(randomCrackRate(BUDGET) * 100)}% open the safe`,
+    );
+    expect(card.body).toContain(`${CRACK_RATE_RUNS} simulated`);
+  });
+
+  it("compares against the grid's real best, whichever side it lands", () => {
+    const card = cardFor(runStrategy("random", BUDGET, UNLUCKY_SEED), false);
+    expect(card.body).toContain(`${(gridBest(BUDGET) * 100).toFixed(1)}%`);
+  });
+
+  it("credits a random run that did open the safe", () => {
+    const trials = runStrategy("random", BUDGET, randomSeedFor(0));
+    const first = trials.findIndex((trial) => trial.objectiveValue >= CRACK_THRESHOLD);
+    const card = cardFor(trials.slice(0, first + 1), true);
+    expect(card.body).toMatch(/open/);
+    expect(card.body).toMatch(/It wins/);
+    expect(card.tone).toBe("good");
+  });
+
+  it("calls a first-try crack luck, not a strategy winning", () => {
+    // A run stops at the crack, so some draws open the safe on try 1 having
+    // seen one learning rate. That card used to say "no more resolution than
+    // the grid" and then "It wins because…" in the same breath.
+    const seed = (() => {
+      for (let candidate = 1; candidate < 5000; candidate += 1) {
+        const first = runStrategy("random", BUDGET, candidate)[0]!;
+        if (first.objectiveValue >= CRACK_THRESHOLD) return candidate;
+      }
+      throw new Error("no random run cracks on its first try");
+    })();
+    const card = cardFor(runStrategy("random", BUDGET, seed).slice(0, 1), true);
+
+    expect(card.title).toBe("Random spent 1 try and saw 1 learning rate");
+    expect(card.body).toMatch(/opened on try 1/);
+    expect(card.body).toMatch(/lucky/i);
+    expect(card.body).not.toMatch(/It wins/);
+    expect(card.body).not.toMatch(/no more resolution/);
+    expect(card.body).toContain(
+      `${Math.round(randomCrackRate(BUDGET) * 100)}% open the safe`,
+    );
+    expect(card.body).toContain("15 tries to spare");
+  });
+
+  it("never credits the strategy on a crack that saw no more learning rates than the grid", () => {
+    // Every attempt the visual lane can draw, driven through the real store so
+    // the card is judged on the truncated run it actually receives.
+    const store = useHeistStore;
+    const levels = gridLevels(BUDGET);
+    let early = 0;
+    let credited = 0;
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      store.getState().reset();
+      store.getState().setStrategy("random");
+      store.getState().runToBudget("random");
+      const state = store.getState();
+      if (state.phase !== "cracked") continue;
+      const body = state.whyCard!.body;
+      if (distinctValuesTried(state.trials, LEARNING_RATE) <= levels) {
+        early += 1;
+        expect(body, `attempt ${state.attempt}`).not.toMatch(/It wins/);
+        expect(body, `attempt ${state.attempt}`).toMatch(/lucky/i);
+      } else {
+        credited += 1;
+        expect(body, `attempt ${state.attempt}`).toMatch(/It wins/);
+      }
+    }
+    // Both branches are genuinely exercised by the draws a player can get.
+    expect(early).toBeGreaterThan(0);
+    expect(credited).toBeGreaterThan(0);
+  });
+});
+
+describe("Bayesian simulations are genuinely different runs", () => {
+  it("varies its warm-up with the seed, so an average is an average", () => {
+    // The warm-up was the same four Halton points for every seed, so sixty
+    // "runs" were four distinct sequences and two distinct results.
+    const runs = Array.from({ length: 60 }, (_, index) =>
+      runStrategy("bayesian", BUDGET, (index + 1) * 7919),
+    );
+    const openings = new Set(
+      runs.map((trials) =>
+        trials
+          .slice(0, BAYESIAN_SEED_TRIALS)
+          .map((trial) => trial.params.map((value) => value.toFixed(4)).join(","))
+          .join("|"),
+      ),
+    );
+    const bests = new Set(
+      runs.map((trials) => bestTrial(trials)!.objectiveValue.toFixed(6)),
+    );
+    expect(openings.size).toBe(60);
+    expect(bests.size).toBeGreaterThan(20);
+  });
+
+  it("keeps the visual lane's hint identical on every safe", () => {
+    // The hint box and "Spend up to … on bayesian" must agree with each other.
+    expect(suggestNext([]).point).toEqual(haltonPoints(BAYESIAN_SEED_TRIALS, 1)[0]);
+  });
+
+  it("hands back a copy of its pick, never a shared candidate", () => {
+    const seeded = asTrials(haltonPoints(BAYESIAN_SEED_TRIALS, 1), "bayesian");
+    const first = suggestNext(seeded);
+    first.point[0] = 42;
+    expect(suggestNext(seeded).point[0]).not.toBe(42);
+  });
+});
+
+describe("non-finite input cannot poison a run", () => {
+  const store = useHeistStore;
+
+  beforeEach(() => {
+    store.getState().reset();
+  });
+
+  it("puts a NaN dial back to the centre instead of trying it", () => {
+    store.getState().setDials([0.3, 0.5, Number.NaN, 0.5]);
+    expect(store.getState().dials).toEqual([0.3, 0.5, 0.5, 0.5]);
+    store.getState().setDial(0, Number.NaN);
+    expect(store.getState().dials[0]).toBe(0.3);
+    const trial = store.getState().tryCurrent()!;
+    expect(Number.isFinite(trial.objectiveValue)).toBe(true);
+  });
+
+  it("never lets a NaN reading become the best", () => {
+    const poisoned: Trial = {
+      params: [0.5, 0.5, 0.5, 0.5],
+      objectiveValue: Number.NaN,
+      index: 1,
+      source: "manual",
+    };
+    const crack: Trial = {
+      params: CRACKING_POINT,
+      objectiveValue: objectiveAt(CRACKING_POINT),
+      index: 2,
+      source: "manual",
+    };
+    expect(bestTrial([poisoned, crack])).toBe(crack);
+    const evaluation = evaluateRun({
+      trials: [poisoned, crack],
+      budget: BUDGET,
+      finished: false,
+    });
+    expect(evaluation.outcome).toBe("cracked");
+  });
+});
+
+describe("scoring and the star criteria", () => {
+  it("states the try that still earns the high-score star, from the formula", () => {
+    const latest = latestCrackScoring(HIGH_SCORE_THRESHOLD, BUDGET);
+    expect(crackScore(latest, BUDGET)).toBeGreaterThanOrEqual(HIGH_SCORE_THRESHOLD);
+    expect(crackScore(latest + 1, BUDGET)).toBeLessThan(HIGH_SCORE_THRESHOLD);
+    expect(latest).toBe(9);
+  });
+
+  it("scores a crack on the first try as perfect and falls with every try", () => {
+    expect(crackScore(1, BUDGET)).toBe(1);
+    for (let tryNumber = 2; tryNumber <= BUDGET; tryNumber += 1) {
+      expect(crackScore(tryNumber, BUDGET)).toBeLessThan(
+        crackScore(tryNumber - 1, BUDGET),
+      );
+    }
+  });
+});
+
+describe("the Grid trap names numbers it measured", () => {
+  it("reports the dominant dial's swing in points, and the real resolution ratio", () => {
+    const evaluation = evaluateRun({
+      trials: runStrategy("grid", BUDGET, 0),
+      budget: BUDGET,
+      finished: true,
+    });
+    const swing = Math.round(dialInfluence()[LEARNING_RATE]! * 100);
+    expect(evaluation.failure!.detail).toContain(`by ${swing} points`);
+    expect(evaluation.failure!.detail).toContain(
+      `${BUDGET / gridLevels(BUDGET)} times the resolution`,
+    );
+    // It used to call that absolute swing a percentage of the range.
+    expect(evaluation.failure!.detail).not.toMatch(/of this safe's range/);
+  });
+});
+
+describe("the code-lane star follows the action, not the tab", () => {
+  const store = useHeistStore;
+  const recorded: Array<{ lane: string; codeLaneCleared: boolean }> = [];
+  const realRecord = useProgression.getState().recordResult;
+
+  beforeEach(() => {
+    recorded.length = 0;
+    useProgression.setState({
+      recordResult: vi.fn((result: Parameters<typeof realRecord>[0]) => {
+        recorded.push({ lane: result.lane, codeLaneCleared: result.codeLaneCleared === true });
+        return realRecord(result);
+      }),
+    });
+    store.getState().reset();
+  });
+
+  afterEach(() => {
+    useProgression.setState({ recordResult: realRecord });
+  });
+
+  it("does not award it for a rail click while the code tab is open", () => {
+    store.getState().setLane("code");
+    store.getState().setDials(CRACKING_POINT);
+    store.getState().tryCurrent();
+    expect(recorded).toEqual([{ lane: "visual", codeLaneCleared: false }]);
+  });
+
+  it("awards it for a crack made by a code-lane call", () => {
+    const api = createCodeApi();
+    api.setDials(CRACKING_POINT);
+    api.try();
+    expect(store.getState().phase).toBe("cracked");
+    expect(recorded).toEqual([{ lane: "code", codeLaneCleared: true }]);
+  });
+
+  it("records a crack once, however often the verb is called again", () => {
+    const api = createCodeApi();
+    api.setDials(CRACKING_POINT);
+    api.try();
+    expect(api.try()).toBeNull();
+    expect(api.runStrategy("random")).toEqual([]);
+    expect(recorded).toHaveLength(1);
+  });
+});
+
+describe("the code-lane api refuses bad input by name", () => {
+  const store = useHeistStore;
+
+  beforeEach(() => {
+    store.getState().reset();
+  });
+
+  it("rejects dials that are not four finite unit coordinates", () => {
+    const api = createCodeApi();
+    expect(() => api.setDials([0.3, 0.5, Number.NaN, 0.5])).toThrow(/finite number/);
+    expect(() => api.setDials([0.3, 0.5])).toThrow(/4 unit coordinates/);
+    expect(() => api.setDials([0.3, 0.5, 32, 0.5])).toThrow(/\[0, 1\]/);
+    expect(() => api.setDials("centre")).toThrow(/4 unit coordinates/);
+    expect(store.getState().dials).toEqual(new Array(DIAL_COUNT).fill(0.5));
+    expect(triesUsed(store.getState())).toBe(0);
+  });
+
+  it("rejects a real value its dial cannot hold", () => {
+    const api = createCodeApi();
+    expect(() => api.setDialValue(0, -1)).toThrow(/learning rate runs from/);
+    expect(() => api.setDialValue(2, 512)).toThrow(/batch size runs from/);
+    expect(() => api.setDialValue(7, 0.1)).toThrow(/no dial 7/);
+    expect(() => api.setDialValue(0, Number.NaN)).toThrow(/finite number/);
+    api.setDialValue(0, 0.01);
+    expect(store.getState().dials[0]).toBeCloseTo(0.5, 8);
+  });
+
+  it("will not simulate a strategy it does not know", () => {
+    const api = createCodeApi();
+    // "Random" used to run Bayesian search under the typo's label.
+    expect(() => api.simulate("Random", 1)).toThrow(/unknown strategy "Random"/);
+    expect(() => api.runStrategy("grd")).toThrow(/unknown strategy/);
+    expect(() => api.simulate("random", 1.5)).toThrow(/whole-number seed/);
+    expect(() => api.simulate("random", -3)).toThrow(/whole-number seed/);
+    expect(api.simulate("random", 3).strategy).toBe("random");
+  });
+
+  it("hands back copies, so a snippet cannot edit the store behind its back", () => {
+    const api = createCodeApi();
+    const trial = api.try()!;
+    trial.params[0] = 0.99;
+    expect(store.getState().trials[0]!.params[0]).toBe(0.5);
+    const planned = api.runStrategy("grid");
+    planned[0]!.params[0] = 0.01;
+    expect(store.getState().trials[1]!.params[0]).not.toBe(0.01);
+  });
+
+  it("exposes the visual lane's random seed for this attempt", () => {
+    const api = createCodeApi();
+    expect(api.randomSeed()).toBe(randomSeedFor(store.getState().attempt));
+    store.getState().runToBudget("random");
+    expect(store.getState().trials[0]!.params).toEqual(
+      api.randomPoints(api.randomSeed())[0],
+    );
+  });
+});
+
+describe("the starter snippet", () => {
+  it("runs to the end, pauses between runs, and prints the three rows", async () => {
+    const logs: string[] = [];
+    let budgetChecks = 0;
+    await createJsExecutor<ReturnType<typeof createCodeApi>>()(STARTER_CODE, {
+      api: createCodeApi(),
+      log: (...args: unknown[]) => logs.push(args.map(String).join(" ")),
+      checkBudget: () => {
+        budgetChecks += 1;
+      },
+    });
+    // A result row starts with the padded strategy name; "grid at this
+    // budget:" does not.
+    const rowOf = (name: string) =>
+      logs.find((line) => line.startsWith(`${name.padEnd(10)} `));
+    for (const strategy of ["grid", "random", "bayesian"]) {
+      expect(rowOf(strategy), strategy).toBeDefined();
+    }
+    // It yields to the page (and so can be stopped) rather than running a
+    // hundred searches in one long task.
+    expect(budgetChecks).toBeGreaterThan(40);
+    const crackColumn = (name: string) =>
+      Number(
+        rowOf(name)!
+          .trim()
+          .split(/\s+/)[2]!
+          .replace("%", ""),
+      );
+    expect(crackColumn("grid")).toBe(0);
+    expect(crackColumn("bayesian")).toBeGreaterThan(crackColumn("random"));
+  }, 120000);
 });

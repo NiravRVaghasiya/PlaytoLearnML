@@ -3,8 +3,8 @@
 export interface BudgetCounterProps {
   used: number;
   budget: number;
-  bestObjective: number;
-  crackThreshold: number;
+  /** The try that opened the safe, or null while it is shut. */
+  crackedOn: number | null;
 }
 
 /**
@@ -13,16 +13,15 @@ export interface BudgetCounterProps {
  * The compute budget is the entire constraint of the game — without it, every
  * strategy eventually finds the optimum and there is nothing to teach. So it is
  * shown as a depleting resource rather than a running total.
+ *
+ * The crack is reported by its own try number, not by how many tries have been
+ * spent. The score counts from the try that opened the safe, so a readout that
+ * named any other try would contradict the number beside it.
  */
-export function BudgetCounter({
-  used,
-  budget,
-  bestObjective,
-  crackThreshold,
-}: BudgetCounterProps) {
+export function BudgetCounter({ used, budget, crackedOn }: BudgetCounterProps) {
   const left = Math.max(0, budget - used);
   const fraction = Math.min(1, used / Math.max(1, budget));
-  const cracked = bestObjective >= crackThreshold;
+  const cracked = crackedOn !== null;
 
   return (
     <div>
@@ -52,7 +51,7 @@ export function BudgetCounter({
 
       <p className="mt-1.5 text-xs text-text-muted">
         {cracked
-          ? `Open on try ${used}. Every try you did not need is score.`
+          ? `Open on try ${crackedOn}. Every try you did not need is score.`
           : left === 0
             ? "No tries left."
             : `Each try buys one reading of the objective. Nothing else.`}

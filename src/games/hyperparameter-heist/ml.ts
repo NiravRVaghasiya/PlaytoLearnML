@@ -14,8 +14,9 @@ import { clamp, seededRandom } from "@/lib/utils";
  * For that claim to be taught rather than asserted, the objective has to actually
  * have low effective dimensionality — and the comparison has to be measured over
  * many runs, because any single run is luck. Both are done here: the surface below
- * puts 84% of its range in one dial, and the tests simulate hundreds of runs of
- * each strategy.
+ * puts most of its range in one dial (`dialInfluence` measures how much, rather
+ * than this comment asserting a figure that could drift), and the tests simulate
+ * hundreds of runs of each strategy.
  *
  * ── Deviations from the spec, flagged ───────────────────────────────────────
  * 1. The spec asks for a "real objective surface in TF.js". This is a closed-form
@@ -224,7 +225,13 @@ export function objectiveAt(unit: UnitPoint): number {
   );
 }
 
-/** Objective at the true optimum, found by a dense sweep in the tests. */
+/**
+ * The objective a try has to reach to open the safe.
+ *
+ * Not the optimum — the true peak sits near 0.99, which the tests confirm by a
+ * dense sweep. The bar is set below it so that "opening the safe" means landing
+ * in the optimum REGION, as the spec asks, rather than on one exact point.
+ */
 export const CRACK_THRESHOLD = 0.9;
 
 export interface Trial {
@@ -253,6 +260,19 @@ export function temperatureOf(objective: number): Temperature {
 // ── Strategies ────────────────────────────────────────────────────────────
 
 export type Strategy = "grid" | "random" | "bayesian";
+
+export const STRATEGIES: readonly Strategy[] = ["grid", "random", "bayesian"];
+
+/**
+ * Whether a value names a strategy.
+ *
+ * The code lane needs this before calling `runStrategy`, which would otherwise
+ * treat any unknown string — `"Random"`, say — as Bayesian and label the result
+ * with the typo.
+ */
+export function isStrategy(value: unknown): value is Strategy {
+  return (STRATEGIES as readonly unknown[]).includes(value);
+}
 
 export const STRATEGY_LABELS: Record<Strategy, string> = {
   grid: "Grid",
@@ -510,14 +530,42 @@ export function expectedImprovement(
   point: UnitPoint,
 ): number {
   const { mean, sd } = surrogate.predict(point);
+  return improvementFrom(mean, sd, surrogate.best);
+}
+
+/**
+ * EI from a prediction already in hand.
+ *
+ * Split out so the acquisition scan can predict each candidate once and use the
+ * same numbers for the score and for the suggestion it reports. It used to
+ * predict twice per new leader, and the scan is the hot loop of every Bayesian
+ * simulation the code lane runs.
+ */
+function improvementFrom(mean: number, sd: number, best: number): number {
   if (sd <= 1e-9) return 0;
-  const gap = mean - surrogate.best - EI_EXPLORATION;
+  const gap = mean - best - EI_EXPLORATION;
   const z = gap / sd;
   return gap * standardNormalCdf(z) + sd * standardNormalPdf(z);
 }
 
 /** How many seed points Bayesian search spends before it can model anything. */
 export const BAYESIAN_SEED_TRIALS = 4;
+
+/** The visual lane's warm-up: the first Halton points, identical on every safe. */
+const DEFAULT_WARMUP: readonly UnitPoint[] = haltonPoints(BAYESIAN_SEED_TRIALS, 1);
+
+/**
+ * The acquisition maximiser's candidate set, built once.
+ *
+ * Every hint in the visual lane scanned a freshly generated copy of the same 512
+ * points. They are deterministic, so they are computed once and shared; nothing
+ * downstream mutates them, and `suggestNext` hands back a copy of the winner.
+ */
+let sharedCandidates: UnitPoint[] | null = null;
+function defaultCandidates(): UnitPoint[] {
+  sharedCandidates ??= haltonPoints(512);
+  return sharedCandidates;
+}
 
 export interface Suggestion {
   point: UnitPoint;
@@ -529,16 +577,25 @@ export interface Suggestion {
 /**
  * Where Bayesian search wants to look next.
  *
- * With fewer than `BAYESIAN_SEED_TRIALS` observations it returns a Halton point
+ * With fewer than `BAYESIAN_SEED_TRIALS` observations it returns a warm-up point
  * instead: a surrogate fitted to one or two samples has no information to offer,
  * and pretending otherwise would just be an expensive random guess.
+ *
+ * The warm-up defaults to the first Halton points, so the visual lane's hint is
+ * the same on every safe and matches what "Spend up to … on bayesian" then does.
+ * `runStrategy` passes a SEEDED warm-up instead. That matters more than it looks:
+ * the warm-up is the only part of Bayesian search that varies from run to run in
+ * practice, so with a fixed one, sixty "different" simulated runs were four
+ * distinct sequences, and the crack rate they reported was one run's result
+ * dressed up as an average.
  */
 export function suggestNext(
   trials: Trial[],
-  candidates = haltonPoints(512),
+  candidates = defaultCandidates(),
+  warmup: readonly UnitPoint[] = DEFAULT_WARMUP,
 ): Suggestion {
   if (trials.length < BAYESIAN_SEED_TRIALS) {
-    const point = haltonPoints(BAYESIAN_SEED_TRIALS, 1)[trials.length]!;
+    const point = [...warmup[trials.length]!];
     return {
       point,
       expectedImprovement: Number.NaN,
@@ -550,7 +607,7 @@ export function suggestNext(
   const surrogate = fitSurrogate(trials);
   if (surrogate === null) {
     return {
-      point: candidates[0]!,
+      point: [...candidates[0]!],
       expectedImprovement: Number.NaN,
       predictedMean: Number.NaN,
       predictedSd: Number.NaN,
@@ -566,9 +623,9 @@ export function suggestNext(
     );
     if (tooClose) continue;
 
-    const ei = expectedImprovement(surrogate, candidate);
+    const { mean, sd } = surrogate.predict(candidate);
+    const ei = improvementFrom(mean, sd, surrogate.best);
     if (best === null || ei > best.expectedImprovement) {
-      const { mean, sd } = surrogate.predict(candidate);
       best = {
         point: candidate,
         expectedImprovement: ei,
@@ -578,12 +635,16 @@ export function suggestNext(
     }
   }
 
-  return best ?? {
-    point: candidates[0]!,
-    expectedImprovement: 0,
-    predictedMean: Number.NaN,
-    predictedSd: Number.NaN,
-  };
+  // A copy: the candidate set can be shared between calls, and a caller that
+  // records this point must not be holding a reference into it.
+  return best
+    ? { ...best, point: [...best.point] }
+    : {
+        point: [...candidates[0]!],
+        expectedImprovement: 0,
+        predictedMean: Number.NaN,
+        predictedSd: Number.NaN,
+      };
 }
 
 /** Run a strategy for a whole budget, from scratch. Used by the tests and the code lane. */
@@ -613,18 +674,34 @@ export function runStrategy(
     return trials;
   }
 
-  // Bayesian: seed points, then Expected Improvement, one at a time.
-  const candidates = haltonPoints(512, 1 + (seed % 97));
+  // Bayesian: seeded warm-up points, then Expected Improvement, one at a time.
+  //
+  // The warm-up is drawn from the seed like a random run's first tries, because
+  // that is where a real Bayesian optimiser's run-to-run variation comes from.
+  // The candidate set stays Halton (shifted by the seed) so the maximiser itself
+  // is not a second source of luck — see `haltonPoints`.
+  const warmup = randomPoints(BAYESIAN_SEED_TRIALS, seed);
+  const candidates = haltonPoints(512, 1 + (Math.abs(seed) % 97));
   while (trials.length < budget) {
-    record(suggestNext(trials, candidates).point);
+    record(suggestNext(trials, candidates, warmup).point);
   }
   return trials;
 }
 
+/**
+ * The highest-scoring try, ignoring any that did not produce a number.
+ *
+ * A non-finite reading can only come from bad input, and it must not become the
+ * "best": `x > NaN` is always false, so a NaN incumbent could never be displaced
+ * and every later genuine crack would go unnoticed.
+ */
 export function bestTrial(trials: Trial[]): Trial | null {
   return trials.reduce<Trial | null>(
     (best, trial) =>
-      best === null || trial.objectiveValue > best.objectiveValue ? trial : best,
+      Number.isFinite(trial.objectiveValue) &&
+      (best === null || trial.objectiveValue > best.objectiveValue)
+        ? trial
+        : best,
     null,
   );
 }
@@ -688,6 +765,65 @@ export interface Evaluation {
 
 const percent = (value: number) => `${Math.round(value * 100)}%`;
 const points = (value: number) => `${(value * 100).toFixed(1)}%`;
+/**
+ * An objective DIFFERENCE, in accuracy points. Kept apart from `percent` on
+ * purpose: "the learning rate moves the objective by 42 points" and "the learning
+ * rate controls 42% of the range" are different claims, and only the first is
+ * what `dialInfluence` measures.
+ */
+const swing = (value: number) => `${Math.round(value * 100)} points`;
+
+/**
+ * The score for opening the safe on a given try.
+ *
+ * Cracking with tries to spare is worth more than cracking on the last turn, per
+ * the spec's "fewer tries = higher score": 1.0 on the first try, falling by an
+ * equal step per try spent, and never below 0.6 for a crack. Exported so the star
+ * criteria can state which try still earns the high-score star, rather than
+ * leaving the player to invert this formula.
+ */
+export function crackScore(crackedOn: number, budget: number): number {
+  const efficiency = 1 - (crackedOn - 1) / Math.max(1, budget);
+  return clamp(0.6 + 0.4 * efficiency, 0, 1);
+}
+
+/** The latest try that still scores at least `threshold` when it opens the safe. */
+export function latestCrackScoring(threshold: number, budget: number): number {
+  let latest = 0;
+  for (let crackedOn = 1; crackedOn <= budget; crackedOn += 1) {
+    if (crackScore(crackedOn, budget) >= threshold) latest = crackedOn;
+  }
+  return latest;
+}
+
+/**
+ * How often a from-scratch random run on this budget opens the safe.
+ *
+ * Measured, over many seeds, so that a WhyCard for one unlucky random run can say
+ * what random search does ON AVERAGE without quoting a number nobody computed.
+ * Random runs cost sixteen closed-form evaluations each, so a thousand of them is
+ * a few milliseconds, and the result is cached per budget.
+ */
+export const CRACK_RATE_RUNS = 1000;
+const randomCrackRates = new Map<number, number>();
+export function randomCrackRate(budget: number, runs = CRACK_RATE_RUNS): number {
+  const key = budget * 100_000 + runs;
+  const cached = randomCrackRates.get(key);
+  if (cached !== undefined) return cached;
+  let cracked = 0;
+  for (let seed = 1; seed <= runs; seed += 1) {
+    const best = bestTrial(runStrategy("random", budget, seed));
+    if (best !== null && best.objectiveValue >= CRACK_THRESHOLD) cracked += 1;
+  }
+  const rate = cracked / runs;
+  randomCrackRates.set(key, rate);
+  return rate;
+}
+
+/** The best a full grid ever does on this budget. Deterministic, so one run. */
+export function gridBest(budget: number): number {
+  return bestTrial(runStrategy("grid", budget, 0))?.objectiveValue ?? Number.NaN;
+}
 
 /**
  * How few distinct values of the dominant dial counts as having not searched it.
@@ -733,13 +869,12 @@ export function evaluateRun({
     const crackedOn =
       trials.find((trial) => trial.objectiveValue >= CRACK_THRESHOLD)?.index ??
       triesUsed;
-    const efficiency = 1 - (crackedOn - 1) / Math.max(1, budget);
     return {
       outcome: "cracked",
       best,
       triesUsed,
       budget,
-      score: clamp(0.6 + 0.4 * efficiency, 0, 1),
+      score: crackScore(crackedOn, budget),
       failure: null,
     };
   }
@@ -768,6 +903,7 @@ export function evaluateRun({
   const dial = DIALS[dominant]!;
 
   if (distinct <= GRID_TRAP_DISTINCT) {
+    const levels = gridLevels(budget);
     return {
       outcome: "grid-trap",
       best,
@@ -780,17 +916,15 @@ export function evaluateRun({
           dial.name
         } value${distinct === 1 ? "" : "s"} among them — best ${points(
           best.objectiveValue,
-        )} against the ${percent(
-          CRACK_THRESHOLD,
-        )} needed. ${dial.name} controls ${percent(
+        )} against the ${percent(CRACK_THRESHOLD)} needed. ${
+          dial.name.charAt(0).toUpperCase() + dial.name.slice(1)
+        } alone swings this safe's objective by ${swing(
           dialInfluence()[dominant] ?? 0,
-        )} of this safe's range on its own, and you sampled it ${distinct} time${
+        )}, more than any other dial, and you looked at just ${distinct} setting${
           distinct === 1 ? "" : "s"
-        }. A full grid over ${DIAL_COUNT} dials at ${gridLevels(
-          budget,
-        )} levels each costs every one of your ${budget} tries and still only ever sees ${gridLevels(
-          budget,
-        )} values of it. The same ${budget} tries placed at random would have sampled ${budget} different values — the same budget, eight times the resolution where it counts.`,
+        } of it. A full grid over ${DIAL_COUNT} dials at ${levels} levels each costs every one of your ${budget} tries and still only ever sees ${levels} values of it. The same ${budget} tries placed at random would have sampled ${budget} different values — the same budget, ${Math.round(
+          budget / Math.max(1, levels),
+        )} times the resolution where it counts.`,
       },
     };
   }
@@ -849,8 +983,8 @@ export const MATH_NOTES = `A grid feels thorough and is not. With ${DIAL_COUNT} 
 )} points. Spend the same ${BUDGET} tries at random and you learn it at ${BUDGET} points. That is the whole of Bergstra and Bengio's argument: the grid spends its budget on dials that do not matter, and it cannot help doing so, because a full factorial has to vary everything equally.
 
 The reason it bites here is that two of these four dials carry almost the whole surface. Sweeping each one alone moves the objective by ${dialInfluence()
-  .map((influence, index) => `${DIALS[index]!.name} ${percent(influence)}`)
-  .join(", ")} — so half your grid budget goes into dials that cannot move the answer more than a couple of points. Note that momentum measures higher than its own weight suggests: it drags the learning rate's optimum with it, and a sweep picks up that interaction too. Real response surfaces look like this more often than not, which is why random search is a genuinely strong default rather than a lazy one.
+  .map((influence, index) => `${DIALS[index]!.name} ${swing(influence)}`)
+  .join(", ")} — so half your grid budget goes into dials that cannot move the answer by more than a few points. Note that momentum measures higher than its own weight suggests: it drags the learning rate's optimum with it, and a sweep picks up that interaction too. Real response surfaces look like this more often than not, which is why random search is a genuinely strong default rather than a lazy one.
 
 Bayesian search does something different again: it fits a model of the objective to what it has already seen, then picks the point where Expected Improvement is highest. Read EI as two competing terms. One says "go where the model predicts a good score", the other says "go where the model has no idea". Pure exploitation would circle the first decent result it found; pure exploration would ignore everything it learned. The sum is why it beats random — not by being cleverer about any single try, but by never wasting one on a region it has already ruled out.
 

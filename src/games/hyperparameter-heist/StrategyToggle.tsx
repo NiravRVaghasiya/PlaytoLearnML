@@ -30,6 +30,9 @@ const OPTIONS: Array<{ value: Strategy | "manual"; label: string; hint: string }
  * Each option states what it does in three words. The grid option also states its
  * cost, because k^d is the number that makes the decision and nobody computes it
  * in their head.
+ *
+ * Every option is at least 44px tall — DESIGN.md's touch-target minimum. These
+ * are the game's primary mode controls, and the whole label is the target.
  */
 export function StrategyToggle({
   strategy,
@@ -46,7 +49,7 @@ export function StrategyToggle({
         {OPTIONS.map((option) => (
           <label
             key={option.value}
-            className={`flex cursor-pointer items-center gap-2 rounded border px-2 py-1.5 text-xs ${
+            className={`flex min-h-11 cursor-pointer items-center gap-2 rounded border px-2 py-1.5 text-xs ${
               option.value === strategy
                 ? "border-primary bg-primary/10"
                 : "border-border bg-surface-2 hover:bg-surface"
