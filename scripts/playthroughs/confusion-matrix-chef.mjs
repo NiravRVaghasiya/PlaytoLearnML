@@ -5,10 +5,10 @@
  * fixed scores, which is the spec's design ("metrics recomputed on threshold
  * change, no retrain needed").
  *
- * The two conceptual failures are checked as a pair on DIFFERENT shifts, because
- * that is the only way to show they are different mistakes: the accuracy paradox
- * needs imbalanced data to bite, and the wrong-side-of-the-tradeoff failure needs
- * a shift where accuracy is not lying.
+ * The conceptual failures are checked on DIFFERENT shifts, because that is the
+ * only way to show they are different mistakes: the accuracy paradox needs
+ * imbalanced data to bite, and the wrong-side-of-the-tradeoff failure (with its
+ * mirror, the overshoot) needs a shift where accuracy is not lying.
  */
 
 export const slug = "confusion-matrix-chef";
@@ -56,6 +56,10 @@ async function setThreshold(page, slider, target) {
 export async function run({ page, check, metricText }) {
   const whyRegion = page.getByRole("region", { name: /why did that happen/i });
   const failure = page.locator('[data-testid="named-failure"]');
+  // The alert's text, not its element count: holds whether the shell unmounts
+  // the alert between failures or keeps an emptied live region mounted.
+  const failureText = async () =>
+    (await failure.allInnerTexts()).join(" ").trim();
   const slider = page.getByRole("slider", { name: /Decision threshold/ });
   const serve = page.getByRole("button", { name: /Serve this cutoff/ });
   const outputRegion = page.getByRole("region", { name: "Script output" });
@@ -181,16 +185,20 @@ export async function run({ page, check, metricText }) {
     ),
   );
 
-  // ── contract #4a: Wrong side of the tradeoff, on a balanced-ish shift ──
+  // ── contract #4a: Wrong side of the tradeoff, and its mirror, the overshoot ──
+  // Both are one metric all but perfect and the other's floor broken, on the
+  // prank shift where precision is what the critic pays for. Recall near 100%
+  // is the WRONG side; precision near 100% is the right side pushed too far —
+  // and only the first may call the other error "the cheaper mistake".
   console.log("\nNamed failure: Wrong side of the tradeoff");
-  await setThreshold(page, slider, 0.9);
+  await setThreshold(page, slider, 0.02);
   await serve.click();
   await page.waitForTimeout(400);
 
-  const wrongSide = (await failure.count()) > 0;
+  const wrongSide = (await failureText()) !== "";
   check("a lopsided cutoff fails the brief", wrongSide);
   if (wrongSide) {
-    const text = await failure.innerText();
+    const text = await failureText();
     check(
       "failure is NAMED 'Wrong side of the tradeoff'",
       /wrong side of the tradeoff/i.test(text) && !/game over/i.test(text),
@@ -203,11 +211,45 @@ export async function run({ page, check, metricText }) {
     );
     check(
       "it names the direction to move the cutoff",
-      /lower the threshold|raise the threshold/i.test(text),
+      /raise the threshold/i.test(text),
+    );
+    check(
+      "it calls the turned-away customer the expensive error, from the brief",
+      /here a paying customer is turned away[^.]*, whereas the kitchen wastes one meal/i.test(
+        text,
+      ),
+      text.replace(/\n/g, " ").slice(0, 200),
     );
     check(
       "retry is one click away inside the alert",
       (await failure.getByRole("button", { name: /retry/i }).count()) > 0,
+    );
+  }
+
+  console.log("\nNamed failure: Overshot the tradeoff (right metric, too far)");
+  await setThreshold(page, slider, 0.9);
+  await serve.click();
+  await page.waitForTimeout(400);
+
+  const overshoot = (await failureText()) !== "";
+  check("pushing precision to ~97% fails the recall floor", overshoot);
+  if (overshoot) {
+    const text = await failureText();
+    check(
+      "failure is NAMED 'Overshot the tradeoff' — a different diagnosis",
+      /overshot the tradeoff/i.test(text) && !/wrong side/i.test(text),
+      text.split("\n")[0],
+    );
+    check(
+      "it names the opposite direction",
+      /lower the threshold/i.test(text),
+    );
+    check(
+      "it never calls the error the critic fears the cheap one",
+      /protected against the right error \(here a paying customer is turned away/i.test(
+        text,
+      ) && !/cheaper mistake/i.test(text),
+      text.replace(/\n/g, " ").slice(0, 200),
     );
   }
 
@@ -311,8 +353,8 @@ export async function run({ page, check, metricText }) {
     paradoxOut.replace(/\n/g, " | "),
   );
 
-  if ((await failure.count()) > 0) {
-    const text = await failure.innerText();
+  if ((await failureText()) !== "") {
+    const text = await failureText();
     check(
       "this failure is NAMED 'Accuracy paradox' — a different diagnosis",
       /accuracy paradox/i.test(text),
@@ -326,6 +368,29 @@ export async function run({ page, check, metricText }) {
     check(
       "it does not advise moving the threshold — the scoreboard is the problem",
       /wrong scoreboard/i.test(text),
+    );
+
+    // Retry in the alert means THIS shift again, not the whole week: shift one
+    // was signed off by the sweep above and has to stay signed off.
+    await failure.getByRole("button", { name: /retry/i }).click();
+    await page.waitForTimeout(300);
+    // Read the text rather than counting the element, so this holds whether
+    // the shell removes the alert or keeps an emptied live region mounted.
+    check(
+      "retry clears the named failure",
+      !/accuracy paradox/i.test((await failure.allInnerTexts()).join(" ")),
+    );
+    check(
+      "retry keeps the player on shift two",
+      await page.getByText(/Shift 2 of 4/).first().isVisible(),
+    );
+    await editor.fill("log('RETRYDONE', api.shift(), api.cleared());");
+    await runButton.click();
+    await outputRegion.getByText(/RETRYDONE/).waitFor({ timeout: 60000 });
+    check(
+      "retry does not wipe the shift already signed off",
+      /RETRYDONE 2 1/.test(await outputRegion.innerText()),
+      (await outputRegion.innerText()).replace(/\n/g, " | "),
     );
   } else {
     check("named failure alert appears for the paradox", false);

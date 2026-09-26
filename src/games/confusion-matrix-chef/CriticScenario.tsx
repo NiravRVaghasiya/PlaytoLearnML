@@ -46,7 +46,7 @@ export function CriticScenario({
         </span>
         <span className="text-xs font-normal text-text-muted">
           {Math.round(scenario.prevalence * 100)}% are{" "}
-          {scenario.positiveLabel}s
+          {scenario.positiveLabelPlural}
         </span>
       </h2>
 

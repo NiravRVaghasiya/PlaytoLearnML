@@ -27,10 +27,19 @@ import { CriticScenario } from "./CriticScenario";
 import { VisualLane } from "./VisualLane";
 import { CodeLane } from "./CodeLane";
 
+/**
+ * The engine's rule, stated per game: ★1 finish, ★2 a best score of at least
+ * HIGH_SCORE_THRESHOLD, ★3 that plus a code-lane clear. A shift's score is 60%
+ * for meeting the brief plus up to 40% for how far inside the band the headline
+ * metric was pushed (see BRIEF_MET_SHARE), so the second star is earned by
+ * where in the band you serve, not by finishing.
+ */
 const STAR_CRITERIA = [
   "Sign off all four shifts",
-  `Score ${Math.round(HIGH_SCORE_THRESHOLD * 100)}% or better across the shifts`,
-  "Clear a shift from the code lane",
+  `Score ${Math.round(
+    HIGH_SCORE_THRESHOLD * 100,
+  )}% or better across the week by pushing each shift's headline metric as far as its brief allows`,
+  "Clear a shift with api.serve() from the code lane",
 ];
 
 function Controls() {
@@ -43,6 +52,7 @@ function Controls() {
   const serve = useChefStore((s) => s.serve);
   const nextShift = useChefStore((s) => s.nextShift);
   const restart = useChefStore((s) => s.restart);
+  const scenarioIndex = useChefStore((s) => s.scenarioIndex);
 
   // Derived, never stored: four counts kept alongside the slider could disagree
   // with it, in a game about the matrix recomputing exactly.
@@ -115,7 +125,9 @@ function Controls() {
           <Button
             variant="primary"
             className="w-full"
-            onClick={serve}
+            // Arrow, not `onClick={serve}`: serve's argument is the lane it
+            // came from, and a click would pass the event in its place.
+            onClick={() => serve("visual")}
             icon={<ChefHat className="size-4" />}
           >
             Serve this cutoff
@@ -126,7 +138,9 @@ function Controls() {
           variant="ghost"
           className="mt-2 w-full"
           onClick={restart}
-          disabled={phase === "tuning" && attempts === 0}
+          // Only pointless when already at the untouched start of shift one —
+          // on a fresh shift three it is still a real way back.
+          disabled={scenarioIndex === 1 && phase === "tuning" && attempts === 0}
         >
           Back to shift one
         </Button>
@@ -148,6 +162,7 @@ export default function ConfusionMatrixChef() {
   const lane = useChefStore((s) => s.lane);
   const setLane = useChefStore((s) => s.setLane);
   const nextShift = useChefStore((s) => s.nextShift);
+  const retryShift = useChefStore((s) => s.retryShift);
   const restart = useChefStore((s) => s.restart);
   const games = useProgression((s) => s.games);
 
@@ -266,7 +281,9 @@ export default function ConfusionMatrixChef() {
         recentGain: lastGain,
         starCriteria: STAR_CRITERIA,
       }}
-      onRetry={restart}
+      // Retry means this shift again. Wiping every shift already signed off is
+      // "Back to shift one", which says so.
+      onRetry={retryShift}
       onNext={
         phase === "cleared"
           ? nextShift

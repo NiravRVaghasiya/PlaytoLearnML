@@ -96,7 +96,7 @@ export function ConfusionMatrix({
               truePositives,
               "TP",
               "Caught",
-              `${scenario.positiveLabel}s stopped`,
+              `${scenario.positiveLabelPlural} stopped`,
               true,
             )}
             {cell(

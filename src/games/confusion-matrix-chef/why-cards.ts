@@ -1,10 +1,14 @@
 import type { WhyCardContent } from "@/components";
 import {
   METRIC_LABELS,
+  OVERSHOOT_LEVEL,
   SCENARIOS,
   confusionAt,
+  dearErrorFor,
   majorityBaseline,
+  metricName,
   metricsOf,
+  opposingMetric,
   type RoundResult,
   type Sample,
   type Scenario,
@@ -41,6 +45,11 @@ export type ChefEvent =
     };
 
 const percent = (value: number) => `${Math.round(value * 100)}%`;
+const points = (value: number) => `${(value * 100).toFixed(1)}%`;
+
+/** "1 prank order", "3 prank orders" — spelled from the scenario, never by "+s". */
+const casesOf = (scenario: Scenario, count: number) =>
+  count === 1 ? scenario.positiveLabel : scenario.positiveLabelPlural;
 
 export function whyCardFor(event: ChefEvent): WhyCardContent {
   switch (event.kind) {
@@ -89,6 +98,33 @@ export function whyCardFor(event: ChefEvent): WhyCardContent {
       }
 
       const loosened = threshold < previous;
+
+      // Precision after loosening is not a law, it is arithmetic: the pile's hit
+      // rate moves toward the newcomers' hit rate. Say which way it went THIS
+      // time, from the counts, rather than asserting it can only fall — on these
+      // very shifts a notch down often raises it (prank 0.91 to 0.90 takes it
+      // from 96.4% to 97.4%).
+      const beforePrecision = metricsOf(before).precision;
+      const beforeFlagged = before.truePositives + before.falsePositives;
+      const newcomerRate =
+        flaggedDelta > 0 ? Math.max(0, caughtDelta) / flaggedDelta : 0;
+      const precisionMoved =
+        metrics.precision > beforePrecision + 1e-12
+          ? "rose"
+          : metrics.precision < beforePrecision - 1e-12
+            ? "fell"
+            : "held";
+      const precisionClause =
+        beforeFlagged === 0
+          ? `The pile was empty before, so precision is simply how often these newcomers were right: ${percent(
+              metrics.precision,
+            )}.`
+          : `Precision only falls when the newcomers are right less often than the pile already was. These were right ${points(
+              newcomerRate,
+            )} of the time against the pile's ${points(
+              beforePrecision,
+            )}, so precision ${precisionMoved}.`;
+
       return {
         key: `moved-${threshold.toFixed(2)}`,
         title: `Cutoff ${threshold.toFixed(2)} — ${
@@ -100,23 +136,30 @@ export function whyCardFor(event: ChefEvent): WhyCardContent {
           ? `${Math.abs(flaggedDelta)} more case${
               Math.abs(flaggedDelta) === 1 ? "" : "s"
             } crossed into the flagged pile: ${caughtDelta} of them ${
-              caughtDelta === 1 ? "was" : "were"
-            } a real ${scenario.positiveLabel} and ${alarmDelta} ${
-              alarmDelta === 1 ? "was" : "were"
-            } a false alarm. Recall is now ${percent(
+              caughtDelta === 1
+                ? `was a real ${scenario.positiveLabel}`
+                : `were real ${scenario.positiveLabelPlural}`
+            } and ${alarmDelta} ${
+              alarmDelta === 1 ? "was a false alarm" : "were false alarms"
+            }. Recall is now ${percent(
               metrics.recall,
             )} and precision ${percent(
               metrics.precision,
-            )}. Every case you add to the pile helps recall and can only hurt precision — that is not a coincidence, they share a numerator and differ in the denominator.`
+            )}. Growing the pile can never lower recall — ${
+              caughtDelta > 0
+                ? `the ${caughtDelta} new catch${caughtDelta === 1 ? "" : "es"} raised it`
+                : "none of these were real, so it held"
+            }. ${precisionClause} The two share a numerator and differ in the denominator, which is why they usually, but not on every notch, move in opposite directions.`
           : `${Math.abs(flaggedDelta)} case${
               Math.abs(flaggedDelta) === 1 ? "" : "s"
             } left the flagged pile: ${Math.abs(
               alarmDelta,
             )} false alarm${Math.abs(alarmDelta) === 1 ? "" : "s"} you no longer raise, and ${Math.abs(
               caughtDelta,
-            )} real ${scenario.positiveLabel}${
-              Math.abs(caughtDelta) === 1 ? "" : "s"
-            } you now miss. Precision is ${percent(
+            )} real ${casesOf(
+              scenario,
+              Math.abs(caughtDelta),
+            )} you now miss. Precision is ${percent(
               metrics.precision,
             )} and recall ${percent(
               metrics.recall,
@@ -147,15 +190,26 @@ export function whyCardFor(event: ChefEvent): WhyCardContent {
         const metricLines = result.constraints
           .map(
             (constraint) =>
-              `${METRIC_LABELS[constraint.metric].toLowerCase()} ${percent(
+              `${metricName(constraint.metric)} ${percent(
                 constraint.achieved,
               )} against a ${percent(constraint.floor)} floor`,
           )
           .join(", ");
+        // Where inside the band this cutoff landed, on the headline metric —
+        // the number the score is built from, so the second star is legible.
+        const range = result.primaryRange;
+        const rangeLine =
+          range === null || range.max - range.min < 0.0005
+            ? ""
+            : ` Inside the band, ${metricName(scenario.primary)} ran from ${points(
+                range.min,
+              )} to ${points(range.max)}; you served ${points(
+                result.metrics[scenario.primary],
+              )}.`;
         return {
           key: `cleared-${scenario.id}`,
           title: `${scenario.name} signed off`,
-          body: `${metricLines}. ${
+          body: `${metricLines}.${rangeLine} ${
             attempts === 1
               ? "First cutoff you tried."
               : `Took ${attempts} cutoffs to find the band.`
@@ -187,41 +241,84 @@ export function whyCardFor(event: ChefEvent): WhyCardContent {
             result.matrix.truePositives === 1 ? "" : "s"
           }, so it is mostly measuring how good you are at the easy majority class. The ${
             result.matrix.falseNegatives
-          } missed ${scenario.positiveLabel}${
-            result.matrix.falseNegatives === 1 ? "" : "s"
-          } barely register in it — and on this shift, each one ${
+          } missed ${casesOf(
+            scenario,
+            result.matrix.falseNegatives,
+          )} barely register in it — and on this shift, each one ${
             scenario.falseNegativeCost
           }.`,
           tone: "bad",
         };
       }
 
-      if (result.outcome === "wrong-side") {
+      if (result.outcome === "wrong-side" || result.outcome === "overshoot") {
+        // Both are "one metric all but perfect, the other's floor broken". The
+        // card names which metric the critic is paying for from the BRIEF, so it
+        // never tells a player at 100% recall on the allergen shift that recall
+        // "is not the one the critic is paying for".
+        // The same floor the judge picked: broken, with its opposite metric
+        // all but perfect.
+        const failing =
+          result.constraints.find((constraint) => {
+            const opposite = opposingMetric(constraint.metric);
+            return (
+              !constraint.met &&
+              opposite !== null &&
+              result.metrics[opposite] >= OVERSHOOT_LEVEL
+            );
+          })?.metric ?? "precision";
+        const perfect = opposingMetric(failing) ?? "recall";
+        const dear = dearErrorFor(scenario, failing);
+        const dearCost =
+          dear === "falsePositive"
+            ? scenario.falsePositiveCost
+            : scenario.falseNegativeCost;
+        const cheapCost =
+          dear === "falsePositive"
+            ? scenario.falseNegativeCost
+            : scenario.falsePositiveCost;
+        const trade = `The matrix shows exactly where the trade sits: ${
+          result.matrix.falsePositives
+        } false alarm${
+          result.matrix.falsePositives === 1 ? "" : "s"
+        } against ${result.matrix.falseNegatives} miss${
+          result.matrix.falseNegatives === 1 ? "" : "es"
+        }.`;
+        const pair = `Precision ${percent(
+          result.metrics.precision,
+        )}, recall ${percent(result.metrics.recall)}.`;
+
+        if (result.outcome === "overshoot") {
+          return {
+            key: `overshoot-${scenario.id}-${result.threshold.toFixed(2)}`,
+            title: "Right error, pushed too far",
+            body: `${pair} ${METRIC_LABELS[perfect]} is the number this shift is judged on, and it is nearly perfect — but the brief also puts a floor under ${metricName(
+              failing,
+            )}, and you sold it to get there. On this shift the expensive mistake is the ${
+              dear === "falsePositive" ? "false alarm" : "miss"
+            } — ${dearCost} — so leaning away from it was right. The other one, where ${cheapCost}, is cheaper but not free. ${trade}`,
+            tone: "bad",
+          };
+        }
+
         return {
           key: `wrong-side-${scenario.id}-${result.threshold.toFixed(2)}`,
           title: "You optimised the wrong error",
-          body: `Precision ${percent(
-            result.metrics.precision,
-          )}, recall ${percent(
-            result.metrics.recall,
-          )}. One of those is nearly perfect and it is not the one the critic is paying for. On this shift ${
-            scenario.falseNegativeCost
-          }, while ${
-            scenario.falsePositiveCost
-          } — so the cheap mistake is the one to make more of. The matrix shows exactly where the trade sits: ${
-            result.matrix.falsePositives
-          } false alarm${
-            result.matrix.falsePositives === 1 ? "" : "s"
-          } against ${result.matrix.falseNegatives} miss${
-            result.matrix.falseNegatives === 1 ? "" : "es"
-          }.`,
+          body:
+            opposingMetric(scenario.primary) === null
+              ? `${pair} ${METRIC_LABELS[perfect]} is nearly perfect, and this brief needs both — it puts a floor under ${metricName(
+                  failing,
+                )} too, and that is the one breaking. On this shift ${dearCost}, and you are making that mistake far more often than the brief allows. ${trade}`
+              : `${pair} ${METRIC_LABELS[perfect]} is nearly perfect, and it is not the one the critic is paying for — ${metricName(
+                  scenario.primary,
+                )} is. On this shift ${dearCost}, while ${cheapCost} — so the cheap mistake is the one to make more of. ${trade}`,
           tone: "bad",
         };
       }
 
       const failedNames = result.constraints
         .filter((constraint) => !constraint.met)
-        .map((constraint) => METRIC_LABELS[constraint.metric].toLowerCase())
+        .map((constraint) => metricName(constraint.metric))
         .join(" and ");
       return {
         key: `missed-${scenario.id}-${result.threshold.toFixed(2)}`,
@@ -229,7 +326,7 @@ export function whyCardFor(event: ChefEvent): WhyCardContent {
         body: `${result.constraints
           .map(
             (constraint) =>
-              `${METRIC_LABELS[constraint.metric].toLowerCase()} ${percent(
+              `${metricName(constraint.metric)} ${percent(
                 constraint.achieved,
               )}/${percent(constraint.floor)}${constraint.met ? " ✓" : ""}`,
           )

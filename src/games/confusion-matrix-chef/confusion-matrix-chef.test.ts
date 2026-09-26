@@ -1,11 +1,20 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  EMPTY_PROGRESSION,
+  HIGH_SCORE_THRESHOLD,
+  createMemoryAdapter,
+  useProgression,
+} from "@/engine/progression";
+import {
+  BRIEF_MET_SHARE,
   OVERSHOOT_LEVEL,
   PARADOX_BASELINE,
   SAMPLE_COUNT,
   SCENARIOS,
+  SLIDER_THRESHOLDS,
   auc,
   confusionAt,
+  dearErrorFor,
   directionToRaise,
   expectedAuc,
   generateSamples,
@@ -17,10 +26,14 @@ import {
   rocCurve,
   rocPointAt,
   scenarioAt,
+  winningBand,
   type Sample,
   type Scenario,
 } from "./ml";
-import { useChefStore } from "./store";
+import { createJsExecutor } from "@/engine/useCodeLane";
+import { SLUG, createCodeApi, useChefStore } from "./store";
+import { whyCardFor } from "./why-cards";
+import { STARTER_CODE } from "./CodeLane";
 
 const DATA_SEED = 9310;
 
@@ -324,23 +337,52 @@ describe("naming the failure", () => {
     expect(result.metrics.accuracy).toBeCloseTo(0.5, 1);
   });
 
-  it("names the wrong side of the tradeoff when precision is bought with recall", () => {
+  it("names an overshoot when the headline metric is pushed until the other floor breaks", () => {
     // Prank shift at a high cutoff: precision is ~97%, which SATISFIES the shift's
     // headline metric, while recall collapses and fails the brief. Judging on the
-    // headline metric would have called this a near miss.
+    // headline metric would have called this a near miss — but it is not the
+    // wrong side either: precision IS what the critic pays for. It is the right
+    // side, pushed too far, and the copy must not call a turned-away customer
+    // the cheap mistake.
     const result = judgeRound({
       scenario: pranks,
       samples: samplesFor(pranks),
       threshold: 0.9,
     });
     expect(result.metrics.precision).toBeGreaterThan(OVERSHOOT_LEVEL);
-    expect(result.outcome).toBe("wrong-side");
-    expect(result.failure?.name).toBe("Wrong side of the tradeoff");
+    expect(result.outcome).toBe("overshoot");
+    expect(result.failure?.name).toBe("Overshot the tradeoff");
     expect(result.failure?.detail).toMatch(/lower the threshold/i);
+    expect(result.failure?.detail).toContain(
+      `protected against the right error (here ${pranks.falsePositiveCost})`,
+    );
+    expect(result.failure?.detail).not.toMatch(/cheaper mistake/i);
   });
 
-  it("names the wrong side when recall is bought with precision", () => {
-    // The mirror image, and the advice must reverse with it.
+  it("never calls a hospitalisation the cheaper mistake on the allergen shift", () => {
+    // The finding that prompted the split: flag every dish (t=0, the natural
+    // direction on a recall shift) and precision breaks its floor. The old copy
+    // then said "a customer is hospitalised … let the cheaper mistake happen".
+    for (const threshold of [0, 0.1, 0.36]) {
+      const result = judgeRound({
+        scenario: allergen,
+        samples: samplesFor(allergen),
+        threshold,
+      });
+      expect(result.outcome, `t=${threshold}`).toBe("overshoot");
+      expect(result.metrics.recall).toBeGreaterThanOrEqual(OVERSHOOT_LEVEL);
+      expect(result.failure?.detail).toMatch(/raise the threshold/i);
+      expect(result.failure?.detail).toContain(
+        `(here ${allergen.falseNegativeCost})`,
+      );
+      expect(result.failure?.detail).not.toMatch(/cheaper mistake/i);
+    }
+  });
+
+  it("names the wrong side when the metric the critic does not pay for is bought", () => {
+    // The mirror image, and the advice must reverse with it: recall is near
+    // perfect on the PRECISION shift. Here the cost ordering comes from the
+    // brief — refusing a customer is the dear error, a wasted meal the cheap one.
     const result = judgeRound({
       scenario: pranks,
       samples: samplesFor(pranks),
@@ -348,7 +390,87 @@ describe("naming the failure", () => {
     });
     expect(result.metrics.recall).toBeGreaterThan(OVERSHOOT_LEVEL);
     expect(result.outcome).toBe("wrong-side");
+    expect(result.failure?.name).toBe("Wrong side of the tradeoff");
     expect(result.failure?.detail).toMatch(/raise the threshold/i);
+    expect(result.failure?.detail).toContain(
+      `here ${pranks.falsePositiveCost}, whereas ${pranks.falseNegativeCost}`,
+    );
+  });
+
+  it("does not rank the two errors on a shift where both hurt", () => {
+    // Fraud's brief: "Both errors hurt here." Flag every payment and the
+    // precision floor breaks; the copy says which floor, not which error is cheap.
+    const fraud = scenarioAt(4);
+    const result = judgeRound({
+      scenario: fraud,
+      samples: samplesFor(fraud),
+      threshold: 0.02,
+    });
+    expect(result.outcome).toBe("wrong-side");
+    expect(result.failure?.detail).toMatch(/floor under both errors/i);
+    expect(result.failure?.detail).not.toMatch(/does not mind|cheaper mistake/i);
+    expect(result.failure?.detail).toMatch(/raise the threshold/i);
+  });
+
+  it("reads the dear error from the brief, not from the floor that broke", () => {
+    expect(dearErrorFor(pranks, "recall")).toBe("falsePositive");
+    expect(dearErrorFor(pranks, "precision")).toBe("falsePositive");
+    expect(dearErrorFor(allergen, "precision")).toBe("falseNegative");
+    expect(dearErrorFor(allergen, "recall")).toBe("falseNegative");
+    // Composite headline: whichever floor is breaking.
+    expect(dearErrorFor(scenarioAt(4), "precision")).toBe("falsePositive");
+    expect(dearErrorFor(scenarioAt(4), "recall")).toBe("falseNegative");
+  });
+
+  it("names flagging nothing for what it is, on a shift that has a winning band", () => {
+    // Prank shift, cutoff at the top: nothing flagged, precision reported 0.
+    // The old judge read "precision wants the cutoff raised, recall wants it
+    // lowered" as proof no cutoff could work — on a shift winnable at 0.69-0.79.
+    expect(winnableThresholds(pranks).length).toBeGreaterThan(0);
+    for (const threshold of [0.98, 0.99, 1]) {
+      const result = judgeRound({
+        scenario: pranks,
+        samples: samplesFor(pranks),
+        threshold,
+      });
+      expect(result.matrix.truePositives + result.matrix.falsePositives).toBe(0);
+      expect(result.outcome).toBe("missed");
+      expect(result.failure?.detail).toMatch(/flagged nothing/i);
+      expect(result.failure?.detail).toMatch(/lower the threshold/i);
+      expect(result.failure?.detail).not.toMatch(/no cutoff/i);
+    }
+  });
+
+  it("claims no cutoff satisfies both only after a sweep finds none", () => {
+    // Hand-built so that at t=0.93 only two negatives are flagged: precision
+    // and recall are both 0, pulling in opposite directions, with something
+    // flagged. Whether a band exists then decides the copy, not the directions.
+    const samples: Sample[] = [
+      ...Array.from({ length: 10 }, () => ({ score: 0.9, trueLabel: 1 as const })),
+      ...Array.from({ length: 2 }, () => ({ score: 0.95, trueLabel: 0 as const })),
+      ...Array.from({ length: 10 }, () => ({ score: 0.5, trueLabel: 0 as const })),
+    ];
+    const brief = (floor: number): Scenario => ({
+      ...pranks,
+      prevalence: 10 / 22,
+      primary: "precision",
+      constraints: [
+        { metric: "precision", floor },
+        { metric: "recall", floor },
+      ],
+    });
+
+    // Feasible: t in (0.5, 0.9] flags all 10 positives and 2 negatives, 83% precision.
+    const feasible = judgeRound({ scenario: brief(0.8), samples, threshold: 0.93 });
+    expect(winningBand(brief(0.8), samples).length).toBeGreaterThan(0);
+    expect(feasible.outcome).toBe("missed");
+    expect(feasible.failure?.detail).toMatch(/do exist, below yours/i);
+    expect(feasible.failure?.detail).not.toMatch(/no cutoff/i);
+
+    // Infeasible: 83% is the best precision any cutoff with recall reaches.
+    const infeasible = judgeRound({ scenario: brief(0.9), samples, threshold: 0.93 });
+    expect(winningBand(brief(0.9), samples)).toHaveLength(0);
+    expect(infeasible.failure?.detail).toMatch(/no cutoff on the slider satisfies both/i);
   });
 
   it("names a near miss as a near miss, with a direction", () => {
@@ -361,6 +483,62 @@ describe("naming the failure", () => {
     expect(result.failure?.name).toBe("Target band missed");
     expect(result.failure?.detail).toMatch(/threshold/i);
     expect(result.failure?.detail).toMatch(/\d+\.\d%/);
+  });
+
+  it("does not tell a player who has gone past the band they are not far enough", () => {
+    // Prank shift at 0.93: precision 93.8%, just under the overshoot bar, one
+    // notch between two "Overshot the tradeoff" verdicts. It used to read
+    // "You are on the right side of the trade, just not far enough along it."
+    const result = judgeRound({
+      scenario: pranks,
+      samples: samplesFor(pranks),
+      threshold: 0.93,
+    });
+    expect(result.metrics.precision).toBeLessThan(OVERSHOOT_LEVEL);
+    expect(result.outcome).toBe("missed");
+    expect(result.failure?.detail).toMatch(/lower the threshold/i);
+    expect(result.failure?.detail).toContain("Every cutoff that meets this brief is below yours.");
+    expect(result.failure?.detail).toContain(
+      "Precision already clears its 90% floor: the brief asks for enough of it, not all of it.",
+    );
+    expect(result.failure?.detail).not.toMatch(/far enough/i);
+  });
+
+  it("points a one-way miss at where the winning cutoffs really are, on every shift", () => {
+    // Every slider stop judged "missed" with something flagged and one
+    // direction to go: the direction and the side must be the band's.
+    let checked = 0;
+    for (const scenario of SCENARIOS) {
+      const samples = samplesFor(scenario);
+      const band = winningBand(scenario, samples).map((entry) => entry.threshold);
+      expect(band.length, scenario.name).toBeGreaterThan(0);
+      for (const threshold of SLIDER_THRESHOLDS) {
+        const result = judgeRound({ scenario, samples, threshold });
+        const detail = result.failure?.detail ?? "";
+        if (result.outcome !== "missed" || /flagged nothing|opposite directions/.test(detail)) {
+          continue;
+        }
+        checked += 1;
+        const label = `${scenario.name} at t=${threshold}`;
+        const below = band.every((cutoff) => cutoff < threshold);
+        const above = band.every((cutoff) => cutoff > threshold);
+        expect(below || above, label).toBe(true);
+        expect(detail, label).toMatch(below ? /Lower the threshold/ : /Raise the threshold/);
+        expect(detail, label).toContain(
+          `Every cutoff that meets this brief is ${below ? "below" : "above"} yours.`,
+        );
+        expect(detail, label).not.toMatch(/far enough/i);
+        // The headline note appears exactly when the headline floor holds.
+        const headline = scenario.constraints.find(
+          (constraint) => constraint.metric === scenario.primary,
+        );
+        expect(/already clears its/.test(detail), label).toBe(
+          headline !== undefined &&
+            metricValue(result.metrics, scenario.primary) >= headline.floor,
+        );
+      }
+    }
+    expect(checked).toBeGreaterThan(100);
   });
 
   it("wins inside the band, with no failure attached", () => {
@@ -587,5 +765,351 @@ describe("the store's shift flow", () => {
     const result = store.getState().serve();
     expect(result.outcome).not.toBe("win");
     expect(store.getState().failure).not.toBeNull();
+  });
+});
+
+describe("scoring a win by where it sits in the band", () => {
+  // The second star is "best score ≥ HIGH_SCORE_THRESHOLD". Under the old
+  // formula every winning week cleared it — the worst winning cutoff on every
+  // shift still averaged 85% — so the star measured nothing but finishing.
+
+  const bandScores = (scenario: Scenario) =>
+    winnableThresholds(scenario).map(
+      (threshold) =>
+        judgeRound({ scenario, samples: samplesFor(scenario), threshold }).score,
+    );
+
+  it("spans the whole range from meeting the brief to its best cutoff", () => {
+    for (const scenario of SCENARIOS) {
+      const scores = bandScores(scenario);
+      expect(Math.min(...scores), scenario.name).toBeCloseTo(BRIEF_MET_SHARE, 6);
+      expect(Math.max(...scores), scenario.name).toBeCloseTo(1, 6);
+    }
+  });
+
+  it("makes the second star something a finished week can miss, and can earn", () => {
+    const worstWeek =
+      SCENARIOS.reduce((total, scenario) => total + Math.min(...bandScores(scenario)), 0) /
+      SCENARIOS.length;
+    const bestWeek =
+      SCENARIOS.reduce((total, scenario) => total + Math.max(...bandScores(scenario)), 0) /
+      SCENARIOS.length;
+    expect(worstWeek).toBeLessThan(HIGH_SCORE_THRESHOLD);
+    expect(bestWeek).toBeGreaterThanOrEqual(HIGH_SCORE_THRESHOLD);
+  });
+
+  it("scores higher wherever the headline metric is higher inside the band", () => {
+    for (const scenario of SCENARIOS) {
+      const samples = samplesFor(scenario);
+      const results = winnableThresholds(scenario).map((threshold) =>
+        judgeRound({ scenario, samples, threshold }),
+      );
+      for (const a of results) {
+        for (const b of results) {
+          const pa = metricValue(a.metrics, scenario.primary);
+          const pb = metricValue(b.metrics, scenario.primary);
+          if (pa > pb + 1e-12) expect(a.score, scenario.name).toBeGreaterThan(b.score);
+        }
+      }
+    }
+  });
+
+  it("reports the headline metric's range across the band on a win, and only then", () => {
+    const scenario = scenarioAt(2);
+    const samples = samplesFor(scenario);
+    const band = winningBand(scenario, samples);
+    const win = judgeRound({ scenario, samples, threshold: band[0]!.threshold });
+    expect(win.primaryRange).toEqual({
+      min: Math.min(...band.map((entry) => entry.primary)),
+      max: Math.max(...band.map((entry) => entry.primary)),
+    });
+    expect(judgeRound({ scenario, samples, threshold: 0 }).primaryRange).toBeNull();
+  });
+
+  it("uses exactly the slider's stops for the band", () => {
+    expect(SLIDER_THRESHOLDS).toHaveLength(101);
+    expect(SLIDER_THRESHOLDS[7]).toBe(0.07);
+    expect(SLIDER_THRESHOLDS[100]).toBe(1);
+    for (const scenario of SCENARIOS) {
+      expect(
+        winningBand(scenario, samplesFor(scenario)).map((entry) => entry.threshold),
+      ).toEqual(winnableThresholds(scenario));
+    }
+  });
+});
+
+describe("the why-cards tell the truth about the numbers they print", () => {
+  it("says precision rose when loosening raised it, and fell when it fell", () => {
+    // "Every case you add to the pile … can only hurt precision" was printed
+    // next to numbers showing precision going up (prank 0.91 → 0.90). The card
+    // now reports what this notch did, so check it against every notch.
+    let rose = 0;
+    let fell = 0;
+    for (const scenario of SCENARIOS) {
+      const samples = samplesFor(scenario);
+      for (let step = 100; step > 0; step -= 1) {
+        const previous = SLIDER_THRESHOLDS[step]!;
+        const threshold = SLIDER_THRESHOLDS[step - 1]!;
+        const before = metricsOf(confusionAt(samples, previous));
+        const after = metricsOf(confusionAt(samples, threshold));
+        const card = whyCardFor({
+          kind: "threshold-moved",
+          scenario,
+          samples,
+          threshold,
+          previous,
+        });
+        expect(card.body).not.toMatch(/can only hurt precision/i);
+        const flaggedBefore = confusionAt(samples, previous);
+        if (flaggedBefore.truePositives + flaggedBefore.falsePositives === 0) continue;
+        if (card.title.includes("nothing crossed")) continue;
+        if (after.precision > before.precision) {
+          rose += 1;
+          expect(card.body, `${scenario.name} ${previous}→${threshold}`).toMatch(
+            /so precision rose/,
+          );
+        } else if (after.precision < before.precision) {
+          fell += 1;
+          expect(card.body, `${scenario.name} ${previous}→${threshold}`).toMatch(
+            /so precision fell/,
+          );
+        }
+      }
+    }
+    // Both directions genuinely happen, which is why the card cannot assert one.
+    expect(rose).toBeGreaterThan(0);
+    expect(fell).toBeGreaterThan(0);
+  });
+
+  it("never tells an allergen player that recall is not what the critic pays for", () => {
+    const allergen = scenarioAt(2);
+    const result = judgeRound({
+      scenario: allergen,
+      samples: samplesFor(allergen),
+      threshold: 0,
+    });
+    const card = whyCardFor({
+      kind: "served",
+      scenario: allergen,
+      result,
+      attempts: 1,
+      complete: false,
+    });
+    expect(card.body).not.toMatch(/not the one the critic is paying for/i);
+    expect(card.body).toContain(`the expensive mistake is the miss — ${allergen.falseNegativeCost}`);
+  });
+
+  it("names the metric the critic IS paying for on the wrong side", () => {
+    const pranks = scenarioAt(1);
+    const result = judgeRound({
+      scenario: pranks,
+      samples: samplesFor(pranks),
+      threshold: 0.02,
+    });
+    const card = whyCardFor({
+      kind: "served",
+      scenario: pranks,
+      result,
+      attempts: 1,
+      complete: false,
+    });
+    expect(card.body).toMatch(/Recall is nearly perfect, and it is not the one the critic is paying for — precision is/);
+    expect(card.body).toContain(
+      `On this shift ${pranks.falsePositiveCost}, while ${pranks.falseNegativeCost}`,
+    );
+  });
+
+  it("spells every plural out rather than appending an s", () => {
+    // "contaminated dishs", "badly plated dishs" used to sit in the matrix.
+    expect(SCENARIOS.map((scenario) => scenario.positiveLabelPlural)).toEqual([
+      "prank orders",
+      "contaminated dishes",
+      "badly plated dishes",
+      "fraudulent payments",
+    ]);
+    for (const scenario of SCENARIOS) {
+      const naive = `${scenario.positiveLabel}s`;
+      if (naive === scenario.positiveLabelPlural) continue;
+      const samples = samplesFor(scenario);
+      const released = whyCardFor({
+        kind: "threshold-moved",
+        scenario,
+        samples,
+        threshold: 0.9,
+        previous: 0.1,
+      });
+      const judged = [0.5, 0.8, 0.99].map(
+        (threshold) =>
+          judgeRound({ scenario, samples, threshold }).failure?.detail ?? "",
+      );
+      for (const text of [released.body, ...judged]) {
+        expect(text, scenario.name).not.toContain(naive);
+      }
+    }
+  });
+});
+
+describe("the store cannot double-count, un-clear, or wipe a shift", () => {
+  const store = useChefStore;
+
+  /** Park the cutoff in the middle of the current shift's band. */
+  const aimAtBand = () => {
+    const band = winnableThresholds(scenarioAt(store.getState().scenarioIndex));
+    store.getState().setThreshold(band[Math.floor(band.length / 2)]!);
+  };
+
+  beforeEach(() => {
+    useProgression.setState({
+      ...EMPTY_PROGRESSION,
+      hydrated: true,
+      syncError: null,
+      lastGain: null,
+    });
+    useProgression.getState().setAdapter(createMemoryAdapter());
+    store.getState().restart();
+    store.getState().setLane("visual");
+  });
+
+  it("banks a cleared shift once, however many times it is served", () => {
+    // Running the starter snippet twice used to read "2 of 4 signed off" while
+    // still on shift one.
+    aimAtBand();
+    store.getState().serve();
+    store.getState().serve();
+    store.getState().serve("code");
+    expect(store.getState().clearedScores).toHaveLength(1);
+    expect(store.getState().phase).toBe("cleared");
+    expect(store.getState().attempts).toBe(1);
+  });
+
+  it("does not un-clear a shift when a worse cutoff is served after it", () => {
+    aimAtBand();
+    const won = store.getState().serve();
+    store.getState().setThreshold(0.2);
+    const judged = store.getState().serve();
+
+    // The caller still gets an honest verdict on the cutoff it asked about…
+    expect(judged.outcome).not.toBe("win");
+    expect(judged.threshold).toBe(0.2);
+    // …but the state keeps the shift signed off with its winning judgement.
+    expect(store.getState().phase).toBe("cleared");
+    expect(store.getState().servedResult).toEqual(won);
+    expect(store.getState().failure).toBeNull();
+    expect(store.getState().clearedScores).toEqual([won.score]);
+  });
+
+  it("records a finished week with progression exactly once", () => {
+    for (let shift = 1; shift <= SCENARIOS.length; shift += 1) {
+      aimAtBand();
+      store.getState().serve();
+      if (shift < SCENARIOS.length) store.getState().nextShift();
+    }
+    expect(store.getState().phase).toBe("complete");
+    expect(store.getState().clearedScores).toHaveLength(SCENARIOS.length);
+    const played = useProgression.getState().games[SLUG]?.playCount;
+    expect(played).toBe(1);
+
+    store.getState().serve();
+    store.getState().serve("code");
+    expect(useProgression.getState().games[SLUG]?.playCount).toBe(played);
+  });
+
+  it("retries the current shift and keeps the ones already signed off", () => {
+    aimAtBand();
+    store.getState().serve();
+    store.getState().nextShift();
+    store.getState().setThreshold(1);
+    store.getState().serve();
+    expect(store.getState().failure).not.toBeNull();
+
+    store.getState().retryShift();
+    expect(store.getState().scenarioIndex).toBe(2);
+    expect(store.getState().clearedScores).toHaveLength(1);
+    expect(store.getState().failure).toBeNull();
+    expect(store.getState().servedResult).toBeNull();
+    expect(store.getState().threshold).toBe(0.5);
+    expect(store.getState().phase).toBe("tuning");
+  });
+
+  it("replaces a retried shift's score rather than appending it, keeping the best", () => {
+    const band = winnableThresholds(scenarioAt(1));
+    store.getState().setThreshold(band[band.length - 1]!);
+    const best = store.getState().serve().score;
+    store.getState().retryShift();
+    store.getState().setThreshold(band[0]!);
+    const worse = store.getState().serve().score;
+    expect(worse).toBeLessThan(best);
+    expect(store.getState().clearedScores).toEqual([best]);
+  });
+
+  it("counts the third star from the lane that cleared, not the tab that is open", () => {
+    // Every shift served from the visual button, with the Code tab showing.
+    store.getState().setLane("code");
+    for (let shift = 1; shift <= SCENARIOS.length; shift += 1) {
+      aimAtBand();
+      store.getState().serve("visual");
+      if (shift < SCENARIOS.length) store.getState().nextShift();
+    }
+    expect(useProgression.getState().games[SLUG]?.codeLaneCleared).toBe(false);
+  });
+
+  it("awards the code-lane clear when a shift is cleared through the api", () => {
+    // Shift one cleared by the script, the rest by hand in the visual lane —
+    // exactly what running the starter snippet and then playing on does.
+    const api = createCodeApi();
+    aimAtBand();
+    expect(api.serve().outcome).toBe("win");
+    expect(store.getState().codeLaneWin).toBe(true);
+    store.getState().nextShift();
+    for (let shift = 2; shift <= SCENARIOS.length; shift += 1) {
+      aimAtBand();
+      store.getState().serve("visual");
+      if (shift < SCENARIOS.length) store.getState().nextShift();
+    }
+    expect(useProgression.getState().games[SLUG]?.codeLaneCleared).toBe(true);
+  });
+
+  it("treats a click event handed to serve as a visual-lane serve", () => {
+    aimAtBand();
+    // What `onClick={serve}` would pass.
+    (store.getState().serve as (source: unknown) => unknown)({ type: "click" });
+    expect(store.getState().codeLaneWin).toBe(false);
+  });
+
+  it("runs the starter snippet to the top of the band, and can run it twice", async () => {
+    const run = async () => {
+      const logs: string[] = [];
+      await createJsExecutor<ReturnType<typeof createCodeApi>>()(STARTER_CODE, {
+        api: createCodeApi(),
+        log: (...args: unknown[]) => logs.push(args.map(String).join(" ")),
+        checkBudget: () => {},
+      });
+      return logs;
+    };
+
+    const first = await run();
+    expect(first.some((line) => /verdict: win/.test(line))).toBe(true);
+    // It pushes the shift's headline metric as far as the band allows, which
+    // is exactly what the score rewards.
+    expect(store.getState().servedResult?.score).toBeCloseTo(1, 9);
+    expect(store.getState().codeLaneWin).toBe(true);
+
+    await run();
+    expect(store.getState().clearedScores).toHaveLength(1);
+    expect(store.getState().phase).toBe("cleared");
+  });
+
+  it("rejects bad script input with a named error instead of corrupting state", () => {
+    const api = createCodeApi();
+    const before = store.getState().threshold;
+    expect(() => api.setThreshold(Number.NaN)).toThrow(/finite number/);
+    expect(() => api.setThreshold("0.5" as unknown as number)).toThrow(/finite number/);
+    expect(() => api.setThreshold(1.5)).toThrow(/between 0 and 1/);
+    expect(() => api.metricsAt(Number.POSITIVE_INFINITY)).toThrow(/metricsAt/);
+    expect(() => api.matrixAt(-0.1)).toThrow(/matrixAt/);
+    expect(store.getState().threshold).toBe(before);
+    // And the store itself ignores a NaN from any other caller.
+    store.getState().setThreshold(Number.NaN);
+    expect(store.getState().threshold).toBe(before);
   });
 });

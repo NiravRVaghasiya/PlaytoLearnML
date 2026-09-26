@@ -67,6 +67,17 @@ export const SAMPLE_COUNT = 800;
 export const THRESHOLD_STEP = 0.01;
 export const DEFAULT_THRESHOLD = 0.5;
 
+/**
+ * Every cutoff the slider can reach, 0.00 to 1.00.
+ *
+ * Built from integer steps rather than by adding 0.01 a hundred times, so each
+ * stop is exactly the number the slider reports (0.07, not 0.07000000000000001).
+ */
+export const SLIDER_THRESHOLDS: readonly number[] = Array.from(
+  { length: Math.round(1 / THRESHOLD_STEP) + 1 },
+  (_, step) => step / Math.round(1 / THRESHOLD_STEP),
+);
+
 const sigmoid = (z: number) => 1 / (1 + Math.exp(-z));
 
 /** Φ, via the Abramowitz–Stegun erf approximation. Used only to state the AUC. */
@@ -200,6 +211,11 @@ export const METRIC_LABELS: Record<MetricKey, string> = {
   balancedAccuracy: "Balanced accuracy",
 };
 
+/** A metric's name mid-sentence: "recall", "balanced accuracy" — but "F1". */
+export function metricName(metric: MetricKey): string {
+  return metric === "f1" ? METRIC_LABELS.f1 : METRIC_LABELS[metric].toLowerCase();
+}
+
 // ── ROC ───────────────────────────────────────────────────────────────────
 
 export interface RocPoint {
@@ -287,6 +303,11 @@ export interface Scenario {
   name: string;
   /** What a positive case is. */
   positiveLabel: string;
+  /**
+   * The plural, spelled out. Appending "s" gives "contaminated dishs", and this
+   * label sits in the always-visible matrix and brief.
+   */
+  positiveLabelPlural: string;
   /** What flagging one does. */
   flagAction: string;
   prevalence: number;
@@ -348,6 +369,7 @@ export const SCENARIOS: readonly Scenario[] = [
     index: 1,
     name: "Prank orders",
     positiveLabel: "prank order",
+    positiveLabelPlural: "prank orders",
     flagAction: "refuse the order",
     prevalence: 0.35,
     separability: 2.0,
@@ -366,6 +388,7 @@ export const SCENARIOS: readonly Scenario[] = [
     index: 2,
     name: "Allergen screening",
     positiveLabel: "contaminated dish",
+    positiveLabelPlural: "contaminated dishes",
     flagAction: "pull the dish and remake it",
     prevalence: 0.06,
     separability: 2.2,
@@ -384,6 +407,7 @@ export const SCENARIOS: readonly Scenario[] = [
     index: 3,
     name: "Plating standards",
     positiveLabel: "badly plated dish",
+    positiveLabelPlural: "badly plated dishes",
     flagAction: "send it back to be replated",
     prevalence: 0.5,
     separability: 2.0,
@@ -399,6 +423,7 @@ export const SCENARIOS: readonly Scenario[] = [
     index: 4,
     name: "Card fraud review",
     positiveLabel: "fraudulent payment",
+    positiveLabelPlural: "fraudulent payments",
     flagAction: "hold the payment for review",
     prevalence: 0.12,
     separability: 2.4,
@@ -429,6 +454,7 @@ export type Outcome =
   | "win"
   | "accuracy-paradox"
   | "wrong-side"
+  | "overshoot"
   | "missed"
   | "unscored";
 
@@ -445,11 +471,18 @@ export interface RoundResult {
   constraints: ConstraintResult[];
   outcome: Outcome;
   score: number;
+  /**
+   * On a win: the lowest and highest value the shift's headline metric takes
+   * across every slider cutoff that satisfies the brief. The score is where the
+   * served cutoff sits inside that range. Null when the brief was not met.
+   */
+  primaryRange: { min: number; max: number } | null;
   failure: NamedFailure | null;
 }
 
 const percent = (value: number) => `${Math.round(value * 100)}%`;
 const points = (value: number) => `${(value * 100).toFixed(1)}%`;
+const lower = metricName;
 
 /**
  * How imbalanced the data must be before "Accuracy paradox" is the right name.
@@ -462,19 +495,90 @@ export const PARADOX_BASELINE = 0.8;
 export const OVERSHOOT_LEVEL = 0.95;
 
 /**
+ * Share of a shift's score that meeting the brief is worth on its own.
+ *
+ * The rest is earned by WHERE inside the winning band the cutoff sits: how far
+ * the shift's headline metric was pushed, as a fraction of how far the brief
+ * allowed. Measured, the old split (65% for the floors plus 35% of F1) put every
+ * possible winning week above the 80% second-star bar — the lowest winning
+ * cutoffs on all four shifts still averaged 85% — so the star said nothing.
+ * With this split, a week served at the bottom of every band scores 60% and one
+ * served at the top scores 100%; the second star asks for the better half.
+ */
+export const BRIEF_MET_SHARE = 0.6;
+
+/** Does this set of metrics satisfy every floor in the brief? */
+export function meetsBrief(scenario: Scenario, metrics: Metrics): boolean {
+  return scenario.constraints.every(
+    (constraint) => metricValue(metrics, constraint.metric) >= constraint.floor,
+  );
+}
+
+/**
+ * Every slider cutoff that satisfies the brief, with the headline metric there.
+ *
+ * A real sweep over the 101 stops — the same search the code lane's starter
+ * snippet runs. It is what lets the judge say "no cutoff satisfies both" only
+ * when that is true, rather than inferring it from which way two metrics point.
+ * 101 × 800 comparisons, well under a millisecond.
+ */
+export function winningBand(
+  scenario: Scenario,
+  samples: Sample[],
+): { threshold: number; primary: number }[] {
+  const band: { threshold: number; primary: number }[] = [];
+  for (const threshold of SLIDER_THRESHOLDS) {
+    const metrics = metricsOf(confusionAt(samples, threshold));
+    if (meetsBrief(scenario, metrics)) {
+      band.push({ threshold, primary: metricValue(metrics, scenario.primary) });
+    }
+  }
+  return band;
+}
+
+/**
+ * Which error this brief can least afford — read from the BRIEF, never from
+ * whichever floor happened to break.
+ *
+ * On the prank shift (headline: precision) the dear error is the false positive,
+ * a paying customer turned away. On the allergen shift (headline: recall) it is
+ * the false negative, a customer in hospital. Getting this backwards is how a
+ * judge ends up calling a hospitalisation "the cheaper mistake".
+ *
+ * Composite headlines (F1, balanced accuracy) put a floor under both errors, so
+ * there the dear one is whichever is currently breaking its floor: too little
+ * precision means too many false positives, too little recall too many misses.
+ */
+export function dearErrorFor(
+  scenario: Scenario,
+  failing: MetricKey,
+): "falsePositive" | "falseNegative" {
+  if (scenario.primary === "precision") return "falsePositive";
+  if (scenario.primary === "recall") return "falseNegative";
+  return failing === "precision" ? "falsePositive" : "falseNegative";
+}
+
+/**
  * Judge the player's cutoff against the critic's brief.
  *
- * Three failures, ordered by how fundamental the misunderstanding is:
+ * Four failures, ordered by how fundamental the misunderstanding is:
  *
  *   1. "Accuracy paradox" — accuracy is at or above what you would get by
  *      ignoring the model entirely, while the metric that matters has collapsed.
  *      Checked first because a player in this state is reading the wrong number,
  *      and no amount of nudging the threshold fixes a wrong scoreboard.
- *   2. "Wrong side of the tradeoff" — the metric that matters is short while the
- *      metric it trades against is nearly perfect. Different mistake: the right
- *      scoreboard, the wrong direction.
- *   3. "Target band missed" — right direction, not far enough. Not a conceptual
- *      error, so it gets directional advice rather than a lecture.
+ *   2. "Wrong side of the tradeoff" — a floor is short while the metric it
+ *      trades against, which is NOT the one the critic is paying for, is nearly
+ *      perfect. The right scoreboard, the wrong direction.
+ *   3. "Overshot the tradeoff" — the headline metric itself is nearly perfect,
+ *      and the floor on the other one broke to pay for it. The right direction,
+ *      pushed too far. Kept apart from (2) because the advice about which error
+ *      is cheap is the opposite: telling an allergen player who has flagged
+ *      every dish to "let the cheaper mistake happen" would name a
+ *      hospitalisation as the cheap one.
+ *   4. "Target band missed" — outside the band, short of it or past it. Not a
+ *      conceptual error, so it gets directional advice rather than a lecture,
+ *      and the direction is read from where the band actually is.
  */
 export function judgeRound({
   scenario,
@@ -498,7 +602,31 @@ export function judgeRound({
   const met = constraints.filter((constraint) => constraint.met).length;
   const satisfied = met === constraints.length;
   const constraintScore = met / Math.max(1, constraints.length);
-  const score = clamp(constraintScore * 0.65 + metrics.f1 * 0.35, 0, 1);
+  const primaryValue = metricValue(metrics, scenario.primary);
+
+  if (satisfied) {
+    // Where inside the band this cutoff sits, on the metric the brief is about.
+    // A cutoff off the slider grid (the code lane can set any value) may sit
+    // past the grid's best, so the position is clamped; an empty grid band
+    // means the player found a winner the grid cannot, which is the top.
+    const band = winningBand(scenario, samples);
+    const values = band.map((entry) => entry.primary);
+    const min = values.length > 0 ? Math.min(...values) : primaryValue;
+    const max = values.length > 0 ? Math.max(...values) : primaryValue;
+    const position =
+      max - min < 1e-9 ? 1 : clamp((primaryValue - min) / (max - min), 0, 1);
+    return {
+      scenario: scenario.id,
+      threshold,
+      matrix,
+      metrics,
+      constraints,
+      outcome: "win",
+      score: clamp(BRIEF_MET_SHARE + (1 - BRIEF_MET_SHARE) * position, 0, 1),
+      primaryRange: { min, max },
+      failure: null,
+    };
+  }
 
   const base = {
     scenario: scenario.id,
@@ -506,16 +634,13 @@ export function judgeRound({
     matrix,
     metrics,
     constraints,
-    score,
+    score: clamp(constraintScore * BRIEF_MET_SHARE, 0, 1),
+    primaryRange: null,
   };
 
-  if (satisfied) {
-    return { ...base, outcome: "win", failure: null };
-  }
-
   const baseline = majorityBaseline(scenario.prevalence);
-  const primaryValue = metricValue(metrics, scenario.primary);
   const failed = constraints.filter((constraint) => !constraint.met);
+  const flagged = matrix.truePositives + matrix.falsePositives;
 
   // 1. Reading the wrong number entirely.
   //
@@ -532,7 +657,6 @@ export function judgeRound({
     metrics.accuracy >= baseline - 0.01 &&
     metrics.recall < 0.5
   ) {
-    const flagged = matrix.truePositives + matrix.falsePositives;
     return {
       ...base,
       outcome: "accuracy-paradox",
@@ -546,16 +670,14 @@ export function judgeRound({
           scenario.prevalence < 0.5 ? "clean" : "suspect"
         }. ${
           flagged === 0
-            ? `You flagged nothing at all, so ${METRIC_LABELS[
-                scenario.primary
-              ].toLowerCase()} is ${percent(primaryValue)}.`
+            ? `You flagged nothing at all, so ${lower(
+                scenario.primary,
+              )} is ${percent(primaryValue)}.`
             : `You flagged ${flagged} of ${samples.length} cases and caught ${
                 matrix.truePositives
-              } of ${
-                matrix.truePositives + matrix.falseNegatives
-              } ${scenario.positiveLabel}s, so ${METRIC_LABELS[
-                scenario.primary
-              ].toLowerCase()} is ${percent(primaryValue)}.`
+              } of ${matrix.truePositives + matrix.falseNegatives} ${
+                scenario.positiveLabelPlural
+              }, so ${lower(scenario.primary)} is ${percent(primaryValue)}.`
         } Accuracy counts both classes equally and ${percent(
           1 - scenario.prevalence,
         )} of these cases are negative, so it barely moves when you miss every single ${
@@ -565,14 +687,13 @@ export function judgeRound({
     };
   }
 
-  // 2. Right scoreboard, wrong direction.
+  // 2 and 3. One metric all but perfect, the floor on the other broken.
   //
-  // Judged on the FAILED constraint rather than the scenario's headline metric.
-  // On the prank shift the headline metric is precision, and a player sitting at
-  // 97% precision with 14% recall has satisfied the headline while failing the
-  // shift — reading the primary metric here would have missed the mistake
-  // entirely and told them they were merely a little short.
-  const overshoot = failed
+  // Judged on the FAILED constraint rather than the scenario's headline metric,
+  // so a player at 97% precision and 14% recall on the prank shift is not told
+  // they are merely a little short. Which of the two failures it is depends on
+  // whether the near-perfect metric is the one the brief is paying for.
+  const lopsided = failed
     .map((constraint) => {
       const opposing = opposingMetric(constraint.metric);
       if (opposing === null) return null;
@@ -583,62 +704,185 @@ export function judgeRound({
     })
     .find((entry) => entry !== null);
 
-  if (overshoot) {
-    const { constraint, opposing, opposingValue } = overshoot;
-    const move = directionToRaise(constraint.metric, metrics);
-    const cheaper =
-      constraint.metric === "recall"
+  if (lopsided) {
+    const { constraint, opposing, opposingValue } = lopsided;
+    const move =
+      directionToRaise(constraint.metric, metrics) === "lower"
+        ? "Lower"
+        : "Raise";
+    const shortfall = `${lower(constraint.metric)} is ${percent(
+      constraint.achieved,
+    )}, short of the ${percent(constraint.floor)} floor`;
+
+    // The error that is piling up is the one the broken floor counts: a
+    // precision floor counts false positives, a recall floor counts misses.
+    const pilingIsFalsePositive = constraint.metric === "precision";
+    const pilingCount = pilingIsFalsePositive
+      ? matrix.falsePositives
+      : matrix.falseNegatives;
+    const pilingCost = pilingIsFalsePositive
+      ? scenario.falsePositiveCost
+      : scenario.falseNegativeCost;
+    const pilingNoun = pilingIsFalsePositive
+      ? `false alarm${pilingCount === 1 ? "" : "s"}`
+      : `miss${pilingCount === 1 ? "" : "es"}`;
+
+    if (opposing === scenario.primary) {
+      // 3. The right metric, pushed past what the brief needs.
+      const primaryFloor = scenario.constraints.find(
+        (entry) => entry.metric === scenario.primary,
+      )?.floor;
+      const protectedCost =
+        opposing === "precision"
+          ? scenario.falsePositiveCost
+          : scenario.falseNegativeCost;
+      return {
+        ...base,
+        outcome: "overshoot",
+        failure: {
+          name: "Overshot the tradeoff",
+          detail: `${METRIC_LABELS[opposing]} ${percent(
+            opposingValue,
+          )} is more than this brief needs${
+            primaryFloor === undefined
+              ? ""
+              : ` — it asks for ${percent(primaryFloor)}`
+          } — and ${shortfall}. You protected against the right error (here ${protectedCost}) so hard that the other one piled up: ${pilingCount} ${pilingNoun}, each meaning ${pilingCost}. ${move} the threshold and give back some ${lower(
+            opposing,
+          )}; the brief asks for enough of it, not all of it.`,
+        },
+      };
+    }
+
+    // 2. The metric the critic is NOT paying for, bought with the one they are.
+    const dear = dearErrorFor(scenario, constraint.metric);
+    const dearer =
+      dear === "falsePositive"
         ? scenario.falsePositiveCost
         : scenario.falseNegativeCost;
-    const dearer =
-      constraint.metric === "recall"
+    const cheaper =
+      dear === "falsePositive"
         ? scenario.falseNegativeCost
         : scenario.falsePositiveCost;
+    const composite = opposingMetric(scenario.primary) === null;
 
     return {
       ...base,
       outcome: "wrong-side",
       failure: {
         name: "Wrong side of the tradeoff",
-        detail: `${METRIC_LABELS[opposing]} ${percent(
-          opposingValue,
-        )} is all but perfect while ${METRIC_LABELS[
-          constraint.metric
-        ].toLowerCase()} is ${percent(constraint.achieved)}, short of the ${percent(
-          constraint.floor,
-        )} floor. You bought the error the critic does not mind at the price of the one that matters: here ${dearer}, whereas ${cheaper}. ${
-          move === "lower" ? "Lower" : "Raise"
-        } the threshold and let the cheaper mistake happen more often.`,
+        detail: composite
+          ? // "Both errors hurt here": no error is the cheap one, so the copy
+            // says which floor is breaking rather than ranking the two.
+            `${METRIC_LABELS[opposing]} ${percent(
+              opposingValue,
+            )} is all but perfect while ${shortfall}. This brief puts a floor under both errors and you have spent everything on one side of it: ${pilingCount} ${pilingNoun}, each meaning ${pilingCost}. ${move} the threshold and accept more of the other error — ${cheaper} — until both floors hold.`
+          : `${METRIC_LABELS[opposing]} ${percent(
+              opposingValue,
+            )} is all but perfect while ${shortfall}. You bought the error the critic does not mind at the price of the one that matters: here ${dearer}, whereas ${cheaper}. ${move} the threshold and let the cheaper mistake happen more often.`,
       },
     };
   }
 
-  // 3. Right idea, short of the band.
+  // 4. Right idea, short of the band.
   const shortfalls = failed
     .map(
       (constraint) =>
-        `${METRIC_LABELS[constraint.metric].toLowerCase()} ${points(
+        `${lower(constraint.metric)} ${points(
           constraint.achieved,
         )} against a ${percent(constraint.floor)} floor`,
     )
     .join(", and ");
 
+  // Flag nothing and there is no trade to be on the wrong side of yet. Named
+  // first because the direction heuristics below would disagree here — recall
+  // says lower, and a precision of 0 (no denominator) says "raise", which
+  // cannot raise anything — and that disagreement used to be reported as proof
+  // that no cutoff could work, on shifts that have a winning band.
+  if (flagged === 0) {
+    return {
+      ...base,
+      outcome: "missed",
+      failure: {
+        name: "Target band missed",
+        detail: `${shortfalls}. You flagged nothing at all, so precision has no denominator — it is reported as 0, not as perfect — and nothing is being traded yet. Lower the threshold until the model starts flagging cases, then watch which floor moves first.`,
+      },
+    };
+  }
+
   const directions = new Set(
     failed.map((constraint) => directionToRaise(constraint.metric, metrics)),
   );
+
+  let advice: string;
+  if (directions.size > 1) {
+    // Claim infeasibility only after actually looking for a cutoff.
+    const band = winningBand(scenario, samples);
+    if (band.length === 0) {
+      advice =
+        "The two shortfalls want the threshold moved in opposite directions, and no cutoff on the slider satisfies both — this model is not separating the cases well enough for this brief, and the honest answer is to say so rather than to keep sliding.";
+    } else {
+      const nearest = band.reduce((best, entry) =>
+        Math.abs(entry.threshold - threshold) <
+        Math.abs(best.threshold - threshold)
+          ? entry
+          : best,
+      );
+      advice = `The two shortfalls pull the threshold in opposite directions from here, yet cutoffs that satisfy both do exist, ${
+        nearest.threshold > threshold ? "above" : "below"
+      } yours. Move toward them one notch at a time and watch which cell of the matrix pays.`;
+    }
+  } else {
+    // Said from where the winning cutoffs actually are, not from the path the
+    // player took: "not far enough along it" read backwards to a player who had
+    // pushed PAST the band (prank shift at 0.93, one notch between two
+    // overshoots), and the direction is the band's, which cannot be wrong.
+    const band = winningBand(scenario, samples);
+    if (band.length === 0) {
+      advice = `${
+        directions.has("lower") ? "Lower" : "Raise"
+      } the threshold and watch which cell of the matrix pays for it — though no cutoff on the slider meets every floor of this brief, so another floor will give way first.`;
+    } else {
+      const nearest = band.reduce((best, entry) =>
+        Math.abs(entry.threshold - threshold) <
+        Math.abs(best.threshold - threshold)
+          ? entry
+          : best,
+      );
+      const below = nearest.threshold < threshold;
+      const side = below ? "below" : "above";
+      const all = band.every((entry) =>
+        below ? entry.threshold < threshold : entry.threshold > threshold,
+      );
+      // The headline floor already holding is the overshoot's lesson, one
+      // notch short of its 95% bar: say it here too.
+      const headline = scenario.constraints.find(
+        (constraint) => constraint.metric === scenario.primary,
+      );
+      const headlineHolds =
+        headline !== undefined && primaryValue >= headline.floor;
+      advice = `${
+        below ? "Lower" : "Raise"
+      } the threshold and watch which cell of the matrix pays for it. ${
+        all
+          ? `Every cutoff that meets this brief is ${side} yours.`
+          : `The nearest cutoff that meets this brief is ${side} yours.`
+      }${
+        headlineHolds && headline
+          ? ` ${METRIC_LABELS[scenario.primary]} already clears its ${percent(
+              headline.floor,
+            )} floor: the brief asks for enough of it, not all of it.`
+          : ""
+      }`;
+    }
+  }
 
   return {
     ...base,
     outcome: "missed",
     failure: {
       name: "Target band missed",
-      detail: `${shortfalls}. ${
-        directions.size > 1
-          ? "The two shortfalls want the threshold moved in opposite directions, which means no cutoff satisfies both — this model is not separating the cases well enough for this brief, and the honest answer is to say so rather than to keep sliding."
-          : `${
-              directions.has("lower") ? "Lower" : "Raise"
-            } the threshold and watch which cell of the matrix pays for it. You are on the right side of the trade, just not far enough along it.`
-      }`,
+      detail: `${shortfalls}. ${advice}`,
     },
   };
 }
@@ -675,7 +919,7 @@ const recall    = TP / (TP + FN);   // of what mattered, how much you caught
 const accuracy  = (TP + TN) / (TP + FP + TN + FN);   // counts TN, which is why
                                                      // it lies on rare positives`;
 
-export const MATH_NOTES = `Precision and recall share a numerator and differ in the denominator, and that is the entire tradeoff. Raising the cutoff removes cases from the flagged pile: the ones it removes are mostly false positives, so precision climbs, and some were true positives, so recall falls. You cannot move one without paying in the other.
+export const MATH_NOTES = `Precision and recall share a numerator and differ in the denominator, and that is the entire tradeoff. Raising the cutoff removes cases from the flagged pile, lowest scores first. Any true positives among them lower recall — it can never rise when the pile shrinks. Precision usually climbs, because with a model that ranks well the lowest-scoring flagged cases are the likeliest to be false alarms; but it only climbs when the removed cases were right less often than the pile as a whole, so a notch here and there can move it the other way. Over the whole range you cannot buy one without paying in the other.
 
 Accuracy is the odd one out because TN is in its numerator. When 94% of cases are negative, a classifier that flags nothing collects all of those true negatives and reports 94% — while catching none of the thing you built it for. That is not a rounding artefact, it is what accuracy means on imbalanced data.
 
