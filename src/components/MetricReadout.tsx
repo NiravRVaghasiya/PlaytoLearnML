@@ -136,14 +136,24 @@ export function MetricReadout({
     const previous = previousRef.current;
     previousRef.current = value;
 
-    const changed =
-      previous !== null && previous !== value && Number.isFinite(value);
+    // A change needs a real number on BOTH sides. Games use NaN for "not
+    // measured yet", and every comparison with NaN is false, so the first real
+    // measurement used to read as "down" — a red ▼ and a bad pulse on Data
+    // Detox's very first accuracy, whichever way was good.
+    const comparable =
+      previous !== null && Number.isFinite(previous) && Number.isFinite(value);
+    const changed = comparable && previous !== value;
 
     if (changed) {
       setTrend(value > previous ? "up" : "down");
       const improving =
         goodDirection === "up" ? value > previous : value < previous;
       setPulse(improving ? "good" : "bad");
+    } else if (!comparable) {
+      // Into or out of "not measured": there is no direction to show, and a
+      // stale arrow beside "—" would claim one.
+      setTrend("flat");
+      setPulse(null);
     }
 
     const announceTimer = announce
@@ -177,6 +187,7 @@ export function MetricReadout({
         {/* Redundant, non-colour cue for the direction of travel. */}
         <span
           aria-hidden="true"
+          data-testid="metric-trend"
           className={cx(
             "font-mono text-sm transition-colors dur-standard",
             STATE_COLOR[effectiveState],
@@ -198,7 +209,13 @@ export function MetricReadout({
           "mt-1 block font-mono tabular-nums transition-colors dur-standard",
           size === "lg" ? "text-2xl" : "text-xl",
           STATE_COLOR[effectiveState],
-          pulse === "good" ? "metric-sparkle" : null,
+          // The sparkle is part of the pulse, so an explicit state overrides it
+          // the same way it overrides the pulse colour. A count the game marks
+          // `neutral` (K-Means' number of flags) is not "better" for rising, and
+          // a green sparkle on a red, failing metric would contradict it.
+          pulse === "good" && (state === undefined || state === "good")
+            ? "metric-sparkle"
+            : null,
         )}
       >
         {formatMetric(displayed, format, precision)}

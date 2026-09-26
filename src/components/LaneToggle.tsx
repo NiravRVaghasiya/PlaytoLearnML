@@ -1,5 +1,6 @@
 "use client";
 
+import { useRef } from "react";
 import { Code2, MousePointerClick } from "lucide-react";
 import { cx } from "@/lib/utils";
 import type { Lane } from "@/engine/types";
@@ -27,7 +28,10 @@ const OPTIONS: ReadonlyArray<{
  *
  * Implemented as a real radiogroup so arrow keys move between lanes and screen
  * readers announce "Visual, radio button, 1 of 2, selected". Roving tabindex
- * keeps the group a single tab stop.
+ * keeps the group a single tab stop, and — per the APG radio pattern — an arrow
+ * key moves focus AND selection together. Moving only the selection left focus
+ * on the radio that had just become unchecked, so a screen reader said
+ * "Visual, not checked" and never announced the lane that was chosen.
  *
  * Game state persists across the toggle because both lanes read the same
  * Zustand store — the shell swaps which view is mounted, it never owns the
@@ -41,11 +45,15 @@ export function LaneToggle({
   className,
 }: LaneToggleProps) {
   const isDisabled = (lane: Lane) => lane === "code" && codeDisabled;
+  const buttonRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   const move = (direction: 1 | -1) => {
     const index = OPTIONS.findIndex((o) => o.lane === value);
-    const next = OPTIONS[(index + direction + OPTIONS.length) % OPTIONS.length];
-    if (next && !isDisabled(next.lane)) onChange(next.lane);
+    const nextIndex = (index + direction + OPTIONS.length) % OPTIONS.length;
+    const next = OPTIONS[nextIndex];
+    if (!next || isDisabled(next.lane)) return;
+    onChange(next.lane);
+    buttonRefs.current[nextIndex]?.focus();
   };
 
   return (
@@ -57,13 +65,16 @@ export function LaneToggle({
         className,
       )}
     >
-      {OPTIONS.map(({ lane, label, Icon }) => {
+      {OPTIONS.map(({ lane, label, Icon }, optionIndex) => {
         const selected = value === lane;
         const disabled = isDisabled(lane);
 
         return (
           <button
             key={lane}
+            ref={(node) => {
+              buttonRefs.current[optionIndex] = node;
+            }}
             type="button"
             role="radio"
             aria-checked={selected}

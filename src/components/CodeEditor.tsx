@@ -125,13 +125,18 @@ export function CodeEditor({
       ) : null}
 
       {error ? (
+        // Red carries the state (border, tint, icon); the message itself is in
+        // --text. --wrong text on its own 10% tint measured 4.1:1 at 12px,
+        // under the 4.5:1 AA bar — and this box is in all fourteen code lanes.
+        // pre-wrap keeps a multi-line message (a Python traceback summary, a
+        // snippet's own thrown text) on separate lines instead of one run-on.
         <p
           id={errorId}
           role="alert"
-          className="mt-2 flex items-start gap-2 rounded-md border border-wrong/50 bg-wrong/10 p-2 font-mono text-xs text-wrong"
+          className="mt-2 flex items-start gap-2 rounded-md border border-wrong/50 bg-wrong/10 p-2 font-mono text-xs text-text"
         >
-          <AlertCircle aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
-          <span className="min-w-0 break-words">{error}</span>
+          <AlertCircle aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-wrong" />
+          <span className="min-w-0 break-words whitespace-pre-wrap">{error}</span>
         </p>
       ) : null}
     </div>

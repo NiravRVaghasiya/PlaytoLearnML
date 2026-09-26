@@ -31,6 +31,12 @@ export {
   type ControlScale,
 } from "./Slider";
 export { StarRating, type StarRatingProps } from "./StarRating";
-export { WhyCard, type WhyCardProps, type WhyCardContent, type WhyTone } from "./WhyCard";
+export {
+  WhyCard,
+  whyCardHeadline,
+  type WhyCardProps,
+  type WhyCardContent,
+  type WhyTone,
+} from "./WhyCard";
 export { XPBar, type XPBarProps } from "./XPBar";
 export { useAnimatedNumber } from "./useAnimatedNumber";

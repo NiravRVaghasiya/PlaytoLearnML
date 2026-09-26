@@ -58,6 +58,16 @@ const TONE: Record<
 };
 
 /**
+ * The one line a screen reader should hear when this card changes: its tone
+ * prefix and headline, e.g. "Failure: You overfit". Deliberately not the body —
+ * the body is two sentences, and reading it after every move would bury the
+ * metric. `GameShell` announces this politely whenever the card's key changes.
+ */
+export function whyCardHeadline(content: WhyCardContent): string {
+  return `${TONE[content.tone ?? "info"].srPrefix}: ${content.title}`;
+}
+
+/**
  * "Why did that happen?" — the 2-line explanation tied to the player's last
  * action (DESIGN.md §6, spec §4).
  *
@@ -115,7 +125,9 @@ export function WhyCard({ content, className }: WhyCardProps) {
           {content.conceptHref ? (
             <Link
               href={content.conceptHref}
-              className="mt-2 inline-block text-sm font-medium text-primary underline decoration-dotted underline-offset-4"
+              // min-h-11: a standalone link, not one inside a sentence, so the
+              // WCAG 2.5.8 inline exception does not cover it (DESIGN.md §9).
+              className="mt-2 inline-flex min-h-11 items-center text-sm font-medium text-primary underline decoration-dotted underline-offset-4"
             >
               {content.conceptLabel ?? "Read the concept"}
             </Link>

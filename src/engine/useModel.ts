@@ -18,9 +18,15 @@ import * as tf from "@tensorflow/tfjs";
  *    the wire that makes the metric move during training — never fake progress.
  * 3. **Inference is wrapped in `tf.tidy`.**
  * 4. **Disposal on rebuild, reset, and unmount.**
- * 5. **Overlapping trainings are serialised.** A player mashing "Train" stops
- *    the in-flight fit and waits for it before starting the next one, so two
- *    fits never share a model.
+ * 5. **Overlapping trainings are serialised, latest wins.** A player mashing
+ *    "Train" stops the in-flight fit and waits for it; of all the calls that
+ *    queued up meanwhile, only the newest runs. Every other one resolves
+ *    `null`, the stopped fit included, so two fits never share a model and no
+ *    caller scores weights a newer request now owns.
+ * 6. **A model is never disposed mid-fit.** `build()` or `reset()` during a
+ *    fit stops it and frees the old weights once it has actually stopped, so
+ *    the common "fresh weights, then train" (`build(); await train(…)`) is safe
+ *    even while a previous fit is still running.
  *
  * Tests assert `tensorCount()` returns to baseline after a full round.
  */
@@ -47,6 +53,13 @@ export interface TrainRequest {
   /** 0–1. Enables `valLoss`/`valAccuracy` in the epoch metrics. */
   validationSplit?: number;
   shuffle?: boolean;
+  /**
+   * Train from fresh weights: rebuild the model AFTER any in-flight fit has
+   * been stopped and awaited, then fit. Equivalent to `build(); train()`, but
+   * the rebuild happens once the queue is clear rather than while another fit
+   * may still hold the model.
+   */
+  rebuild?: boolean;
 }
 
 export interface UseModelOptions {
@@ -57,7 +70,11 @@ export interface UseModelOptions {
   build: () => tf.LayersModel;
   /** Fired every epoch with real logs. Wire this to the game's store. */
   onEpoch?: (metrics: EpochMetrics) => void;
-  /** Fired once when a fit finishes or is stopped. */
+  /**
+   * Fired once when a fit finishes or is stopped. Not fired for a fit that a
+   * newer `train()`, `build()` or `reset()` took over: like its epoch updates,
+   * its end is stale.
+   */
   onDone?: (last: EpochMetrics | null) => void;
   /** Build on mount. Defaults to false so games control the timing. */
   autoBuild?: boolean;
@@ -72,6 +89,14 @@ export interface UseModelApi {
   latest: EpochMetrics | null;
   /** Build or rebuild. Disposes any previous model first. */
   build: () => void;
+  /**
+   * Fit the model. Resolves with the last epoch's metrics — partial if `stop()`
+   * or an unmount cut it short, so check the epoch count — or `null` when the
+   * request never ran or was taken over: bad input, a factory failure, a reset
+   * or unmount while it waited, or a newer `train()`, `build()` or `reset()`
+   * that superseded it, queued or mid-fit. Treat `null` as "not trained" —
+   * don't score whatever the model currently holds.
+   */
   train: (request: TrainRequest) => Promise<EpochMetrics | null>;
   /** Synchronous inference. Returns null when no model is built. */
   predict: (xs: number[][]) => Float32Array | null;
@@ -113,6 +138,16 @@ export function useModel(options: UseModelOptions): UseModelApi {
   const modelRef = useRef<tf.LayersModel | null>(null);
   /** In-flight fit, so a second train() can await it instead of racing. */
   const pendingRef = useRef<Promise<unknown> | null>(null);
+  /** The model that in-flight fit is using, so it isn't disposed under it. */
+  const fittingModelRef = useRef<tf.LayersModel | null>(null);
+  /**
+   * Ticket per train() call. Only the newest ticket may start a fit once the
+   * queue clears; reset and unmount take a ticket too, which cancels anything
+   * still waiting. A single `if (pending) await pending` was not enough: with
+   * three overlapping calls, two waiters both woke up and raced into
+   * `model.fit` ("another fit() call is ongoing").
+   */
+  const requestRef = useRef(0);
   /** Bumped per fit; stale epoch callbacks are dropped. */
   const generationRef = useRef(0);
   const mountedRef = useRef(true);
@@ -141,11 +176,7 @@ export function useModel(options: UseModelOptions): UseModelApi {
   const [totalEpochs, setTotalEpochs] = useState(0);
   const [latest, setLatest] = useState<EpochMetrics | null>(null);
 
-  const disposeModel = useCallback(() => {
-    const model = modelRef.current;
-    modelRef.current = null;
-    if (!model) return;
-
+  const disposeInstance = useCallback((model: tf.LayersModel) => {
     // `LayersModel.dispose()` frees the weights but NOT the optimizer, which
     // allocates its own accumulator variables during `fit` (Adam keeps two per
     // weight). Leaving those behind is the leak that eventually kills the tab,
@@ -164,8 +195,32 @@ export function useModel(options: UseModelOptions): UseModelApi {
     }
   }, []);
 
+  /**
+   * Take the current model out of service and free it — now if it is idle, or
+   * once its fit has actually stopped if it is mid-fit. Disposing weights that
+   * `fit` is still reading throws "LayersVariable … is already disposed" inside
+   * the fit and can leave the next fit reading freed memory.
+   */
+  const disposeModel = useCallback(() => {
+    const model = modelRef.current;
+    modelRef.current = null;
+    if (!model) return;
+
+    const pending = pendingRef.current;
+    if (pending && fittingModelRef.current === model) {
+      model.stopTraining = true;
+      const release = () => disposeInstance(model);
+      void pending.then(release, release);
+      return;
+    }
+    disposeInstance(model);
+  }, [disposeInstance]);
+
   const build = useCallback(() => {
     try {
+      // A fit still running on the old model is now obsolete: drop its
+      // remaining epoch callbacks so they can't report on weights nobody uses.
+      if (pendingRef.current) generationRef.current += 1;
       // Rebuilding must not orphan the previous model's weights.
       disposeModel();
       modelRef.current = optionsRef.current.build();
@@ -187,6 +242,8 @@ export function useModel(options: UseModelOptions): UseModelApi {
 
   const reset = useCallback(() => {
     generationRef.current += 1;
+    // Cancel any train() still queued behind the in-flight fit.
+    requestRef.current += 1;
     stop();
     disposeModel();
     setStatus("idle");
@@ -199,16 +256,22 @@ export function useModel(options: UseModelOptions): UseModelApi {
   const train = useCallback(
     async (request: TrainRequest): Promise<EpochMetrics | null> => {
       // --- serialise overlapping trainings -------------------------------
-      if (pendingRef.current) {
+      const ticket = ++requestRef.current;
+      while (pendingRef.current) {
+        const pending = pendingRef.current;
         stop();
         try {
-          await pendingRef.current;
+          await pending;
         } catch {
           // The previous fit's failure is already reported; don't mask this one.
         }
+        // A newer train(), a reset or an unmount arrived while this one
+        // waited. The newest request wins; this one never runs.
+        if (ticket !== requestRef.current) return null;
       }
+      if (ticket !== requestRef.current) return null;
 
-      if (!modelRef.current) build();
+      if (request.rebuild || !modelRef.current) build();
       const model = modelRef.current;
       if (!model) return null;
 
@@ -272,12 +335,20 @@ export function useModel(options: UseModelOptions): UseModelApi {
       })();
 
       pendingRef.current = run;
+      fittingModelRef.current = model;
 
       try {
         await run;
-        if (generation === generationRef.current && mountedRef.current) {
-          setStatus("ready");
-        }
+        // Taken over mid-fit: a newer train() is queued for this model (its
+        // ticket is newer), or build()/reset() replaced it (the generation
+        // moved). This fit's partial epochs describe weights nobody will use,
+        // so it reports "not trained", like a request that never ran. An
+        // unmount replaces nothing; like stop(), it reports how far it got.
+        const superseded =
+          mountedRef.current &&
+          (ticket !== requestRef.current || generation !== generationRef.current);
+        if (superseded) return null;
+        if (mountedRef.current) setStatus("ready");
         optionsRef.current.onDone?.(last);
         return last;
       } catch (cause) {
@@ -290,7 +361,10 @@ export function useModel(options: UseModelOptions): UseModelApi {
         // Training tensors are ours; free them regardless of outcome.
         for (const tensor of owned) tensor.dispose();
         owned.length = 0;
-        if (pendingRef.current === run) pendingRef.current = null;
+        if (pendingRef.current === run) {
+          pendingRef.current = null;
+          fittingModelRef.current = null;
+        }
       }
     },
     [build, stop],
@@ -316,6 +390,7 @@ export function useModel(options: UseModelOptions): UseModelApi {
     return () => {
       mountedRef.current = false;
       generationRef.current += 1;
+      requestRef.current += 1;
       const model = modelRef.current;
       if (model) model.stopTraining = true;
       disposeModel();

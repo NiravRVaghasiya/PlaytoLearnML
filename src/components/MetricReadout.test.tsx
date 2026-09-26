@@ -187,3 +187,84 @@ describe("<MetricReadout>", () => {
     expect(screen.getByText("on held-out set")).toBeInTheDocument();
   });
 });
+
+describe("direction cue around 'not measured yet'", () => {
+  it("shows no 'worse' arrow on the first real measurement after NaN", async () => {
+    // Regression: every comparison with NaN is false, so NaN → 0.91 read as a
+    // DROP — a red ▼ and a bad pulse on the very first accuracy a game showed.
+    const { rerender } = render(
+      <MetricReadout label="Accuracy" value={Number.NaN} format="percent" goodDirection="up" />,
+    );
+    rerender(
+      <MetricReadout label="Accuracy" value={0.91} format="percent" goodDirection="up" />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("metric-value")).toHaveTextContent("91%"),
+    );
+    expect(screen.getByTestId("metric-trend")).toHaveTextContent("–");
+    expect(screen.getByTestId("metric-value").className).not.toContain("text-wrong");
+    expect(screen.getByTestId("metric-trend").className).not.toContain("text-wrong");
+  });
+
+  it("drops a stale arrow when the value goes back to 'not measured'", async () => {
+    const { rerender } = render(
+      <MetricReadout label="Accuracy" value={0.5} format="percent" />,
+    );
+    rerender(<MetricReadout label="Accuracy" value={0.8} format="percent" />);
+    await waitFor(() =>
+      expect(screen.getByTestId("metric-trend")).toHaveTextContent("▲"),
+    );
+
+    rerender(<MetricReadout label="Accuracy" value={Number.NaN} format="percent" />);
+    await waitFor(() =>
+      expect(screen.getByTestId("metric-trend")).toHaveTextContent("–"),
+    );
+  });
+
+  it("still shows a real drop between two real values", async () => {
+    const { rerender } = render(
+      <MetricReadout label="Accuracy" value={0.8} format="percent" goodDirection="up" />,
+    );
+    rerender(
+      <MetricReadout label="Accuracy" value={0.6} format="percent" goodDirection="up" />,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("metric-trend")).toHaveTextContent("▼"),
+    );
+    expect(screen.getByTestId("metric-trend").className).toContain("text-wrong");
+  });
+});
+
+describe("the improvement sparkle", () => {
+  it("sparkles when a metric with no explicit state improves", async () => {
+    const { rerender } = render(<MetricReadout label="Accuracy" value={0.5} format="percent" />);
+    rerender(<MetricReadout label="Accuracy" value={0.8} format="percent" />);
+    await waitFor(() =>
+      expect(screen.getByTestId("metric-value").className).toContain("metric-sparkle"),
+    );
+  });
+
+  it("does not sparkle a count the game marks neutral, however it moves", async () => {
+    // K-Means passes state: "neutral" for its number of flags: more is not better.
+    const { rerender } = render(
+      <MetricReadout label="Flags (k)" value={3} format="integer" state="neutral" />,
+    );
+    rerender(<MetricReadout label="Flags (k)" value={4} format="integer" state="neutral" />);
+    await waitFor(() =>
+      expect(screen.getByTestId("metric-trend")).toHaveTextContent("▲"),
+    );
+    expect(screen.getByTestId("metric-value").className).not.toContain("metric-sparkle");
+  });
+
+  it("does not sparkle a metric the game has forced into a failing state", async () => {
+    const { rerender } = render(
+      <MetricReadout label="Accuracy" value={0.5} format="percent" state="bad" />,
+    );
+    rerender(<MetricReadout label="Accuracy" value={0.6} format="percent" state="bad" />);
+    await waitFor(() =>
+      expect(screen.getByTestId("metric-trend")).toHaveTextContent("▲"),
+    );
+    expect(screen.getByTestId("metric-value").className).not.toContain("metric-sparkle");
+  });
+});

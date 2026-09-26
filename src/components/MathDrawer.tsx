@@ -1,8 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef } from "react";
-import katex from "katex";
-import "katex/dist/katex.min.css";
+import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { Button } from "./Button";
 import { CodeBlock } from "./CodeBlock";
@@ -17,6 +15,21 @@ export interface MathDrawerProps {
   title: string;
 }
 
+/** What's in the equation box: rendered HTML, or "" = show the source. */
+interface RenderedEquation {
+  equation: string;
+  html: string;
+  /**
+   * KaTeX itself didn't arrive (as opposed to "" from a parse failure, which
+   * no retry can fix). The source shows meanwhile, and the next open tries
+   * the download again instead of settling for it for the rest of the visit.
+   */
+  loadFailed?: boolean;
+}
+
+const FOCUSABLE =
+  'button:not([disabled]), [href], input, textarea, select, [tabindex]:not([tabindex="-1"])';
+
 /**
  * The "ƒ Math" reveal drawer (DESIGN.md §5/§6).
  *
@@ -25,25 +38,61 @@ export interface MathDrawerProps {
  * contents as documentation of the implementation, not marketing.
  *
  * Accessibility: rendered as a modal dialog with a focus trap, Escape to close,
- * and focus returned to the trigger on dismiss.
+ * and focus returned to the trigger on dismiss. Three details make it actually
+ * modal rather than only labelled as one:
+ *
+ * - The panel itself is focusable (`tabIndex={-1}`), so clicking its text keeps
+ *   focus inside instead of dropping it on the page behind — from where Tab used
+ *   to walk straight out into the game.
+ * - Tab from anywhere that isn't inside the panel is pulled back in.
+ * - While open, keydown events stop at the dialog (a capture listener on the
+ *   document), so a game's document-level shortcuts — Data Detox sorts rows on
+ *   1–4 — can't change the game behind an `aria-modal` dialog. Default actions
+ *   (Tab, Enter on a button, scrolling) are untouched. `GameShell` also marks
+ *   the rest of the page `inert`, which covers pointer input and the virtual
+ *   cursor.
+ *
+ * KaTeX is loaded the first time the drawer opens, not with the game — see
+ * `katexRender.ts`. The code block renders immediately; the equation follows a
+ * moment later on first open, and instantly after that.
  */
 export function MathDrawer({ open, onClose, math, title }: MathDrawerProps) {
   const panelRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   const restoreRef = useRef<HTMLElement | null>(null);
 
-  const equationHtml = useMemo(() => {
-    try {
-      return katex.renderToString(math.equation, {
-        displayMode: true,
-        throwOnError: false,
-        output: "html",
+  const [rendered, setRendered] = useState<RenderedEquation | null>(null);
+  // Stays true after a failed load while the drawer is open (so it isn't
+  // retried in a loop), and is true again on the next open.
+  const needsRender =
+    open && (rendered?.equation !== math.equation || rendered.loadFailed === true);
+
+  // Lazy-load KaTeX on first open (and again only if the equation changes).
+  useEffect(() => {
+    if (!needsRender) return;
+    let live = true;
+    const equation = math.equation;
+
+    import("./katexRender")
+      .then(({ renderEquation }) => {
+        if (live) setRendered({ equation, html: renderEquation(equation) });
+      })
+      .catch(() => {
+        // Chunk failed to load (offline, deploy mid-session). The LaTeX source
+        // is still the truth, so show that rather than nothing.
+        if (live) setRendered({ equation, html: "", loadFailed: true });
       });
-    } catch {
-      // Never let a bad LaTeX string take down a game.
-      return "";
-    }
-  }, [math.equation]);
+
+    return () => {
+      live = false;
+    };
+  }, [needsRender, math.equation]);
+
+  const equationHtml =
+    rendered && rendered.equation === math.equation ? rendered.html : null;
+  /** Stable hook for browser checks: wait for "rendered", not for a timeout. */
+  const equationState =
+    equationHtml === null ? "loading" : equationHtml ? "rendered" : "source";
 
   // Remember the trigger, move focus in, restore on close.
   useEffect(() => {
@@ -55,11 +104,15 @@ export function MathDrawer({ open, onClose, math, title }: MathDrawerProps) {
     return () => restoreRef.current?.focus?.();
   }, [open]);
 
-  // Escape to close + Tab trapped inside the panel.
+  // Escape to close, Tab trapped inside the panel, and nothing leaks out.
   useEffect(() => {
     if (!open) return;
 
     const onKeyDown = (event: KeyboardEvent) => {
+      // Capture phase on the document: runs before any target or bubbling
+      // listener, so stopping it here keeps the page behind from reacting.
+      event.stopPropagation();
+
       if (event.key === "Escape") {
         event.preventDefault();
         onClose();
@@ -67,25 +120,33 @@ export function MathDrawer({ open, onClose, math, title }: MathDrawerProps) {
       }
       if (event.key !== "Tab") return;
 
-      const focusable = panelRef.current?.querySelectorAll<HTMLElement>(
-        'button, [href], input, textarea, select, [tabindex]:not([tabindex="-1"])',
-      );
-      if (!focusable || focusable.length === 0) return;
+      const panel = panelRef.current;
+      const focusable = panel?.querySelectorAll<HTMLElement>(FOCUSABLE);
+      if (!panel || !focusable || focusable.length === 0) return;
 
       const first = focusable[0]!;
       const last = focusable[focusable.length - 1]!;
+      const active = document.activeElement;
 
-      if (event.shiftKey && document.activeElement === first) {
+      // Focus on the panel itself (after a click on its text) or, somehow,
+      // outside it: the browser's next Tab stop may be in the page behind.
+      if (active === panel || !panel.contains(active)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+        return;
+      }
+
+      if (event.shiftKey && active === first) {
         event.preventDefault();
         last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
+      } else if (!event.shiftKey && active === last) {
         event.preventDefault();
         first.focus();
       }
     };
 
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => document.removeEventListener("keydown", onKeyDown, true);
   }, [open, onClose]);
 
   if (!open) return null;
@@ -105,8 +166,11 @@ export function MathDrawer({ open, onClose, math, title }: MathDrawerProps) {
         role="dialog"
         aria-modal="true"
         aria-label={`Reveal the math: ${title}`}
+        data-testid="math-dialog"
+        // Focusable so a click on the panel's text keeps focus in the dialog.
+        tabIndex={-1}
         className={cx(
-          "relative flex h-full w-full max-w-xl flex-col overflow-y-auto",
+          "relative flex h-full w-full max-w-xl flex-col overflow-y-auto outline-none",
           "border-l border-border bg-surface p-6 shadow-raised",
         )}
       >
@@ -133,18 +197,32 @@ export function MathDrawer({ open, onClose, math, title }: MathDrawerProps) {
           >
             The equation
           </h3>
-          <div className="mt-2 overflow-x-auto rounded-md border border-border bg-surface-2 p-4">
-            {equationHtml ? (
+          {/* Focusable because it scrolls: a long equation overflows sideways,
+              and a scroller that can't take focus can't be scrolled from the
+              keyboard in Safari or Firefox. */}
+          <div
+            role="group"
+            aria-labelledby="math-equation-heading"
+            tabIndex={0}
+            data-testid="math-equation"
+            data-state={equationState}
+            className="mt-2 overflow-x-auto rounded-md border border-border bg-surface-2 p-4"
+          >
+            {equationHtml === null ? (
+              <p className="font-mono text-sm text-text-muted">
+                Rendering the equation…
+              </p>
+            ) : equationHtml ? (
+              // KaTeX emits MathML beside the HTML, so a screen reader reads
+              // real maths here rather than backslash commands.
               <div dangerouslySetInnerHTML={{ __html: equationHtml }} />
             ) : (
-              <p className="font-mono text-sm text-text-muted">
+              // KaTeX couldn't render it: the source is still the truth.
+              <p className="font-mono text-sm break-words text-text-muted">
                 {math.equation}
               </p>
             )}
           </div>
-          {/* KaTeX output is decorative markup to a screen reader; give it a
-              plain-text fallback that can actually be read aloud. */}
-          <p className="sr-only-live">LaTeX source: {math.equation}</p>
         </section>
 
         {math.notes ? (

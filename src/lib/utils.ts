@@ -49,3 +49,71 @@ export function gaussian(random: () => number): number {
   const v = random();
   return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 }
+
+/**
+ * Resolve after the browser has had a chance to paint.
+ *
+ * `await Promise.resolve()` is not enough: microtasks run before rendering, so a
+ * "Running…" label set just before a long synchronous job would never reach the
+ * screen. A `requestAnimationFrame` callback runs right before a paint, and the
+ * `setTimeout` inside it lands after that paint — which is the point.
+ *
+ * rAF is paused in background tabs, so a plain timeout races it: a job started
+ * from a hidden tab (autoRun on a tab opened in the background) still starts,
+ * a frame or so late, instead of waiting until the player comes back.
+ *
+ * Games chunking a heavy loop use this between batches so the UI stays live:
+ * `if (i % 10 === 0) await yieldToPaint();`
+ */
+export function yieldToPaint(fallbackMs = 100): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(() => setTimeout(finish, 0));
+    }
+    setTimeout(finish, fallbackMs);
+  });
+}
+
+/** Cached result of the one WebGL probe per page. `null` = not probed yet. */
+let webglSupport: boolean | null = null;
+
+/**
+ * Can this browser create a WebGL context? Probed once per page, then cached.
+ *
+ * Every probe is a real GL context, and browsers cap live contexts (Chrome: 16)
+ * by force-losing the OLDEST one — which in a long session can be TF.js's own
+ * WebGL backend. So the probe releases its context straight away through
+ * `WEBGL_lose_context` rather than waiting for garbage collection, and it runs
+ * once, not on every mount of a 3D view (Gradient Descent Skier's terrain,
+ * Dimension Diver's point cloud).
+ */
+export function isWebGLAvailable(): boolean {
+  if (webglSupport !== null) return webglSupport;
+  // Server render: can't know, and must not cache a guess for the client.
+  if (typeof document === "undefined") return false;
+
+  try {
+    const canvas = document.createElement("canvas");
+    const gl = (canvas.getContext("webgl2") ?? canvas.getContext("webgl")) as
+      | WebGLRenderingContext
+      | WebGL2RenderingContext
+      | null
+      | undefined;
+    webglSupport = Boolean(gl);
+    gl?.getExtension("WEBGL_lose_context")?.loseContext();
+  } catch {
+    webglSupport = false;
+  }
+  return webglSupport;
+}
+
+/** Test seam: forget the cached WebGL probe. Never needed by app code. */
+export function resetWebGLProbeForTests(): void {
+  webglSupport = null;
+}

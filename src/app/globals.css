@@ -167,11 +167,8 @@
 
 /* --- Utilities ---------------------------------------------------------- */
 @layer utilities {
-  /* DESIGN.md §9 — minimum 44x44px interactive target. */
-  .target-44 {
-    min-inline-size: 44px;
-    min-block-size: 44px;
-  }
+  /* DESIGN.md §9's 44x44px minimum target has no bespoke utility: shared
+     controls use Tailwind's `min-h-11` / `size-11` (2.75rem = 44px). */
 
   /* DESIGN.md §7 durations as utilities. */
   .dur-micro {
@@ -223,9 +220,19 @@
   /* Shared "this one is wrong" pulse. Used for misclassified points in Sort-It
      Arcade and reusable by any game that needs to draw the eye to an error
      (Data Detox's nulls, Confusion Chef's false positives). Decorative only —
-     the error is always also carried by a shape or label. */
+     the error is always also carried by a shape or label.
+
+     Two rules, both learned the hard way:
+     - It pulses three times when the element appears, then holds still. It
+       used to blink forever on states that last the whole round, with no way
+       to pause it short of the OS reduced-motion setting (WCAG 2.2.2).
+     - It glows rather than fades. The old keyframes dipped opacity to 0.45,
+       which took --wrong text from 4.5:1 down to 1.8:1 at every trough. A
+       red halo around a glyph that stays at full strength draws the same eye
+       without ever costing contrast. `filter` applies to HTML text and SVG
+       graphics alike, so one class still serves both. */
   .flash-wrong {
-    animation: flash-wrong 1400ms ease-in-out infinite;
+    animation: flash-wrong 1400ms ease-in-out 3;
   }
 }
 
@@ -258,10 +265,10 @@
 @keyframes flash-wrong {
   0%,
   100% {
-    opacity: 0.45;
+    filter: none;
   }
   50% {
-    opacity: 1;
+    filter: drop-shadow(0 0 3px color-mix(in srgb, var(--wrong) 85%, transparent));
   }
 }
 
@@ -305,6 +312,42 @@
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
+  }
+
+  /* Belt and braces: the error pulse is attention-getting motion, so under
+     reduced motion it is off outright rather than merely very short. */
+  .flash-wrong {
+    animation: none !important;
+  }
+}
+
+/* --- WCAG 2.4.11 Focus Not Obscured -------------------------------------
+   Keyboard focus scrolls the focused control to the top edge of the viewport,
+   which is exactly where the shell's pinned chrome sits — so Shift+Tab used to
+   land controls entirely underneath it. `scroll-padding-top` tells the
+   browser about that band. Scoped to pages that render a GameShell (it marks
+   its root with data-game); other pages have nothing pinned.
+
+   Values match what GameShell pins at each size:
+   - below lg: only the primary metric card (about 125 px with a one-line
+     caption, 140 px with two) → 9rem. Landscape phones included;
+   - 320 px tall or less below lg (400% zoom): nothing is pinned → 1rem. The
+     height MUST equal GameShell's `[@media(max-height:…)]:static`, or focus
+     lands under a card that is still pinned (GameShell.test.tsx checks);
+   - lg and up: the one-row header (about 70–80 px) → 5.5rem. */
+html:has([data-game]) {
+  scroll-padding-top: 9rem;
+}
+
+@media (max-height: 320px) {
+  html:has([data-game]) {
+    scroll-padding-top: 1rem;
+  }
+}
+
+@media (min-width: 64rem) {
+  html:has([data-game]) {
+    scroll-padding-top: 5.5rem;
   }
 }
 

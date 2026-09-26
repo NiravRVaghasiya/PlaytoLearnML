@@ -12,10 +12,16 @@ import type { Lane, StarCount } from "./types";
  *
  * Two design decisions worth knowing:
  *
- * 1. **It works with no backend.** Supabase is optional. When it isn't
- *    configured, everything persists to localStorage and the games play
- *    identically. Progression must never be a hard dependency of gameplay —
- *    the first-run flow in spec §6 is an explicit no-signup demo.
+ * 1. **It works with no backend.** Progression persists to localStorage, per
+ *    browser, and the games play identically with or without it. Progression
+ *    must never be a hard dependency of gameplay — the first-run flow in spec
+ *    §6 is an explicit no-signup demo.
+ *
+ *    Supabase is a seam, not a feature: `createSupabaseAdapter` exists and is
+ *    tested, but nothing calls it yet, because there is no sign-in flow to
+ *    supply the user id it needs. Setting `NEXT_PUBLIC_SUPABASE_*` alone
+ *    therefore changes nothing. Wiring it up means adding auth first, then
+ *    calling `setAdapter()` with it before `hydrate()`.
  * 2. **Writes are optimistic.** Local state updates immediately so the XP bar
  *    springs the instant a player earns something; persistence happens after and
  *    surfaces failures in `syncError` rather than blocking the UI.
@@ -238,6 +244,62 @@ export function applyResult(
   };
 }
 
+/**
+ * Combine two progression states without losing anything either one earned.
+ *
+ * Used when another tab saves: both tabs hydrated from the same storage, then
+ * each earned things on its own, so neither copy is "the truth". Per game the
+ * best of each field wins (best score, completion, code-lane clear, XP already
+ * paid out, play count), stars are recomputed from those, and badges are the
+ * union. Total XP is the sum of what every game has paid out — which is how
+ * `applyResult` accrues it — and never less than either side's total.
+ */
+export function mergeProgression(
+  a: ProgressionState,
+  b: ProgressionState,
+): ProgressionState {
+  const games: Record<string, GameProgress> = { ...a.games };
+  for (const [slug, theirs] of Object.entries(b.games)) {
+    const ours = games[slug];
+    if (!ours) {
+      games[slug] = theirs;
+      continue;
+    }
+    const bestScore = Math.max(ours.bestScore, theirs.bestScore);
+    const completed = ours.completed || theirs.completed;
+    const codeLaneCleared = ours.codeLaneCleared || theirs.codeLaneCleared;
+    games[slug] = {
+      slug,
+      bestScore,
+      completed,
+      codeLaneCleared,
+      stars: starsFor({ completed, bestScore, codeLaneCleared }),
+      playCount: Math.max(ours.playCount, theirs.playCount),
+      xpAwarded: Math.max(ours.xpAwarded, theirs.xpAwarded),
+      updatedAt: ours.updatedAt > theirs.updatedAt ? ours.updatedAt : theirs.updatedAt,
+    };
+  }
+
+  const paidOut = Object.values(games).reduce(
+    (sum, game) => sum + (Number.isFinite(game.xpAwarded) ? game.xpAwarded : 0),
+    0,
+  );
+
+  return {
+    xp: Math.max(a.xp, b.xp, paidOut),
+    games,
+    badges: [...new Set([...a.badges, ...b.badges])],
+  };
+}
+
+function isEmptyProgression(state: ProgressionState): boolean {
+  return (
+    state.xp === 0 &&
+    Object.keys(state.games).length === 0 &&
+    state.badges.length === 0
+  );
+}
+
 // ── Persistence adapters ───────────────────────────────────────────────────
 
 export interface ProgressionAdapter {
@@ -248,6 +310,23 @@ export interface ProgressionAdapter {
 
 export const STORAGE_KEY = "gameml:progression:v1";
 
+/** Parse a stored blob. Corrupt input reads as "nothing saved", never a throw. */
+function parseStored(raw: string | null): ProgressionState | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<ProgressionState> | null;
+    if (!parsed || typeof parsed !== "object") return null;
+    return {
+      xp: typeof parsed.xp === "number" ? parsed.xp : 0,
+      games:
+        parsed.games && typeof parsed.games === "object" ? parsed.games : {},
+      badges: Array.isArray(parsed.badges) ? parsed.badges : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** Default adapter. Works offline, needs no account. */
 export function createLocalAdapter(): ProgressionAdapter {
   return {
@@ -255,26 +334,31 @@ export function createLocalAdapter(): ProgressionAdapter {
     async load() {
       if (typeof window === "undefined") return null;
       try {
-        const raw = window.localStorage.getItem(STORAGE_KEY);
-        if (!raw) return null;
-        const parsed = JSON.parse(raw) as Partial<ProgressionState>;
-        return {
-          xp: typeof parsed.xp === "number" ? parsed.xp : 0,
-          games: parsed.games ?? {},
-          badges: Array.isArray(parsed.badges) ? parsed.badges : [],
-        };
+        return parseStored(window.localStorage.getItem(STORAGE_KEY));
       } catch {
-        // Corrupt or blocked storage must not break gameplay.
+        // Blocked storage (some privacy modes throw on access) must not break
+        // gameplay.
         return null;
       }
     },
     async save(state) {
       if (typeof window === "undefined") return;
-      try {
-        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-      } catch {
-        // Private-mode quota errors are non-fatal.
-      }
+      // Deliberately NOT swallowed. A quota or privacy-mode failure is still
+      // non-fatal — gameplay carries on from memory — but the player deserves
+      // to know their progress isn't being kept, and `persist()` can only say
+      // so (via `syncError`) if the failure reaches it.
+      //
+      // Read, merge, write. Another tab may have saved since this one last
+      // heard from it (its `storage` event is still in flight), and writing
+      // this tab's copy over the blob would erase what that tab earned. An
+      // empty state is a deliberate reset (`clear()`) and is written as-is.
+      const next = isEmptyProgression(state)
+        ? state
+        : mergeProgression(
+            parseStored(window.localStorage.getItem(STORAGE_KEY)) ?? EMPTY_PROGRESSION,
+            state,
+          );
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
     },
   };
 }
@@ -357,10 +441,17 @@ export interface ProgressionStore extends ProgressionState {
   hydrated: boolean;
   /** Non-fatal persistence failure, surfaced for a quiet "not saved" hint. */
   syncError: string | null;
-  /** XP delta from the most recent award, for the XP bar's flash. */
+  /**
+   * XP delta from the most recent award, for the XP bar's flash. Transient: it
+   * clears itself after `GAIN_FLASH_MS`, and `GameShell` clears it when a game
+   * unmounts, so the "+N XP" never replays on arrival in another game, and a
+   * second award of the same size still flashes and is announced again.
+   */
   lastGain: number | null;
 
   setAdapter: (adapter: ProgressionAdapter) => void;
+  /** Drop the pending XP flash (GameShell calls this on unmount). */
+  dismissGain: () => void;
   hydrate: () => Promise<void>;
   recordResult: (result: GameResult) => AppliedResult;
   isUnlocked: (slug: string) => boolean;
@@ -369,21 +460,73 @@ export interface ProgressionStore extends ProgressionState {
   clear: () => Promise<void>;
 }
 
+/**
+ * How long a "+N XP" stays in `lastGain`. A little longer than the
+ * `xp-gain-flash` animation in globals.css (1600 ms), so the flash always
+ * finishes before the value clears.
+ */
+export const GAIN_FLASH_MS = 2000;
+
+/**
+ * A save failure as a sentence. Read structurally rather than with
+ * `instanceof Error`: a storage quota failure is a `DOMException`, which is not
+ * an `Error` in every realm (jsdom, some embedded webviews).
+ */
+function saveErrorMessage(cause: unknown): string {
+  const message = (cause as { message?: unknown } | null)?.message;
+  return typeof message === "string" && message.length > 0
+    ? message
+    : "Could not save progress";
+}
+
 export const useProgression = create<ProgressionStore>((set, get) => {
   let adapter: ProgressionAdapter = createLocalAdapter();
+  let gainTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const clearGainTimer = () => {
+    if (gainTimer !== null) clearTimeout(gainTimer);
+    gainTimer = null;
+  };
 
   const persist = (state: ProgressionState) => {
     // Optimistic: local state is already updated; report failure, don't revert.
-    adapter
-      .save(state)
+    // `Promise.resolve().then` so an adapter that throws synchronously is
+    // reported the same way as one that rejects.
+    Promise.resolve()
+      .then(() => adapter.save(state))
       .then(() => set({ syncError: null }))
       .catch((cause: unknown) =>
         set({
           syncError:
-            cause instanceof Error ? cause.message : "Could not save progress",
+            saveErrorMessage(cause),
         }),
       );
   };
+
+  /*
+   * Cross-tab sync. Two tabs each hydrate once; without this, the second tab
+   * to save silently overwrote everything the first had earned. The browser
+   * fires `storage` in every OTHER tab when one writes, so each tab folds the
+   * other's save into its own state. That keeps memory whole; storage is kept
+   * whole by the local adapter, which merges with the stored blob on every
+   * save, so a near-simultaneous save in both tabs loses nothing even before
+   * either event arrives. A save that empties progression is a deliberate
+   * reset and is adopted as-is rather than merged away.
+   */
+  if (typeof window !== "undefined") {
+    window.addEventListener("storage", (event) => {
+      if (event.key !== null && event.key !== STORAGE_KEY) return;
+      if (adapter.name !== "local" || !get().hydrated) return;
+
+      const incoming = parseStored(event.newValue) ?? EMPTY_PROGRESSION;
+      if (isEmptyProgression(incoming)) {
+        set({ ...EMPTY_PROGRESSION });
+        return;
+      }
+      const { xp, games, badges } = get();
+      set(mergeProgression({ xp, games, badges }, incoming));
+    });
+  }
 
   return {
     ...EMPTY_PROGRESSION,
@@ -393,6 +536,11 @@ export const useProgression = create<ProgressionStore>((set, get) => {
 
     setAdapter(next) {
       adapter = next;
+    },
+
+    dismissGain() {
+      clearGainTimer();
+      if (get().lastGain !== null) set({ lastGain: null });
     },
 
     async hydrate() {
@@ -410,6 +558,13 @@ export const useProgression = create<ProgressionStore>((set, get) => {
       const applied = applyResult({ xp, games, badges }, result);
 
       set({ ...applied.state, lastGain: applied.xpGained || null });
+      clearGainTimer();
+      if (applied.xpGained > 0) {
+        gainTimer = setTimeout(() => {
+          gainTimer = null;
+          set({ lastGain: null });
+        }, GAIN_FLASH_MS);
+      }
       persist(applied.state);
 
       return applied;
@@ -429,8 +584,16 @@ export const useProgression = create<ProgressionStore>((set, get) => {
     },
 
     async clear() {
+      clearGainTimer();
       set({ ...EMPTY_PROGRESSION, lastGain: null, syncError: null });
-      await adapter.save(EMPTY_PROGRESSION);
+      try {
+        await adapter.save(EMPTY_PROGRESSION);
+      } catch (cause) {
+        set({
+          syncError:
+            saveErrorMessage(cause),
+        });
+      }
     },
   };
 });

@@ -50,7 +50,9 @@ export function CodeBlock({
             {showLineNumbers ? (
               <span
                 aria-hidden="true"
-                className="mr-4 inline-block w-6 shrink-0 text-right select-none text-text-muted/60"
+                // Full-strength --text-muted: at /60 the gutter measured 3.41:1 on
+                // --bg, under the 4.5:1 AA bar for text. Full strength is 7.5:1.
+                className="mr-4 inline-block w-6 shrink-0 text-right select-none text-text-muted"
               >
                 {lineIndex + 1}
               </span>

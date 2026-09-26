@@ -1,21 +1,26 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GAME_CATALOG } from "@/lib/catalog";
 import {
   BASE_XP,
   CODE_LANE_MULTIPLIER,
   CONCEPT_BADGES,
   EMPTY_PROGRESSION,
+  GAIN_FLASH_MS,
   HIGH_SCORE_THRESHOLD,
+  STORAGE_KEY,
   applyResult,
   badgeLabel,
+  createLocalAdapter,
   createMemoryAdapter,
   isUnlocked,
+  mergeProgression,
   levelFromXp,
   starsFor,
   unlockedSlugs,
   useProgression,
   xpForScore,
   xpToClearLevel,
+  type GameProgress,
   type ProgressionState,
 } from "./progression";
 
@@ -368,5 +373,263 @@ describe("useProgression store", () => {
     expect(useProgression.getState().isUnlocked("k-means-territory-wars")).toBe(
       true,
     );
+  });
+});
+
+describe("useProgression — the transient XP flash", () => {
+  beforeEach(() => {
+    useProgression.setState({
+      ...EMPTY_PROGRESSION,
+      hydrated: true,
+      syncError: null,
+      lastGain: null,
+    });
+    useProgression.getState().setAdapter(createMemoryAdapter());
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("clears lastGain after the flash, so an equal second gain flashes again", () => {
+    vi.useFakeTimers();
+    const store = useProgression.getState();
+
+    store.recordResult({ slug: "sort-it-arcade", score: 0.2, lane: "visual", completed: true });
+    expect(useProgression.getState().lastGain).toBe(20);
+
+    vi.advanceTimersByTime(GAIN_FLASH_MS);
+    // Cleared: the XP bar unmounts the "+20 XP" span, so the NEXT +20 remounts
+    // it (replaying the animation and changing the live region's content).
+    expect(useProgression.getState().lastGain).toBeNull();
+
+    store.recordResult({ slug: "sort-it-arcade", score: 0.4, lane: "visual", completed: true });
+    expect(useProgression.getState().lastGain).toBe(20);
+  });
+
+  it("dismissGain drops a pending flash (GameShell does this on unmount)", () => {
+    vi.useFakeTimers();
+    useProgression
+      .getState()
+      .recordResult({ slug: "data-detox", score: 0.5, lane: "visual", completed: true });
+    expect(useProgression.getState().lastGain).toBe(50);
+
+    useProgression.getState().dismissGain();
+    expect(useProgression.getState().lastGain).toBeNull();
+
+    // And the old timer can't fire later and clobber a newer gain.
+    useProgression
+      .getState()
+      .recordResult({ slug: "data-detox", score: 0.9, lane: "visual", completed: true });
+    vi.advanceTimersByTime(GAIN_FLASH_MS - 1);
+    expect(useProgression.getState().lastGain).toBe(40);
+  });
+});
+
+describe("useProgression — persistence failures are surfaced", () => {
+  beforeEach(() => {
+    useProgression.setState({
+      ...EMPTY_PROGRESSION,
+      hydrated: true,
+      syncError: null,
+      lastGain: null,
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    useProgression.getState().setAdapter(createMemoryAdapter());
+  });
+
+  it("reports a localStorage quota error through syncError instead of swallowing it", async () => {
+    useProgression.getState().setAdapter(createLocalAdapter());
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
+    });
+
+    const applied = useProgression
+      .getState()
+      .recordResult({ slug: "k-means-territory-wars", score: 1, lane: "visual", completed: true });
+
+    // Gameplay is unaffected: the award landed in memory.
+    expect(applied.xpGained).toBe(100);
+    expect(useProgression.getState().xp).toBe(100);
+
+    await vi.waitFor(() =>
+      expect(useProgression.getState().syncError).toMatch(/quota/i),
+    );
+  });
+
+  it("clears syncError once a later save succeeds", async () => {
+    useProgression.setState({ syncError: "earlier failure" });
+    useProgression.getState().setAdapter(createMemoryAdapter());
+
+    useProgression
+      .getState()
+      .recordResult({ slug: "k-means-territory-wars", score: 1, lane: "visual", completed: true });
+
+    await vi.waitFor(() => expect(useProgression.getState().syncError).toBeNull());
+  });
+});
+
+describe("mergeProgression (cross-tab)", () => {
+  const game = (slug: string, over: Partial<GameProgress> = {}): GameProgress => ({
+    slug,
+    bestScore: 0,
+    stars: 0,
+    completed: false,
+    codeLaneCleared: false,
+    playCount: 1,
+    xpAwarded: 0,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    ...over,
+  });
+
+  it("keeps what each tab earned, so neither overwrites the other", () => {
+    const tabA: ProgressionState = {
+      xp: 100,
+      games: { "sort-it-arcade": game("sort-it-arcade", { bestScore: 1, completed: true, stars: 2, xpAwarded: 100 }) },
+      badges: ["sort-it-arcade"],
+    };
+    const tabB: ProgressionState = {
+      xp: 60,
+      games: { "data-detox": game("data-detox", { bestScore: 0.6, completed: true, stars: 1, xpAwarded: 60 }) },
+      badges: [],
+    };
+
+    const merged = mergeProgression(tabA, tabB);
+    expect(Object.keys(merged.games).sort()).toEqual(["data-detox", "sort-it-arcade"]);
+    expect(merged.xp).toBe(160);
+    expect(merged.badges).toEqual(["sort-it-arcade"]);
+  });
+
+  it("takes the best of each field for a game both tabs played, and recomputes stars", () => {
+    const merged = mergeProgression(
+      {
+        xp: 90,
+        games: { "neuron-forge": game("neuron-forge", { bestScore: 0.9, completed: true, stars: 2, xpAwarded: 90, playCount: 3 }) },
+        badges: [],
+      },
+      {
+        xp: 45,
+        games: { "neuron-forge": game("neuron-forge", { bestScore: 0.3, completed: true, codeLaneCleared: true, stars: 1, xpAwarded: 45, playCount: 5 }) },
+        badges: [],
+      },
+    );
+
+    const forge = merged.games["neuron-forge"]!;
+    expect(forge.bestScore).toBe(0.9);
+    expect(forge.codeLaneCleared).toBe(true);
+    // 0.9 best score + code lane cleared (from the other tab) = three stars.
+    expect(forge.stars).toBe(3);
+    expect(forge.playCount).toBe(5);
+    expect(forge.xpAwarded).toBe(90);
+    expect(merged.xp).toBe(90);
+  });
+});
+
+describe("useProgression — storage events from another tab", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    useProgression.getState().setAdapter(createLocalAdapter());
+    useProgression.setState({
+      ...EMPTY_PROGRESSION,
+      hydrated: true,
+      syncError: null,
+      lastGain: null,
+    });
+  });
+
+  afterEach(() => {
+    window.localStorage.clear();
+    useProgression.getState().setAdapter(createMemoryAdapter());
+  });
+
+  const otherTabSaves = (state: ProgressionState | null) => {
+    window.dispatchEvent(
+      new StorageEvent("storage", {
+        key: STORAGE_KEY,
+        newValue: state === null ? null : JSON.stringify(state),
+      }),
+    );
+  };
+
+  it("folds the other tab's progress into this one instead of losing it later", () => {
+    useProgression
+      .getState()
+      .recordResult({ slug: "sort-it-arcade", score: 1, lane: "visual", completed: true });
+
+    otherTabSaves({
+      xp: 70,
+      games: {
+        "data-detox": {
+          slug: "data-detox",
+          bestScore: 0.7,
+          stars: 1,
+          completed: true,
+          codeLaneCleared: false,
+          playCount: 1,
+          xpAwarded: 70,
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        },
+      },
+      badges: [],
+    });
+
+    const state = useProgression.getState();
+    expect(state.games["sort-it-arcade"]?.completed).toBe(true);
+    expect(state.games["data-detox"]?.completed).toBe(true);
+    expect(state.xp).toBe(170);
+  });
+
+  it("keeps both tabs' progress in storage when they save before hearing from each other", async () => {
+    // This tab earns and saves.
+    useProgression
+      .getState()
+      .recordResult({ slug: "sort-it-arcade", score: 1, lane: "visual", completed: true });
+    const stored = () =>
+      JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? "null") as ProgressionState | null;
+    await vi.waitFor(() => expect(stored()?.games["sort-it-arcade"]).toBeDefined());
+
+    // The other tab hydrated before that save and never heard about it, then
+    // saved its own copy. It runs the same adapter code this tab does.
+    const otherTab = applyResult(EMPTY_PROGRESSION, {
+      slug: "data-detox",
+      score: 0.7,
+      lane: "visual",
+      completed: true,
+    }).state;
+    await createLocalAdapter().save(otherTab);
+
+    // Storage kept both, so a reload (or a third tab) loses neither.
+    expect(Object.keys(stored()!.games).sort()).toEqual(["data-detox", "sort-it-arcade"]);
+    expect(stored()!.xp).toBe(170);
+    await useProgression.getState().hydrate();
+    expect(useProgression.getState().xp).toBe(170);
+
+    // And a deliberate reset is still a reset, not merged away.
+    await useProgression.getState().clear();
+    expect(stored()).toEqual(EMPTY_PROGRESSION);
+  });
+
+  it("adopts a reset from another tab rather than merging it away", () => {
+    useProgression
+      .getState()
+      .recordResult({ slug: "sort-it-arcade", score: 1, lane: "visual", completed: true });
+
+    otherTabSaves(EMPTY_PROGRESSION);
+
+    expect(useProgression.getState().xp).toBe(0);
+    expect(useProgression.getState().games).toEqual({});
+  });
+
+  it("ignores other keys", () => {
+    useProgression
+      .getState()
+      .recordResult({ slug: "sort-it-arcade", score: 1, lane: "visual", completed: true });
+    window.dispatchEvent(
+      new StorageEvent("storage", { key: "something-else", newValue: "{}" }),
+    );
+    expect(useProgression.getState().xp).toBe(100);
   });
 });

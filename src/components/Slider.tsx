@@ -94,7 +94,15 @@ export function Slider({
         <label htmlFor={id} className="text-sm font-medium">
           {label}
         </label>
-        <output htmlFor={id} className="font-mono text-sm tabular-nums">
+        {/* `<output>` is an implicit role="status" live region, so leaving it
+            exposed made every change speak twice: once from the input's
+            aria-valuetext, once from here — and code-lane changes were read out
+            of context. The input's valuetext is the one channel. */}
+        <output
+          htmlFor={id}
+          aria-hidden="true"
+          className="font-mono text-sm tabular-nums"
+        >
           {display}
         </output>
       </div>

@@ -1,5 +1,13 @@
-import { describe, expect, it } from "vitest";
-import { clamp, cx, formatPercent, seededRandom } from "./utils";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  clamp,
+  cx,
+  formatPercent,
+  isWebGLAvailable,
+  resetWebGLProbeForTests,
+  seededRandom,
+  yieldToPaint,
+} from "./utils";
 
 describe("cx", () => {
   it("drops falsy parts", () => {
@@ -42,5 +50,86 @@ describe("seededRandom", () => {
 
   it("differs across seeds", () => {
     expect(seededRandom(1)()).not.toBe(seededRandom(2)());
+  });
+});
+
+describe("yieldToPaint", () => {
+  it("does not resolve synchronously or in the same microtask burst", async () => {
+    // The whole point: "Running…" set before this must get a paint before the
+    // heavy job after it starts. A helper that resolved on a microtask would
+    // run the job before the browser ever rendered.
+    let resolved = false;
+    const pending = yieldToPaint().then(() => {
+      resolved = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    await pending;
+    expect(resolved).toBe(true);
+  });
+
+  it("still resolves when requestAnimationFrame never fires (hidden tab)", async () => {
+    vi.useFakeTimers();
+    const raf = vi
+      .spyOn(globalThis, "requestAnimationFrame")
+      .mockImplementation(() => 0);
+    try {
+      let resolved = false;
+      const pending = yieldToPaint(50).then(() => {
+        resolved = true;
+      });
+      await vi.advanceTimersByTimeAsync(49);
+      expect(resolved).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await pending;
+      expect(resolved).toBe(true);
+    } finally {
+      raf.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("isWebGLAvailable", () => {
+  afterEach(() => {
+    resetWebGLProbeForTests();
+    vi.restoreAllMocks();
+  });
+
+  it("releases the probe's GL context instead of leaving it for GC", () => {
+    // Browsers cap live contexts and force-lose the oldest one. A probe that
+    // keeps its context alive can evict TF.js's WebGL backend mid-lesson.
+    const loseContext = vi.fn();
+    const fakeGl = {
+      getExtension: (name: string) =>
+        name === "WEBGL_lose_context" ? { loseContext } : null,
+    };
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(
+      ((kind: string) =>
+        kind === "webgl2" ? fakeGl : null) as unknown as HTMLCanvasElement["getContext"],
+    );
+
+    expect(isWebGLAvailable()).toBe(true);
+    expect(loseContext).toHaveBeenCalledOnce();
+  });
+
+  it("probes once per page, then answers from the cache", () => {
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockImplementation((() => null) as unknown as HTMLCanvasElement["getContext"]);
+
+    expect(isWebGLAvailable()).toBe(false);
+    const probesAfterFirst = getContext.mock.calls.length;
+    expect(isWebGLAvailable()).toBe(false);
+    expect(isWebGLAvailable()).toBe(false);
+    expect(getContext.mock.calls.length).toBe(probesAfterFirst);
+  });
+
+  it("treats a throwing getContext as no WebGL", () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(() => {
+      throw new Error("blocked");
+    });
+    expect(isWebGLAvailable()).toBe(false);
   });
 });
