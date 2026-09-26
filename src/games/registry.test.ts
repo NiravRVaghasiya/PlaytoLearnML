@@ -1,4 +1,10 @@
+import { existsSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import {
+  playableSlugsFromSource,
+  siteRoutes,
+} from "../../scripts/harness.mjs";
 import { GAME_CATALOG, getGameMeta } from "@/lib/catalog";
 import { MOUNTED_SLUGS } from "./GameMount";
 import { isPlayable, playableSlugs } from "./registry";
@@ -65,5 +71,46 @@ describe("game registry", () => {
     for (const game of unbuilt) {
       expect(MOUNTED_SLUGS).not.toContain(game.slug);
     }
+  });
+});
+
+describe("a game module on disk is a game on the site", () => {
+  // Everything above compares the registry, the catalog and the mount map with
+  // EACH OTHER, so a game built under src/games/<slug>/ and never registered in
+  // any of them passed the whole suite while being unreachable. These start
+  // from the directory instead.
+  const GAMES_DIR = join(process.cwd(), "src", "games");
+  const gameDirs = readdirSync(GAMES_DIR, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .filter((name) => existsSync(join(GAMES_DIR, name, "index.tsx")))
+    .sort();
+
+  it("registers every src/games/<slug>/index.tsx", () => {
+    expect(gameDirs.length, "no game modules found to check").toBeGreaterThan(0);
+    expect(gameDirs).toEqual([...playableSlugs()].sort());
+  });
+
+  it("gives every playable game a browser playthrough", () => {
+    // scripts/verify-playthrough.mjs is what proves a game is wired to the
+    // screen; a game without one is never driven in a real browser.
+    for (const slug of playableSlugs()) {
+      expect(
+        existsSync(join(process.cwd(), "scripts", "playthroughs", `${slug}.mjs`)),
+        `scripts/playthroughs/${slug}.mjs is missing`,
+      ).toBe(true);
+    }
+  });
+
+  it("puts every playable game in the browser harnesses' route list", () => {
+    // The a11y audit and the mobile harness read the registry's source with a
+    // regex (they run under plain node). The parse has to equal the registry.
+    expect(playableSlugsFromSource()).toEqual(playableSlugs());
+    const routes = siteRoutes().map((route) => route.path);
+    for (const slug of playableSlugs()) {
+      expect(routes).toContain(`/play/${slug}`);
+    }
+    // ...and the harnesses always include a route that must 404.
+    expect(siteRoutes().some((route) => route.kind === "not-found")).toBe(true);
   });
 });

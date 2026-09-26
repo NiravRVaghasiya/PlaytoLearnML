@@ -1,5 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { Space_Grotesk, Inter, JetBrains_Mono } from "next/font/google";
+import { SITE_DESCRIPTION, SITE_NAME, SITE_TITLE, siteUrl } from "@/lib/site";
+import { SkipLink } from "./_components/SkipLink";
 import "./globals.css";
 
 /* DESIGN.md §3 Typography.
@@ -23,13 +25,29 @@ const jetbrainsMono = JetBrains_Mono({
   display: "swap",
 });
 
+/**
+ * Site-wide defaults. Pages add their own canonical URL, Open Graph and Twitter
+ * card through `pageSocialMetadata()` — deliberately NOT here: Next merges
+ * metadata shallowly, so an `alternates.canonical` set in the layout would be
+ * inherited by every page that forgot its own, and they would all claim to be
+ * the home page.
+ *
+ * The icons come from the file conventions next to this layout (`icon.svg`,
+ * `favicon.ico`), so there is no `icons` key.
+ */
 export const metadata: Metadata = {
+  metadataBase: siteUrl(),
   title: {
-    default: "GameML — learn Machine Learning by playing",
-    template: "%s · GameML",
+    default: SITE_TITLE,
+    template: `%s · ${SITE_NAME}`,
   },
-  description:
-    "Fourteen games that teach real Machine Learning. Every model trains in your browser — no server, no GPU, no signup to start.",
+  description: SITE_DESCRIPTION,
+  applicationName: SITE_NAME,
+  openGraph: {
+    siteName: SITE_NAME,
+    type: "website",
+    locale: "en_US",
+  },
 };
 
 export const viewport: Viewport = {
@@ -46,23 +64,10 @@ export default function RootLayout({
       <body
         className={`${spaceGrotesk.variable} ${inter.variable} ${jetbrainsMono.variable} font-body antialiased`}
       >
-        {/* DESIGN.md §9 — keyboard users get a way past the chrome.
-            Two details that are easy to get wrong:
-
-            1. Uses Tailwind's `sr-only` / `focus:not-sr-only` pair, which are
-               built to undo each other. The project's own `.sr-only-live` helper
-               is NOT interchangeable: `not-sr-only` doesn't reset its
-               `clip-path`, so the link would stay clipped while focused.
-            2. Targets `#main-content`, which every route renders on the SERVER.
-               Pointing it at the game canvas looked right but was broken — games
-               load via `dynamic(ssr: false)`, so that element doesn't exist when
-               the page loads, and the link went nowhere. */}
-        <a
-          href="#main-content"
-          className="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:rounded-md focus:bg-primary focus:px-4 focus:py-2 focus:text-primary-ink"
-        >
-          Skip to content
-        </a>
+        {/* Targets #main-content, which every route — the 404 and error pages
+            included — renders on the server. See SkipLink for why game pages
+            then hand focus on to the canvas. */}
+        <SkipLink />
         {children}
       </body>
     </html>

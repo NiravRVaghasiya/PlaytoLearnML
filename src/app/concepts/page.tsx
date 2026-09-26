@@ -3,11 +3,19 @@ import Link from "next/link";
 import { ArrowLeft } from "lucide-react";
 import { CONCEPT_LIBRARY } from "@/lib/concepts";
 import { getGameMeta } from "@/lib/catalog";
+import { pageSocialMetadata } from "@/lib/site";
+
+const DESCRIPTION =
+  "Short, plain-language explainers for the ML ideas behind the games — decision boundaries, overfitting, gradient descent, clustering and more.";
 
 export const metadata: Metadata = {
   title: "Concept Library",
-  description:
-    "Short, plain-language explainers for the ML ideas behind the games — decision boundaries, overfitting, gradient descent, clustering and more.",
+  description: DESCRIPTION,
+  ...pageSocialMetadata({
+    title: "Concept Library",
+    description: DESCRIPTION,
+    path: "/concepts",
+  }),
 };
 
 export default function ConceptLibraryPage() {
@@ -19,7 +27,7 @@ export default function ConceptLibraryPage() {
     >
       <Link
         href="/"
-        className="inline-flex items-center gap-2 text-sm text-text-muted underline decoration-dotted underline-offset-4 hover:text-text"
+        className="inline-flex min-h-6 items-center gap-2 text-sm text-text-muted underline decoration-dotted underline-offset-4 hover:text-text"
       >
         <ArrowLeft aria-hidden="true" className="size-4" />
         GameML

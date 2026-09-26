@@ -4,6 +4,7 @@ import { notFound } from "next/navigation";
 import { ArrowLeft, Gamepad2 } from "lucide-react";
 import { CONCEPT_LIBRARY, conceptSlugs, getConcept } from "@/lib/concepts";
 import { getGameMeta } from "@/lib/catalog";
+import { pageSocialMetadata } from "@/lib/site";
 
 interface PageProps {
   params: Promise<{ slug: string }>;
@@ -18,11 +19,18 @@ export function generateStaticParams() {
   return conceptSlugs().map((slug) => ({ slug }));
 }
 
+/**
+ * The whole library is known at build time, so an unknown slug is a static 404
+ * rather than an on-demand render written to the ISR cache.
+ */
+export const dynamicParams = false;
+
 export async function generateMetadata({
   params,
 }: PageProps): Promise<Metadata> {
   const { slug } = await params;
   const concept = getConcept(slug);
+  // Defensive only: dynamicParams = false keeps unknown slugs out.
   if (!concept) return { title: "Concept not found" };
 
   return {
@@ -30,11 +38,12 @@ export async function generateMetadata({
     // because the searched-for phrase is "what is overfitting", not "overfitting".
     title: concept.question,
     description: concept.summary,
-    openGraph: {
-      title: `${concept.question} · GameML`,
+    ...pageSocialMetadata({
+      title: concept.question,
       description: concept.summary,
+      path: `/concepts/${slug}`,
       type: "article",
-    },
+    }),
   };
 }
 
@@ -59,7 +68,7 @@ export default async function ConceptPage({ params }: PageProps) {
     >
       <Link
         href="/concepts"
-        className="inline-flex items-center gap-2 text-sm text-text-muted underline decoration-dotted underline-offset-4 hover:text-text"
+        className="inline-flex min-h-6 items-center gap-2 text-sm text-text-muted underline decoration-dotted underline-offset-4 hover:text-text"
       >
         <ArrowLeft aria-hidden="true" className="size-4" />
         Concept Library
@@ -165,7 +174,7 @@ export default async function ConceptPage({ params }: PageProps) {
               <li key={other.slug}>
                 <Link
                   href={`/concepts/${other.slug}`}
-                  className="text-primary underline decoration-dotted underline-offset-4"
+                  className="inline-flex min-h-6 items-center text-primary underline decoration-dotted underline-offset-4"
                 >
                   {other.question}
                 </Link>

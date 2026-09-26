@@ -43,6 +43,38 @@ export interface GameMeta {
 
 export const PHASES: readonly Phase[] = [1, 2, 3, 4] as const;
 
+/**
+ * Categories in the spec's own order (§2, "ordered beginner → advanced"). The
+ * home roster groups by these, as spec §6 asks ("games grouped by category"),
+ * rather than by build phase: a phase is a roadmap milestone, and it tells a
+ * learner nothing about what to open.
+ */
+export const CATEGORIES: readonly Category[] = [
+  "Data & Preprocessing",
+  "Supervised Learning",
+  "Neural Networks",
+  "Optimization & Tuning",
+  "Unsupervised Learning",
+  "Reinforcement Learning",
+] as const;
+
+export const DIFFICULTIES: readonly Difficulty[] = [
+  "Beginner",
+  "Intermediate",
+  "Advanced",
+] as const;
+
+/**
+ * Where the home page's "Start here" sends a first-time visitor.
+ *
+ * Sort-It Arcade, because it is the entry point on every axis the catalog
+ * records: Beginner and Easy, no prerequisites, first in the Phase-1 build
+ * order (spec §7, "simplest, proves the loop"), and the game most of the unlock
+ * graph hangs off. `catalog.test.ts` holds it to all four, so a catalog edit
+ * that makes it a bad first game fails the suite.
+ */
+export const START_SLUG = "sort-it-arcade";
+
 export const GAME_CATALOG: readonly GameMeta[] = [
   // --- Phase 1 (MVP) -------------------------------------------------------
   {
@@ -259,4 +291,28 @@ export const PHASE_1_BUILD_ORDER = [
 
 export function getGameMeta(slug: string): GameMeta | undefined {
   return GAME_CATALOG.find((g) => g.slug === slug);
+}
+
+export interface RosterGroup {
+  category: Category;
+  games: GameMeta[];
+}
+
+/**
+ * The home roster: every game, grouped by category in spec order, easiest first
+ * within a group. Ties keep catalog (build-phase) order — `Array.prototype.sort`
+ * is stable — so e.g. the two Advanced neural-network games stay in the order
+ * they unlock. Empty categories are dropped rather than rendered as headings
+ * over nothing.
+ */
+export function rosterByCategory(
+  catalog: readonly GameMeta[] = GAME_CATALOG,
+): RosterGroup[] {
+  const rank = (game: GameMeta) => DIFFICULTIES.indexOf(game.difficulty);
+  return CATEGORIES.map((category) => ({
+    category,
+    games: catalog
+      .filter((game) => game.category === category)
+      .sort((a, b) => rank(a) - rank(b)),
+  })).filter((group) => group.games.length > 0);
 }

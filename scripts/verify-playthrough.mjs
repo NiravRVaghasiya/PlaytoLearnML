@@ -10,6 +10,15 @@
  * Each game supplies a module in `scripts/playthroughs/<slug>.mjs` exporting
  * `slug`, `title`, and `run({ page, check, metricText })`.
  *
+ * On top of each game's own checks, every game's ƒ Math dialog is opened and
+ * checked (`checkMathDialog`: KaTeX rendered, focus trapped, Escape returns
+ * focus), and every playthrough fails on a console
+ * error, an uncaught page error, or a warning that means a real bug (a KaTeX
+ * equation LaTeX would render differently, a React hydration/key warning).
+ * Headless-GPU chatter and TF.js's WebGL-to-CPU fallback are ignored. The
+ * rules are `classifyConsoleMessage` in harness.mjs, shared with
+ * verify-mobile.mjs.
+ *
  * Usage:
  *   node scripts/verify-playthrough.mjs               # every game
  *   node scripts/verify-playthrough.mjs sort-it-arcade
@@ -19,6 +28,7 @@ import { chromium } from "playwright";
 import { readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { checkMathDialog, classifyConsoleMessage } from "./harness.mjs";
 
 const BASE = process.env.AUDIT_BASE ?? "http://localhost:3000";
 const here = dirname(fileURLToPath(import.meta.url));
@@ -59,10 +69,22 @@ let totalChecks = 0;
 for (const playthrough of playthroughs) {
   const results = [];
   const consoleErrors = [];
+  const consoleWarnings = [];
 
   const page = await browser.newPage();
+  // Errors always fail. Warnings fail only when they are the kind that means a
+  // real bug — a KaTeX equation rendering differently from LaTeX, a React
+  // hydration or key warning — and headless-GPU / TF.js-fallback chatter is
+  // ignored. The split lives in harness.mjs so verify-mobile agrees with it.
   page.on("console", (message) => {
-    if (message.type() === "error") consoleErrors.push(message.text());
+    const verdict = classifyConsoleMessage({
+      type: message.type(),
+      text: message.text(),
+      resourceUrl: message.location()?.url,
+    });
+    const line = `${message.type()}: ${message.text().slice(0, 240)}`;
+    if (verdict === "fail") consoleErrors.push(line);
+    else if (verdict === "warn") consoleWarnings.push(line);
   });
   page.on("pageerror", (error) =>
     consoleErrors.push(`pageerror: ${error.message}`),
@@ -98,6 +120,10 @@ for (const playthrough of playthroughs) {
 
     await playthrough.run({ page, check, metricText });
 
+    // After the game's own checks, so it can't disturb their starting state,
+    // and before the console check, so a KaTeX warning is counted.
+    await checkMathDialog(page, check);
+
     console.log("\nAnnouncement hygiene");
     const closingSpeech = await liveRegionText(page);
     const spoken = `${openingSpeech} | ${closingSpeech}`;
@@ -115,10 +141,17 @@ for (const playthrough of playthroughs) {
 
     console.log("\nConsole hygiene");
     check(
-      "no console errors during the playthrough",
+      "no console errors or bug-shaped warnings during the playthrough",
       consoleErrors.length === 0,
       consoleErrors.slice(0, 3).join(" | "),
     );
+    if (consoleWarnings.length > 0) {
+      // Printed, not failed: an unclassified warning is worth a look but is not
+      // proof of a bug. Promote its pattern in harness.mjs if it turns out to be.
+      console.log(
+        `  WARN  ${consoleWarnings.length} other console warning(s): ${consoleWarnings.slice(0, 3).join(" | ")}`,
+      );
+    }
   } catch (error) {
     check(`playthrough completed without throwing`, false, error.message);
   } finally {

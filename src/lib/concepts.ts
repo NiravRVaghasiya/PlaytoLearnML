@@ -80,7 +80,7 @@ export const CONCEPT_LIBRARY: readonly ConceptMeta[] = [
         body: [
           "Capacity is how much a model is allowed to bend its boundary. A straight line has very little; a high-degree curve has a lot. Bias is the error you are stuck with because your capacity is too low to express the real pattern — a straight line cannot separate a ring from its centre no matter how well you fit it.",
           "The tempting conclusion is to always take more capacity, since it can only reduce bias. It does. It also lets the boundary chase individual points, and points include mistakes. Every extra bend is a bend that can be spent on signal or wasted on noise, and the model cannot tell which it is doing.",
-          "So capacity is a budget rather than a free upgrade. The right amount is the least that can express the shape you actually believe is there. In Sort-It Arcade the deliberate labelling noise makes this concrete: the wiggliest boundary always scores best on the points you can see, and worst on the ones you cannot.",
+          "So capacity is a budget rather than a free upgrade. The right amount is the least that can express the shape you actually believe is there. In Sort-It Arcade the deliberate labelling noise makes this concrete: on every round, the wiggliest boundary scores best on the points you can see, and worse than the five-parameter curve on the ones you cannot.",
         ],
       },
       {
@@ -120,7 +120,7 @@ export const CONCEPT_LIBRARY: readonly ConceptMeta[] = [
         heading: "What is overfitting?",
         body: [
           "Any real dataset is signal plus noise: a genuine pattern, plus measurement error, mislabelled rows and the accidents of which examples happened to be collected. A model with enough freedom will fit both, because nothing in the training objective distinguishes them. Fitting the noise is what we call overfitting.",
-          "It is diagnosed by comparison, never from one number. Hold some data back, fit on the rest, then score both. Sort-It Arcade's overfit verdict reads 94% on the 200 points you fitted and 82% on 400 points it never saw — the 94% on its own looks like success, and it is the 12-point gap that tells the truth.",
+          "It is diagnosed by comparison, never from one number. Hold some data back, fit on the rest, then score both. On Sort-It Arcade's first round, switch to the 25-parameter Wiggle and press Fit it for me, and the overfit verdict reads 96% on the 200 points you fitted and 77% on 400 points it never saw — the 96% on its own looks like success, and it is the 19-point gap that tells the truth.",
           "The opposite failure exists and is often mistaken for this one. Underfitting also produces mediocre validation accuracy, but with no gap: the model is bad on data it has seen too. The distinction matters because the fixes are opposites. A gap means take capacity away; no gap and low accuracy means add some.",
         ],
       },
@@ -128,8 +128,11 @@ export const CONCEPT_LIBRARY: readonly ConceptMeta[] = [
         heading: "Why complexity is a cost",
         body: [
           "Extra parameters are usually described as capability, which makes them sound free. They are not. Each one is another degree of freedom the fitting process can spend on a coincidence in your particular sample, and the fitting process has no way to know that is what it is doing — a coincidence reduces training error exactly as convincingly as real structure does.",
-          "So complexity is priced in generalisation. You pay for it whether or not you needed it, which is why the question is never \"can this model represent the pattern\" but \"is this the least model that can\". Decision Tree Architect makes the price visible: growing past the peak takes training accuracy to 100% while validation falls to 88%, and the tree that scored best was two levels shallower.",
-          "Regularization is how you make the cost explicit inside the objective. L2 penalises large weights, L1 pushes them to exactly zero, dropout removes units at random during training. All three say the same thing to the optimiser: fit the data, but only spend flexibility that pays for itself.",
+          "So complexity is priced in generalisation. You pay for it whether or not you needed it, which is why the question is never \"can this model represent the pattern\" but \"is this the least model that can\". Decision Tree Architect makes the price visible: on its first plot, growing the tree from depth 3 to depth 6 takes training accuracy from 95% to 100% while validation falls from 93% to 88%. The deeper tree is better at the only thing it was optimised for, and worse at the thing that matters.",
+          // Not "L1 pushes them to exactly zero": that needs a solver built to
+          // land on zero, and the Adam-trained model in Overfit Tower Defense
+          // (which links here) leaves its quieted weights near zero, not at it.
+          "Regularization is how you make the cost explicit inside the objective. L2 penalises large weights, L1 pushes the unhelpful ones close to zero (exactly zero only with a solver built to land there), and dropout removes units at random during training. All three say the same thing to the optimiser: fit the data, but only spend flexibility that pays for itself.",
         ],
       },
       {
@@ -192,7 +195,13 @@ export const CONCEPT_LIBRARY: readonly ConceptMeta[] = [
         ],
       },
     ],
-    games: ["k-means-territory-wars", "dimension-diver"],
+    // Only the game that actually runs k-means. Dimension Diver used to be
+    // listed too, apparently copied from its catalog unlock edge
+    // (`requires: ["k-means-territory-wars"]`), but it is a PCA game with no
+    // clustering in it, so "Play it instead of reading about it" sent readers
+    // to a different algorithm. An unlock edge says what to play NEXT; this
+    // list says what teaches THIS.
+    games: ["k-means-territory-wars"],
     failureModes: [
       {
         name: "Bad k",
@@ -221,7 +230,7 @@ export const CONCEPT_LIBRARY: readonly ConceptMeta[] = [
         heading: "Why inertia can't choose k",
         body: [
           "Inertia is the total squared distance from each point to its assigned centre, and adding a centre can only reduce it. In the limit where k equals the number of points, every point is its own centre and inertia is exactly zero — a perfect score for a clustering that has learned nothing.",
-          "So inertia is a fine objective for a fixed k and useless for comparing across k. K-Means Territory Wars demonstrates this rather than asserting it: three flags reach an inertia of 1.01 on data with three real groups, and eight flags reach 0.50. The eight-flag answer is numerically twice as good and is still judged a bad k.",
+          "So inertia is a fine objective for a fixed k and useless for comparing across k. K-Means Territory Wars demonstrates this rather than asserting it. On its first map, which has three real groups, the elbow table lists the best inertia each number of flags can reach: 1.01 for three flags and 0.44 for eight. The eight-flag answer is numerically more than twice as good, and settling eight flags there still earns the Bad k verdict.",
           "This is a general shape, not a quirk of clustering. Any score that improves monotonically with model size cannot be used to select model size. Training accuracy has the same problem in supervised learning, which is why held-out data exists.",
         ],
       },
@@ -380,11 +389,18 @@ export const CONCEPT_LIBRARY: readonly ConceptMeta[] = [
         body: [
           "Momentum keeps a running average of past gradients and steps along that instead of along the current gradient alone. Formally, a velocity vector accumulating each new gradient with a decay factor, typically around 0.9. Physically, it is the difference between a walker who re-decides at every step and a ball that has been rolling for a while.",
           "This buys two things. Gradients that keep pointing the same way compound, so long shallow slopes get crossed quickly. Gradients that flip back and forth — the ping-ponging you get across a narrow valley — cancel in the average, so oscillation damps. Both are more valuable than escaping traps, and both are why momentum is a default rather than a trick.",
-          "Escaping traps is the visible bonus. With the identical learning rate that got stuck at 0.33, momentum carries the skier through the shallow valley and settles at -0.364, at x -1.084 — the global minimum. Nothing changed but the accumulated history. Adam adds per-parameter step scaling on top of the same idea, which is why it is usually the first optimiser people reach for.",
+          "Escaping traps is the visible bonus. Keep the identical learning rate that got stuck at 0.33 and set momentum to 0.9, and the skier is carried through the shallow valley and settles at a loss of -0.36, at x -1.08 — the global minimum. Nothing changed but the accumulated history. Adam adds per-parameter step scaling on top of the same idea, which is why it is usually the first optimiser people reach for.",
         ],
       },
     ],
-    games: ["gradient-descent-skier", "backprop-blitz", "neuron-forge"],
+    // Convolution Kitchen last: its "Let it learn" button hands the kernels the
+    // player designed by hand to gradient descent, and its WhyCard links here.
+    games: [
+      "gradient-descent-skier",
+      "backprop-blitz",
+      "neuron-forge",
+      "convolution-kitchen",
+    ],
     failureModes: [
       {
         name: "Local minimum",
@@ -395,6 +411,12 @@ export const CONCEPT_LIBRARY: readonly ConceptMeta[] = [
         name: "Divergence",
         gloss:
           "Steps too large for the curvature, so each one overshoots and the loss grows until it stops being a number.",
+      },
+      {
+        // Neuron Forge names this one, from a measured all-zero relu layer.
+        name: "Dying ReLU",
+        gloss:
+          "Every relu unit in a layer outputs zero for every input. A relu at zero passes back zero gradient, so no signal flows back through that layer and nothing can revive it: the optimiser failed, not the model's capacity.",
       },
     ],
     related: ["learning-rate", "overfitting"],
@@ -414,14 +436,14 @@ export const CONCEPT_LIBRARY: readonly ConceptMeta[] = [
         body: [
           "Every other hyperparameter changes how well a training run ends up doing. The learning rate decides whether the run means anything at all. Get it wrong upward and the loss is infinite after a few steps; wrong downward and you are watching a curve that will eventually work, given more time than you have. Neither failure is subtle, and both are frequently misread as a problem with the architecture.",
           "It also interacts with almost everything else. Batch size changes the gradient's noise and so the rate you can tolerate. Normalisation layers change the scale of the gradients reaching each weight. Momentum effectively multiplies your step length by roughly 1/(1-β), so switching momentum on without lowering the rate can turn a stable run unstable. Tune the learning rate first, then the rest, then the learning rate again.",
-          "Because it spans orders of magnitude, search it on a log scale. Hyperparameter Heist is built around this: a grid that spends its whole budget covering only three distinct learning-rate values never cracks the safe, and random search on the same budget covers around twelve and usually does. Resolution on the dial that matters beats coverage of the dials that do not.",
+          "Because it spans orders of magnitude, search it on a log scale. Hyperparameter Heist is built around this: a grid that spends its whole sixteen-try budget sees only two distinct learning rates and never cracks the safe, while random search on the same budget sees around twelve and usually does. Resolution on the dial that matters beats coverage of the dials that do not.",
         ],
       },
       {
         heading: "Why too-large rates explode",
         body: [
           "The gradient is a good description of the surface only very near where you measured it. A step takes you somewhere the gradient was not measured, and if the surface curves, the slope there is different. On the outside of a bowl the slope steepens as you move away from the bottom, so an overshooting step lands somewhere steeper, producing a larger gradient, a larger next step, and a positive feedback loop.",
-          "There is a threshold, not a gradual decline. For a quadratic bowl of curvature L, steps below 2/L converge and steps above 2/L diverge, with no smooth region between. That is why the skier's divergence verdict fires after a single step: the very first move has already left the region the gradient described.",
+          "There is a threshold, not a gradual decline. For a quadratic bowl of curvature L, steps below 2/L converge and steps above 2/L diverge, with no smooth region between. Gradient Descent Skier's deep valley puts that line at a plain-descent rate of about 0.40, and shows where a real surface parts company with the bowl: just past the line the skier does not explode, it bounces from wall to wall and never comes to rest, which the game names Oscillation, because its surface is two valleys rather than one bowl. The loss runs away from a rate of about 0.68, within three steps, and from 0.85 on the very first one, when that first move has already left the region the gradient described.",
           "The classic symptoms are worth memorising. Loss rising monotonically from step one, loss reaching NaN or infinity, or weights growing without bound all mean the rate is too high — nothing else produces that shape. Loss falling then bouncing around a floor usually means the rate was fine to start with and is now too high for where you are, which is exactly what a decay schedule fixes.",
         ],
       },
@@ -439,7 +461,12 @@ export const CONCEPT_LIBRARY: readonly ConceptMeta[] = [
       {
         name: "Divergence",
         gloss:
-          "Rate above the stability threshold. The loss climbs from the first step and never recovers.",
+          "Rate far enough past the stability threshold that every step overshoots further than the last. The loss climbs from the first step and never recovers.",
+      },
+      {
+        name: "Oscillation",
+        gloss:
+          "Steps, or momentum, too large to come to rest: each one carries past the valley floor and back, so the loss bounces instead of settling.",
       },
       {
         name: "Grid trap",
