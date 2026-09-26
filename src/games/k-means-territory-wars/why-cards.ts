@@ -1,5 +1,11 @@
 import type { WhyCardContent } from "@/components";
-import { MAX_K, WIN_SCORE, type Evaluation } from "./ml";
+import {
+  AT_BEST_QUALITY,
+  CONVERGENCE_EPSILON,
+  MAX_K,
+  WIN_SCORE,
+  type Evaluation,
+} from "./ml";
 
 /**
  * "Why did that happen?" copy for K-Means Territory Wars.
@@ -18,7 +24,17 @@ export type KMeansEvent =
   | { kind: "flag-moved"; flag: number; inertia: number }
   | { kind: "k-changed"; k: number; elbowK: number; added: boolean }
   | { kind: "assigned"; inertia: number; sizes: number[] }
-  | { kind: "updated"; inertia: number; shift: number; converged: boolean }
+  | {
+      kind: "updated";
+      inertia: number;
+      shift: number;
+      converged: boolean;
+      /**
+       * The update ran on out-of-date memberships (flags had moved since the
+       * last assign), so "nothing moved" says nothing about convergence.
+       */
+      stale?: boolean;
+    }
   | {
       kind: "stepped";
       inertia: number;
@@ -93,6 +109,20 @@ export function whyCardFor(event: KMeansEvent): WhyCardContent {
     }
 
     case "updated":
+      if (event.stale && event.shift < CONVERGENCE_EPSILON) {
+        // The trap this branch exists for: Update, Update. The second one
+        // recomputes the mean of the same stale memberships, so of course
+        // nothing moves — but villages would still switch flags on the next
+        // assign. Calling that "converged" would teach the wrong fixed point.
+        return {
+          key: `updated-stale-${event.inertia.toFixed(4)}`,
+          title: "Nothing moved — but that isn't convergence",
+          body: `Each flag is already at the mean of the villages that joined it LAST time. Since then the flags have moved, so some villages may now be closer to a different flag. Press Assign: convergence is when a full assign-then-update changes nothing.`,
+          tone: "warn",
+          conceptHref: CLUSTERING_HREF,
+          conceptLabel: "How k-means works",
+        };
+      }
       return {
         key: `updated-${event.inertia.toFixed(4)}-${event.shift.toFixed(4)}`,
         title: event.converged
@@ -135,6 +165,8 @@ export function whyCardFor(event: KMeansEvent): WhyCardContent {
         emptyClusters,
         score,
         convergenceQuality,
+        assignmentStale,
+        bestInertiaAtElbowK,
       } = event.evaluation;
 
       const key = `checked-${outcome}-${score.toFixed(4)}`;
@@ -156,7 +188,13 @@ export function whyCardFor(event: KMeansEvent): WhyCardContent {
             body:
               k > elbowK
                 ? `${k} flags got inertia down to ${num(inertia)} — lower than the right answer would. That's the trap: inertia always falls as you add flags, so it can't tell you when to stop. The elbow chart flattens after ${elbowK}, which is where the real groups run out.`
-                : `${k} flags can't cover ${elbowK} separate groups. You converged, and ${num(inertia)} really is the best ${k} flags can manage — the limit is the number of flags, not where you put them. One of them is sitting between two clusters, serving both badly.`,
+                : convergenceQuality >= AT_BEST_QUALITY
+                  ? `${k} flags can't cover ${elbowK} separate groups. You converged, and ${num(inertia)} really is about the best ${k} flags can manage — the limit is the number of flags, not where you put them. One of them is sitting between two clusters, serving both badly.`
+                  : `${k} flags can't cover ${elbowK} separate groups. You converged at ${num(inertia)}; even the best ${k}-flag layout only reaches ${num(bestInertiaAtK)}${
+                      bestInertiaAtElbowK !== null
+                        ? `, against ${num(bestInertiaAtElbowK)} for ${elbowK} flags`
+                        : ""
+                    }. Moving these flags won't fix that — the limit is the number of them. One is sitting between two clusters, serving both badly.`,
             tone: "bad",
             conceptHref: ELBOW_HREF,
             conceptLabel: "Reading an elbow chart",
@@ -173,6 +211,14 @@ export function whyCardFor(event: KMeansEvent): WhyCardContent {
           };
 
         case "not-converged":
+          if (assignmentStale) {
+            return {
+              key: `${key}-stale`,
+              title: "Colours are out of date",
+              body: `Flags have moved since the villages last chose one, so the territories on the map belong to a layout that no longer exists — a flag you just placed owns nothing yet. Press Assign first, then keep going until nothing moves.`,
+              tone: "warn",
+            };
+          }
           return {
             key,
             title: "Not settled yet",

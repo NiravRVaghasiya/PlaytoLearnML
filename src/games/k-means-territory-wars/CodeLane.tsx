@@ -4,7 +4,7 @@ import { useMemo } from "react";
 import { Play, RotateCcw } from "lucide-react";
 import { Button, CodeEditor } from "@/components";
 import { useCodeLane } from "@/engine/useCodeLane";
-import { useKMeansStore } from "./store";
+import { MAX_K, MIN_K, useKMeansStore } from "./store";
 
 /**
  * K-Means Territory Wars — the code lane.
@@ -19,9 +19,34 @@ import { useKMeansStore } from "./store";
  * `settle()` helper, because seeing the `while` and the convergence test is the
  * lesson. `checkBudget()` is in there for real: it's what stops a mistyped loop
  * condition from hanging the tab.
+ *
+ * Every verb checks its arguments and throws a named error the output panel can
+ * show. `api.setFlag(0, 0.5)` used to store a flag at y = NaN, which quietly
+ * dropped out of every nearest-flag test and left the metric reading "—".
  */
 
-const STARTER_CODE = `// k-means, written out longhand. Every call drives the same
+function shown(value: unknown): string {
+  if (typeof value === "string") return `"${value}"`;
+  if (typeof value === "number") return String(value);
+  return value === undefined ? "nothing" : typeof value;
+}
+
+/** A coordinate on the 0–1 map, or a named error saying what was wrong. */
+function coordinate(verb: string, name: string, value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new TypeError(
+      `${verb}: ${name} must be a number from 0 to 1, got ${shown(value)}.`,
+    );
+  }
+  if (value < 0 || value > 1) {
+    throw new RangeError(
+      `${verb}: ${name} must be from 0 to 1 (the edges of the map), got ${value}.`,
+    );
+  }
+  return value;
+}
+
+export const STARTER_CODE = `// k-means, written out longhand. Every call drives the same
 // board the visual lane does — flip the toggle and watch.
 
 api.setK(3);              // how many flags? try 3, then try 7
@@ -52,75 +77,101 @@ log('verdict ', result.outcome);
 // Now change setK(3) to setK(7). Inertia gets LOWER and the
 // verdict gets worse. Inertia alone cannot choose k.`;
 
+/**
+ * The code lane's verbs, bound to a store. A plain function rather than inline
+ * in the component so the argument checks can be unit-tested without React.
+ */
+export function createKMeansApi(store: typeof useKMeansStore = useKMeansStore) {
+  return {
+    /** ASSIGN step. Same action as the Assign button. */
+    assign: () => store.getState().assign(),
+    /** UPDATE step. Same action as the Update button. */
+    update: () => store.getState().update(),
+    /** Both halves once. */
+    step: () => store.getState().step(),
+    /** Iterate to convergence. */
+    settle: () => store.getState().settle(),
+
+    /** Add or remove flags until there are exactly `k`. */
+    setK: (k: number) => {
+      if (typeof k !== "number" || !Number.isInteger(k)) {
+        throw new TypeError(
+          `setK(k): k must be a whole number of flags, got ${shown(k)}.`,
+        );
+      }
+      if (k < MIN_K || k > MAX_K) {
+        throw new RangeError(
+          `setK(k): k must be from ${MIN_K} to ${MAX_K}, got ${k}.`,
+        );
+      }
+      // A counted loop, not `while (length !== k)`: if a store guard ever
+      // refused a step, a while-loop on the player's number would spin forever.
+      const difference = k - store.getState().centroids.length;
+      for (let step = 0; step < Math.abs(difference); step += 1) {
+        if (difference > 0) store.getState().addFlag();
+        else store.getState().removeFlag(store.getState().centroids.length - 1);
+      }
+    },
+
+    /** Spread the flags evenly over the map — a neutral starting layout. */
+    scatterFlags: () => {
+      const { centroids, moveFlag } = store.getState();
+      const count = centroids.length;
+      centroids.forEach((_, index) => {
+        const angle = (index / Math.max(1, count)) * Math.PI * 2;
+        moveFlag(
+          index,
+          0.5 + 0.28 * Math.cos(angle),
+          0.5 + 0.28 * Math.sin(angle),
+        );
+      });
+    },
+
+    /** Place one flag exactly. This is the initialization choice. */
+    setFlag: (index: number, x: number, y: number) => {
+      const count = store.getState().centroids.length;
+      if (!Number.isInteger(index) || index < 0 || index >= count) {
+        throw new RangeError(
+          `setFlag(index, x, y): index must be a whole number from 0 to ${
+            count - 1
+          } (there are ${count} flags), got ${shown(index)}.`,
+        );
+      }
+      store
+        .getState()
+        .moveFlag(
+          index,
+          coordinate("setFlag(index, x, y)", "x", x),
+          coordinate("setFlag(index, x, y)", "y", y),
+        );
+    },
+
+    /** Current flag positions. */
+    flags: () =>
+      store.getState().centroids.map(({ id, x, y }) => ({ id, x, y })),
+
+    /** Live inertia — the same number the metric shows. */
+    inertia: () => store.getState().inertia,
+    /** Villages per flag. */
+    territorySizes: () => [...store.getState().sizes],
+    k: () => store.getState().centroids.length,
+    converged: () => store.getState().converged,
+    /** Best achievable inertia at each k — the elbow data. */
+    elbow: () => store.getState().elbowPoints.map((p) => ({ ...p })),
+
+    /** Score the board and name any failure. Credited to the code lane. */
+    check: () => store.getState().check("code"),
+    /** Back to two flags. */
+    reset: () => store.getState().reset(),
+  };
+}
+
+export type KMeansApi = ReturnType<typeof createKMeansApi>;
+
 export function CodeLane() {
-  const store = useKMeansStore;
-
-  const api = useMemo(
-    () => ({
-      /** ASSIGN step. Same action as the Assign button. */
-      assign: () => store.getState().assign(),
-      /** UPDATE step. Same action as the Update button. */
-      update: () => store.getState().update(),
-      /** Both halves once. */
-      step: () => store.getState().step(),
-      /** Iterate to convergence. */
-      settle: () => store.getState().settle(),
-
-      /** Add or remove flags until there are exactly `k`. */
-      setK: (k: number) => {
-        if (!Number.isFinite(k)) throw new Error("setK needs a number");
-        const target = Math.round(k);
-        const state = store.getState();
-        if (target < 1 || target > 8) {
-          throw new Error(`k must be between 1 and 8, got ${target}`);
-        }
-        while (store.getState().centroids.length > target) {
-          store.getState().removeFlag(store.getState().centroids.length - 1);
-        }
-        while (store.getState().centroids.length < target) {
-          store.getState().addFlag();
-        }
-        void state;
-      },
-
-      /** Spread the flags evenly over the map — a neutral starting layout. */
-      scatterFlags: () => {
-        const { centroids, moveFlag } = store.getState();
-        const count = centroids.length;
-        centroids.forEach((_, index) => {
-          const angle = (index / Math.max(1, count)) * Math.PI * 2;
-          moveFlag(
-            index,
-            0.5 + 0.28 * Math.cos(angle),
-            0.5 + 0.28 * Math.sin(angle),
-          );
-        });
-      },
-
-      /** Place one flag exactly. This is the initialization choice. */
-      setFlag: (index: number, x: number, y: number) =>
-        store.getState().moveFlag(index, x, y),
-
-      /** Current flag positions. */
-      flags: () =>
-        store.getState().centroids.map(({ id, x, y }) => ({ id, x, y })),
-
-      /** Live inertia — the same number the metric shows. */
-      inertia: () => store.getState().inertia,
-      /** Villages per flag. */
-      territorySizes: () => [...store.getState().sizes],
-      k: () => store.getState().centroids.length,
-      converged: () => store.getState().converged,
-      /** Best achievable inertia at each k — the elbow data. */
-      elbow: () => store.getState().elbowPoints.map((p) => ({ ...p })),
-
-      /** Score the board and name any failure. */
-      check: () => store.getState().check(),
-      /** Back to two flags. */
-      reset: () => store.getState().reset(),
-    }),
-    [store],
-  );
+  // Memoised on nothing: the store is a module singleton, and the verbs read
+  // current state at call time, so one instance serves the whole mount.
+  const api = useMemo(() => createKMeansApi(), []);
 
   const lane = useCodeLane({ initialCode: STARTER_CODE, api, maxRunMs: 6000 });
 

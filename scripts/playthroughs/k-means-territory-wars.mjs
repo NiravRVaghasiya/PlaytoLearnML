@@ -10,6 +10,34 @@
 export const slug = "k-means-territory-wars";
 export const title = "K-Means Territory Wars";
 
+/**
+ * Screen point of a map coordinate (0–1 on both axes), projected through the
+ * SVG's own painted transform — the same `getScreenCTM()` the lane inverts. A
+ * bounding-box projection would share the bug it is meant to catch.
+ */
+async function mapPoint(page, x, y) {
+  return page.evaluate(
+    ([fx, fy]) => {
+      const svg = document.querySelector('svg[aria-label="Village map"]');
+      const m = svg.getScreenCTM();
+      // viewBox units, matching the lane's scales (PAD = 5 of 100).
+      const vx = 5 + fx * 90;
+      const vy = 95 - fy * 90;
+      return { x: m.a * vx + m.c * vy + m.e, y: m.b * vx + m.d * vy + m.f };
+    },
+    [x, y],
+  );
+}
+
+/** A flag's position (0–100 on each axis), read from its accessible name. */
+async function flagPosition(page, index) {
+  const label = await page
+    .getByRole("button", { name: new RegExp(`^Flag ${index} of`) })
+    .getAttribute("aria-label");
+  const match = /at x (\d+) y (\d+)/.exec(label ?? "");
+  return match ? { x: Number(match[1]), y: Number(match[2]) } : null;
+}
+
 export async function run({ page, check, metricText }) {
   const outputText = () =>
     page.getByRole("region", { name: "Script output" }).innerText();
@@ -76,6 +104,50 @@ export async function run({ page, check, metricText }) {
     /out of date/i.test(await page.locator("main").innerText()),
   );
 
+  // ── pointer: a drag lands under the pointer ──
+  // At 1024×768 the map renders 622 wide and ~1300 tall, and letterboxes; by
+  // bounding box a drag to y = 90 landed at y = 69. The desktop layout starts
+  // at 1024, so no sticky metric overlaps the map here.
+  console.log("\nPointer input");
+  const viewport = page.viewportSize();
+  await page.setViewportSize({ width: 1024, height: 768 });
+  // Scroll so the painted square (not the much taller element box) sits just
+  // under the top of the viewport: every target below is then on screen.
+  await page.evaluate(() => {
+    const svg = document.querySelector('svg[aria-label="Village map"]');
+    window.scrollBy(0, svg.getScreenCTM().f - 80);
+  });
+  await page.waitForTimeout(300);
+
+  const start = await flagPosition(page, 1);
+  if (start) {
+    const from = await mapPoint(page, start.x / 100, start.y / 100);
+    const to = await mapPoint(page, 0.5, 0.9);
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await page.mouse.move(to.x, to.y, { steps: 6 });
+    await page.mouse.up();
+    await page.waitForTimeout(150);
+  }
+  const landed = await flagPosition(page, 1);
+  check(
+    "a drag lands where the pointer is on a letterboxed map",
+    landed !== null &&
+      Math.abs(landed.x - 50) <= 1 &&
+      Math.abs(landed.y - 90) <= 1,
+    landed ? `flag 1 at (${landed.x}, ${landed.y}), target (50, 90)` : "no flag",
+  );
+  if (viewport) await page.setViewportSize(viewport);
+
+  // Scoring before villages re-choose must not judge the stale territories.
+  await page.getByRole("button", { name: /Score this map/ }).click();
+  await page.waitForTimeout(400);
+  check(
+    "scoring a stale map asks for Assign instead of naming a failure",
+    /out of date/i.test(await whyText()) && (await failure.count()) === 0,
+    (await whyText()).split("\n")[0],
+  );
+
   await page.getByRole("button", { name: /1\. Assign/ }).click();
   await page.waitForTimeout(400);
   check(
@@ -91,6 +163,15 @@ export async function run({ page, check, metricText }) {
     "update explains what it did",
     /moved|converged/i.test(afterUpdate),
     afterUpdate.split("\n")[0],
+  );
+
+  // Update again without Assign: nothing moves, and that is NOT convergence.
+  await page.getByRole("button", { name: /2\. Update/ }).click();
+  await page.waitForTimeout(400);
+  check(
+    "a second update on stale memberships is not called converged",
+    /isn't convergence/i.test(await whyText()),
+    (await whyText()).split("\n")[0],
   );
 
   await page.getByRole("button", { name: /Run to convergence/ }).click();

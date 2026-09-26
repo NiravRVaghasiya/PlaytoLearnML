@@ -3,6 +3,12 @@
 import { useCallback, useMemo, useRef } from "react";
 import { scaleLinear } from "d3";
 import { useKMeansStore } from "./store";
+import {
+  GRAB_RADIUS_PX,
+  MIN_GRAB_RADIUS_UNITS,
+  clientToUser,
+  flagUnderPointer,
+} from "./field";
 
 /**
  * K-Means Territory Wars — the no-code lane (spec: `<ClusterMap>`,
@@ -112,6 +118,8 @@ export function VisualLane() {
 
   const svgRef = useRef<SVGSVGElement>(null);
   const draggingRef = useRef<number | null>(null);
+  /** Flag elements by index, so a pointer press can focus the one it grabs. */
+  const flagRefs = useRef<Array<SVGGElement | null>>([]);
 
   const { xScale, yScale } = useMemo(
     () => ({
@@ -121,18 +129,55 @@ export function VisualLane() {
     [],
   );
 
+  /**
+   * A pointer position on the 0–1 map, through the SVG's own transform so the
+   * letterboxing on a tall desktop column can't displace it (see `field.ts`).
+   */
   const pointerToField = useCallback(
     (clientX: number, clientY: number) => {
-      const svg = svgRef.current;
-      if (!svg) return null;
-      const rect = svg.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) return null;
-      return {
-        x: xScale.invert(((clientX - rect.left) / rect.width) * VIEW),
-        y: yScale.invert(((clientY - rect.top) / rect.height) * VIEW),
-      };
+      const view = clientToUser(
+        clientX,
+        clientY,
+        svgRef.current?.getScreenCTM() ?? null,
+      );
+      if (!view) return null;
+      return { x: xScale.invert(view.x), y: yScale.invert(view.y) };
     },
     [xScale, yScale],
+  );
+
+  /**
+   * One press handler for the whole map: it grabs the flag NEAREST the press
+   * within a 44 px target, instead of whichever hit circle was painted last.
+   * A press on empty ground does nothing — the rail's sliders are the
+   * single-pointer way to place a flag.
+   */
+  const onPointerDown = useCallback(
+    (event: React.PointerEvent<SVGSVGElement>) => {
+      if (!event.isPrimary || event.button !== 0) return;
+      const ctm = event.currentTarget.getScreenCTM();
+      const view = clientToUser(event.clientX, event.clientY, ctm);
+      if (!view) return;
+
+      // CSS px per viewBox unit, so the radius is a real 22 px on any screen.
+      const scale = ctm?.a || 1;
+      const radius = Math.max(MIN_GRAB_RADIUS_UNITS, GRAB_RADIUS_PX / scale);
+      const index = flagUnderPointer(
+        view,
+        centroids.map((centroid) => ({
+          x: xScale(centroid.x),
+          y: yScale(centroid.y),
+        })),
+        radius,
+      );
+      if (index === null) return;
+
+      draggingRef.current = index;
+      selectFlag(index);
+      event.currentTarget.setPointerCapture(event.pointerId);
+      flagRefs.current[index]?.focus({ preventScroll: true });
+    },
+    [centroids, selectFlag, xScale, yScale],
   );
 
   const onPointerMove = useCallback(
@@ -180,14 +225,23 @@ export function VisualLane() {
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-3">
-      <p className="text-sm text-text-muted">
-        Drag a flag, or focus one and use the arrow keys. Delete removes it.
-        {assignmentStale
-          ? " Colours are out of date — press Assign."
-          : converged
-            ? " Converged: no flag has anywhere better to go."
-            : ""}
-      </p>
+      <div className="text-sm text-text-muted">
+        <p>
+          Drag a flag, or focus one and use the arrow keys. Delete removes it.
+        </p>
+        {/* Status on its own line, with that line reserved even when empty.
+            It flips the moment a drag starts ("out of date"), and when it used
+            to append to the sentence above, the reflow shifted the map about
+            one text line under the player's finger mid-drag. Two lines are
+            reserved on narrow screens, where either message can wrap. */}
+        <p className="min-h-10 sm:min-h-5">
+          {assignmentStale
+            ? "Colours are out of date — press Assign."
+            : converged
+              ? "Converged: no flag has anywhere better to go."
+              : ""}
+        </p>
+      </div>
 
       <svg
         ref={svgRef}
@@ -195,6 +249,11 @@ export function VisualLane() {
         role="group"
         aria-label="Village map"
         className="min-h-0 w-full flex-1 touch-none rounded-md bg-bg"
+        onPointerDown={onPointerDown}
+        // The press handler focuses the flag it grabbed. Without this, the
+        // browser's own mousedown focusing would then hand focus to whatever
+        // was under the pointer — a neighbouring flag, or the canvas itself.
+        onMouseDown={(event) => event.preventDefault()}
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
@@ -247,6 +306,10 @@ export function VisualLane() {
         {centroids.map((centroid, index) => {
           const colour = CLUSTER_COLORS[index % CLUSTER_COLORS.length]!;
           const size = sizes[index] ?? 0;
+          // Sizes are from the last assign. While that's out of date a new
+          // flag always reads 0 — it hasn't been offered any villages yet —
+          // so "empty" is only claimed on a fresh assignment.
+          const empty = size === 0 && !assignmentStale;
           const cx = xScale(centroid.x);
           const cy = yScale(centroid.y);
           const isSelected = selectedFlag === index;
@@ -254,35 +317,43 @@ export function VisualLane() {
           return (
             <g
               key={centroid.id}
+              ref={(element) => {
+                flagRefs.current[index] = element;
+              }}
               role="button"
               tabIndex={0}
               aria-label={`Flag ${index + 1} of ${centroids.length}, at x ${Math.round(
                 centroid.x * 100,
-              )} y ${Math.round(centroid.y * 100)}, ${size} village${size === 1 ? "" : "s"}${
-                size === 0 ? " — empty, it cannot move" : ""
+              )} y ${Math.round(centroid.y * 100)}, ${
+                assignmentStale
+                  ? `${size} village${size === 1 ? "" : "s"} as of the last assign`
+                  : `${size} village${size === 1 ? "" : "s"}`
+              }${
+                empty ? " — empty, it cannot move" : ""
               }. Arrow keys move it, Delete removes it.`}
               aria-pressed={isSelected}
               onFocus={() => selectFlag(index)}
               onKeyDown={(event) => onFlagKeyDown(event, index)}
-              onPointerDown={(event) => {
-                draggingRef.current = index;
-                selectFlag(index);
-                svgRef.current?.setPointerCapture(event.pointerId);
-              }}
               className="cursor-grab focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)]"
             >
-              {/* Generous invisible hit area. */}
-              <circle cx={cx} cy={cy} r={6} fill="transparent" />
+              {/* Hover cursor and focus-ring size. Grabbing is decided at the
+                  SVG level (onPointerDown) by distance, not by this circle. */}
+              <circle
+                cx={cx}
+                cy={cy}
+                r={MIN_GRAB_RADIUS_UNITS}
+                fill="transparent"
+              />
               {/* An empty flag is drawn hollow with a warning ring, so the
                   failure is visible before the verdict explains it. */}
               <circle
                 cx={cx}
                 cy={cy}
                 r={3.2}
-                fill={size === 0 ? "none" : colour}
-                stroke={size === 0 ? "var(--wrong)" : "var(--bg)"}
-                strokeWidth={size === 0 ? 1 : 0.9}
-                strokeDasharray={size === 0 ? "1.5 1.5" : undefined}
+                fill={empty ? "none" : colour}
+                stroke={empty ? "var(--wrong)" : "var(--bg)"}
+                strokeWidth={empty ? 1 : 0.9}
+                strokeDasharray={empty ? "1.5 1.5" : undefined}
               />
               {isSelected ? (
                 <circle
@@ -299,7 +370,7 @@ export function VisualLane() {
                 y={cy + 1.4}
                 textAnchor="middle"
                 fontSize={4}
-                fill={size === 0 ? "var(--wrong)" : "var(--bg)"}
+                fill={empty ? "var(--wrong)" : "var(--bg)"}
                 style={{ pointerEvents: "none" }}
               >
                 {index + 1}

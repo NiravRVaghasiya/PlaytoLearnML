@@ -23,9 +23,10 @@ import { clamp, gaussian, seededRandom } from "@/lib/utils";
  * training accuracy" was gameable in Sort-It Arcade.
  *
  * The guard is the elbow: `elbowCurve` runs a proper multi-restart solve at every
- * k and `elbowKFor` finds the kink with the standard kneedle construction. A
- * player who drives inertia down by spamming flags is diagnosed with a bad k,
- * and the failure copy says why with real numbers.
+ * k and `elbowKFor` finds the kink as the largest relative drop in inertia (not
+ * kneedle — its doc says why). A player who drives inertia down by spamming
+ * flags is diagnosed with a bad k, and the failure copy says why with real
+ * numbers.
  */
 
 export interface Point {
@@ -79,6 +80,15 @@ export const K_FITNESS_DECAY = 0.25;
 export const LOCAL_MINIMUM_RATIO = 1.15;
 
 export const WIN_SCORE = 0.8;
+
+/**
+ * convergenceQuality at or above which a layout counts as "at the best this k
+ * can do". The Bad-k copy for too few flags only says the limit is the number of
+ * flags, "not where you put them", when it's true: random two-flag starts on the
+ * shipped maps converge up to 32% worse than the best two-flag layout, and even
+ * the default layout settles 3% off it on two of the six maps.
+ */
+export const AT_BEST_QUALITY = 0.97;
 
 // ── The generative process ─────────────────────────────────────────────────
 
@@ -449,7 +459,14 @@ export interface Evaluation {
   k: number;
   inertia: number;
   bestInertiaAtK: number;
+  /** Best inertia at the elbow k, when the caller supplied it. */
+  bestInertiaAtElbowK: number | null;
   elbowK: number;
+  /**
+   * Flags moved since villages last chose, so memberships describe a map that
+   * no longer exists. Nothing is judged on them — see `evaluate`.
+   */
+  assignmentStale: boolean;
   emptyClusters: number[];
   clusterSizes: number[];
   converged: boolean;
@@ -477,15 +494,23 @@ export interface EvaluateInput {
    * k would have reached.
    */
   bestInertiaAtElbowK?: number;
+  /**
+   * Flags have moved since the last assign. A new flag has no villages until
+   * Assign runs, so judging emptiness on stale memberships reports a flag
+   * sitting on a blob as "owns 0 villages".
+   */
+  assignmentStale?: boolean;
 }
 
 /**
  * Score the board and name the failure — honestly.
  *
- * Ordering is diagnostic, not arbitrary. An empty cluster is checked first
- * because it's unambiguous and it invalidates the other numbers. A bad k is
- * checked before a local minimum because when k is wrong, comparing against the
- * best solve *at that wrong k* would praise a well-converged wrong answer.
+ * Ordering is diagnostic, not arbitrary. A stale assignment comes first: every
+ * other test reads memberships, and those are out of date. An empty cluster is
+ * next because on a FRESH assignment it's unambiguous and it invalidates the
+ * other numbers. A bad k is checked before a local minimum because when k is
+ * wrong, comparing against the best solve *at that wrong k* would praise a
+ * well-converged wrong answer.
  */
 export function evaluate({
   points,
@@ -494,6 +519,7 @@ export function evaluate({
   elbowK,
   bestInertiaAtK,
   bestInertiaAtElbowK,
+  assignmentStale = false,
 }: EvaluateInput): Evaluation {
   const k = centroids.length;
   const inertia = inertiaOfAssignment(points, centroids);
@@ -511,7 +537,9 @@ export function evaluate({
       k,
       inertia: 0,
       bestInertiaAtK,
+      bestInertiaAtElbowK: bestInertiaAtElbowK ?? null,
       elbowK,
+      assignmentStale,
       emptyClusters: [],
       clusterSizes: sizes,
       converged: false,
@@ -533,7 +561,11 @@ export function evaluate({
   let outcome: Outcome;
   let failure: NamedFailure | null = null;
 
-  if (emptyClusters.length > 0) {
+  if (assignmentStale) {
+    // Not converged by definition — assign hasn't run on these flags. And no
+    // failure is named: the only true statement is "press Assign".
+    outcome = "not-converged";
+  } else if (emptyClusters.length > 0) {
     outcome = "empty-cluster";
     const labels = emptyClusters.map((index) => `#${index + 1}`).join(", ");
     failure = {
@@ -549,7 +581,13 @@ export function evaluate({
       name: "Bad k",
       detail: tooMany
         ? `Inertia ${round2(inertia)} looks good, but you used ${k} flags where the elbow is at ${elbowK}. Inertia ALWAYS falls as you add flags — at k=${points.length} it would be 0 and tell you nothing. You split real clusters in half.`
-        : `${k} flags can't cover ${elbowK} groups. Inertia ${round2(inertia)} is the best ${k} flags can do here${
+        : `${k} flags can't cover ${elbowK} groups. ${
+            // Only claim the player is at the best k allows when they are: a
+            // two-flag layout can converge well short of the best two-flag one.
+            convergenceQuality >= AT_BEST_QUALITY
+              ? `Inertia ${round2(inertia)} is about the best ${k} flags can do here`
+              : `Yours settled at ${round2(inertia)}, and even the best ${k}-flag layout only gets down to ${round2(bestInertiaAtK)}`
+          }${
             bestInertiaAtElbowK !== undefined
               ? `, where ${elbowK} flags reach ${round2(bestInertiaAtElbowK)}`
               : ""
@@ -571,8 +609,12 @@ export function evaluate({
     k,
     inertia,
     bestInertiaAtK,
+    bestInertiaAtElbowK: bestInertiaAtElbowK ?? null,
     elbowK,
-    emptyClusters,
+    assignmentStale,
+    // Stale memberships can't vouch for emptiness; report none rather than a
+    // list the verdict deliberately ignored.
+    emptyClusters: assignmentStale ? [] : emptyClusters,
     clusterSizes: sizes,
     converged,
     convergenceQuality,

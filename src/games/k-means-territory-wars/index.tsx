@@ -4,7 +4,11 @@ import { useEffect } from "react";
 import { FastForward, Minus, Plus, Sparkles, StepForward } from "lucide-react";
 import { Button, Slider, type MetricSpec } from "@/components";
 import { GameShell } from "@/engine/GameShell";
-import { levelFromXp, useProgression } from "@/engine/progression";
+import {
+  HIGH_SCORE_THRESHOLD,
+  levelFromXp,
+  useProgression,
+} from "@/engine/progression";
 import { getGameMeta } from "@/lib/catalog";
 import {
   MATH_CODE,
@@ -19,9 +23,16 @@ import { VisualLane } from "./VisualLane";
 import { CodeLane } from "./CodeLane";
 import { ElbowMeter } from "./ElbowMeter";
 
+/**
+ * Exactly the engine's rule (`starsFor`): ★1 completed, ★2 best score at or
+ * above `HIGH_SCORE_THRESHOLD`, ★3 that and a code-lane clear. The threshold is
+ * imported rather than restated so the copy can't drift from the rule. A map is
+ * only "settled" (won) at a score of 1/LOCAL_MINIMUM_RATIO ≈ 87% or more, so in
+ * practice the first two stars arrive together.
+ */
 const STAR_CRITERIA = [
   "Settle a map",
-  `Score ${Math.round(WIN_SCORE * 100)}% or better`,
+  `Score ${Math.round(HIGH_SCORE_THRESHOLD * 100)}% or better`,
   "Settle a map from the code lane",
 ];
 
@@ -173,7 +184,8 @@ function Controls() {
       <div className="flex flex-col gap-2 border-t border-border pt-4">
         <Button
           variant="primary"
-          onClick={check}
+          // Wrapped: `check(source)` would otherwise receive the click event.
+          onClick={() => check()}
           icon={<Sparkles className="size-4" />}
         >
           Score this map
@@ -232,30 +244,44 @@ export default function KMeansTerritoryWars() {
     caption: converged ? "converged" : "sum of squared distances",
   };
 
+  /**
+   * k and the iteration count have no good direction: adding the right third
+   * flag is progress, and so is stepping the loop. With a direction set, the
+   * readout pulsed red on both — teaching "fewer is better" for exactly the two
+   * numbers where it isn't. `state: "neutral"` keeps the ▲/▼ glyph and pins
+   * the colour neutral, and MetricReadout suppresses its improvement sparkle
+   * for an explicit neutral state too.
+   */
   const secondaryMetrics: MetricSpec[] = [
     {
       label: "Flags (k)",
       value: k,
       format: "integer",
-      goodDirection: "down",
+      state: "neutral",
       caption: "your choice",
     },
     {
       label: "Iterations",
       value: iteration,
       format: "integer",
-      goodDirection: "down",
+      state: "neutral",
       caption: converged ? "settled" : "still moving",
     },
     {
       label: "Score",
-      value: lastEvaluation?.score ?? Number.NaN,
+      // A verdict on stale territories judged nothing, so it shows no number.
+      value:
+        lastEvaluation && !lastEvaluation.assignmentStale
+          ? lastEvaluation.score
+          : Number.NaN,
       format: "percent",
       goodDirection: "up",
       caption:
         lastEvaluation === null
           ? "score the map to see"
-          : `need ${Math.round(WIN_SCORE * 100)}%`,
+          : lastEvaluation.assignmentStale
+            ? "assign first"
+            : `need ${Math.round(WIN_SCORE * 100)}%`,
       state: won ? "good" : undefined,
     },
   ];

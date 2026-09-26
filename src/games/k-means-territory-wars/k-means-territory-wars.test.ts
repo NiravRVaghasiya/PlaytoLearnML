@@ -1,10 +1,13 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import { createElement } from "react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import {
   EMPTY_PROGRESSION,
   createMemoryAdapter,
   useProgression,
 } from "@/engine/progression";
 import {
+  AT_BEST_QUALITY,
   CONVERGENCE_EPSILON,
   K_FITNESS_DECAY,
   LOCAL_MINIMUM_RATIO,
@@ -32,6 +35,15 @@ import {
 import { useKMeansStore } from "./store";
 import { whyCardFor } from "./why-cards";
 import { seededRandom } from "@/lib/utils";
+import { STARTER_CODE, createKMeansApi } from "./CodeLane";
+import { VisualLane } from "./VisualLane";
+import {
+  GRAB_RADIUS_PX,
+  MIN_GRAB_RADIUS_UNITS,
+  clientToUser,
+  flagUnderPointer,
+  type ScreenMatrix,
+} from "./field";
 
 const flagsAt = (positions: Array<[number, number]>): Centroid[] =>
   positions.map(([x, y], id) => ({ id, x, y }));
@@ -208,6 +220,84 @@ describe("the lesson holds on every shipped round", () => {
     expect(new Set(numbers).size).toBe(numbers.length);
     // And the comparison it does make must be the useful one.
     expect(numbers.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("only says too few flags are 'the best k can do' when they are", () => {
+    // Round 3's default two flags settle 3% worse than the best two-flag
+    // layout. The copy used to say "9.20 is the best 2 flags can do here" and
+    // "not where you put them" regardless — true of the best layout, not of
+    // this one.
+    const { seed, trueK } = ROUNDS[2]!;
+    const { points } = generateVillages(seed, trueK);
+    const elbow = elbowKFor(elbowCurve(points, MAX_K, seed));
+    const settled = runToConvergence(points, [
+      { id: 0, x: 0.3, y: 0.3 },
+      { id: 1, x: 0.7, y: 0.7 },
+    ]).centroids;
+    const best = solveKMeans(points, 2, { seed }).inertia;
+
+    const result = evaluate({
+      points: assignPoints(points, settled),
+      centroids: settled,
+      converged: true,
+      elbowK: elbow,
+      bestInertiaAtK: best,
+      bestInertiaAtElbowK: solveKMeans(points, elbow, { seed }).inertia,
+    });
+
+    expect(result.outcome).toBe("bad-k");
+    expect(result.convergenceQuality).toBeLessThan(AT_BEST_QUALITY);
+    // It quotes the real best for two flags, and doesn't claim the player hit it.
+    expect(result.failure!.detail).toContain(best.toFixed(2));
+    expect(result.failure!.detail).not.toMatch(/is about the best/);
+    const card = whyCardFor({ kind: "checked", evaluation: result });
+    expect(card.body).toContain(best.toFixed(2));
+    expect(card.body).not.toMatch(/really is/);
+
+    // A layout that IS at the best keeps the stronger wording.
+    const optimal = solveKMeans(points, 2, { seed }).centroids;
+    const atBest = evaluate({
+      points: assignPoints(points, optimal),
+      centroids: optimal,
+      converged: true,
+      elbowK: elbow,
+      bestInertiaAtK: best,
+    });
+    expect(atBest.convergenceQuality).toBeGreaterThanOrEqual(AT_BEST_QUALITY);
+    expect(atBest.failure!.detail).toMatch(/is about the best 2 flags can do/);
+  });
+
+  it("judges nothing on a stale assignment", () => {
+    // A flag dropped onto a blob owns 0 villages until Assign runs. Judged on
+    // those memberships it used to be named "Empty cluster" — for a flag
+    // sitting in the middle of 55 villages.
+    const { seed, trueK } = ROUNDS[0]!;
+    const { points } = generateVillages(seed, trueK);
+    const two = runToConvergence(points, [
+      { id: 0, x: 0.3, y: 0.3 },
+      { id: 1, x: 0.7, y: 0.7 },
+    ]).centroids;
+    const stalePoints = assignPoints(points, two);
+    const centre = blobCentre(points, 2);
+    const three = [...two, { id: 2, x: centre.x, y: centre.y }];
+
+    const input = {
+      points: stalePoints,
+      centroids: three,
+      converged: false,
+      elbowK: trueK,
+      bestInertiaAtK: solveKMeans(points, 3, { seed }).inertia,
+    };
+    // The trap is real: without the stale flag, this reads as an empty cluster.
+    expect(evaluate(input).outcome).toBe("empty-cluster");
+
+    const result = evaluate({ ...input, assignmentStale: true });
+    expect(result.outcome).toBe("not-converged");
+    expect(result.failure).toBeNull();
+    expect(result.emptyClusters).toEqual([]);
+    const card = whyCardFor({ kind: "checked", evaluation: result });
+    expect(card.title).toMatch(/out of date/i);
+    expect(card.body).toMatch(/Assign/);
   });
 
   it("names each failure with numbers that back it up", () => {
@@ -753,6 +843,158 @@ describe("store", () => {
     expect(state.assignmentStale).toBe(false);
   });
 
+  it("does not call Update, Update convergence", () => {
+    // The second Update re-averages the same stale memberships, so nothing
+    // moves — yet 22 villages would switch flags on the next Assign. That used
+    // to read "Nothing moved — converged", and Score then named a false
+    // "Local minimum".
+    const { addFlag, assign, update } = useKMeansStore.getState();
+    addFlag();
+    assign();
+    update();
+    expect(useKMeansStore.getState().assignmentStale).toBe(true);
+    expect(useKMeansStore.getState().converged).toBe(false);
+
+    update();
+    const state = useKMeansStore.getState();
+    expect(state.lastShift!).toBeLessThan(CONVERGENCE_EPSILON);
+    expect(state.converged).toBe(false);
+    expect(state.assignmentStale).toBe(true);
+    expect(state.whyCard?.title).toMatch(/isn't convergence/);
+
+    // The fresh assignment really does differ — this isn't a fixed point.
+    const reassigned = assignPoints(state.points, state.centroids);
+    const switched = reassigned.filter(
+      (point, i) => point.clusterId !== state.points[i]!.clusterId,
+    ).length;
+    expect(switched).toBeGreaterThan(0);
+
+    const evaluation = useKMeansStore.getState().check();
+    expect(evaluation.outcome).toBe("not-converged");
+    expect(evaluation.failure).toBeNull();
+  });
+
+  it("still converges on a genuine fixed point of assign then update", () => {
+    const { settle, assign, update } = useKMeansStore.getState();
+    settle();
+    assign();
+    update();
+    const state = useKMeansStore.getState();
+    expect(state.converged).toBe(true);
+    expect(state.assignmentStale).toBe(false);
+    expect(state.whyCard?.title).toMatch(/converged/i);
+  });
+
+  it("won't name an empty cluster for a flag placed on villages but not yet assigned", () => {
+    const { settle, addFlag, moveFlag } = useKMeansStore.getState();
+    settle();
+    addFlag();
+    const centre = blobCentre(useKMeansStore.getState().points, 2);
+    moveFlag(2, centre.x, centre.y);
+
+    const evaluation = useKMeansStore.getState().check();
+    expect(evaluation.outcome).toBe("not-converged");
+    expect(useKMeansStore.getState().failure).toBeNull();
+
+    // And once villages are allowed to choose, it's the right answer.
+    useKMeansStore.getState().assign();
+    useKMeansStore.getState().settle();
+    expect(useKMeansStore.getState().check().outcome).toBe("win");
+  });
+
+  it("clears the stale score whenever the flags change", () => {
+    useKMeansStore.getState().settle();
+    useKMeansStore.getState().check();
+    expect(useKMeansStore.getState().lastEvaluation).not.toBeNull();
+
+    useKMeansStore.getState().moveFlag(0, 0.2, 0.2);
+    expect(useKMeansStore.getState().lastEvaluation).toBeNull();
+
+    useKMeansStore.getState().check();
+    useKMeansStore.getState().addFlag();
+    expect(useKMeansStore.getState().lastEvaluation).toBeNull();
+
+    useKMeansStore.getState().check();
+    useKMeansStore.getState().removeFlag(0);
+    expect(useKMeansStore.getState().lastEvaluation).toBeNull();
+  });
+
+  it("clears the score when the loop changes the board it judged", () => {
+    const { addFlag, assign, settle, step, update, check } =
+      useKMeansStore.getState();
+
+    // Scored stale, then assigned: the tile must stop saying "assign first".
+    addFlag();
+    expect(check().assignmentStale).toBe(true);
+    assign();
+    expect(useKMeansStore.getState().lastEvaluation).toBeNull();
+
+    // Scored mid-loop, then settled: the 9% verdict judged a board that is gone.
+    expect(check().outcome).toBe("not-converged");
+    settle();
+    expect(useKMeansStore.getState().lastEvaluation).toBeNull();
+    expect(useKMeansStore.getState().failure).toBeNull();
+
+    // Scored after one step, then stepped again.
+    useKMeansStore.getState().reset();
+    addFlag();
+    assign();
+    update();
+    assign();
+    check();
+    step();
+    expect(useKMeansStore.getState().lastEvaluation).toBeNull();
+  });
+
+  it("keeps a win through loop presses that change nothing", () => {
+    // Pressing Run to convergence again on a settled map must not take its
+    // Next button away.
+    const { addFlag, assign, settle, step, update, check } =
+      useKMeansStore.getState();
+    settle();
+    addFlag();
+    const centre = blobCentre(useKMeansStore.getState().points, 2);
+    useKMeansStore.getState().moveFlag(2, centre.x, centre.y);
+    assign();
+    settle();
+    expect(check().outcome).toBe("win");
+    const verdict = useKMeansStore.getState().lastEvaluation;
+
+    settle();
+    assign();
+    update();
+    step();
+    const state = useKMeansStore.getState();
+    expect(state.won).toBe(true);
+    expect(state.lastEvaluation).toBe(verdict);
+  });
+
+  it("keeps a named failure through loop presses that change nothing", () => {
+    // Two flags on three blobs, settled: Bad k. Settling again changes
+    // nothing, so the failure still describes the board on screen.
+    const { settle, check } = useKMeansStore.getState();
+    settle();
+    expect(check().outcome).toBe("bad-k");
+    settle();
+    expect(useKMeansStore.getState().failure?.name).toBe("Bad k");
+    expect(useKMeansStore.getState().lastEvaluation?.outcome).toBe("bad-k");
+  });
+
+  it("never stores a NaN flag, whatever it is handed", () => {
+    const before = useKMeansStore.getState().centroids;
+    const { moveFlag, nudgeFlag, addFlag, removeFlag } = useKMeansStore.getState();
+    moveFlag(0, 0.5, Number.NaN);
+    moveFlag(0, undefined as unknown as number, 0.5);
+    moveFlag(0.5, 0.5, 0.5);
+    nudgeFlag(0, Number.NaN, 0);
+    addFlag(Number.NaN, 0.5);
+    removeFlag(0.5);
+
+    const state = useKMeansStore.getState();
+    expect(state.centroids).toBe(before);
+    expect(Number.isFinite(state.inertia)).toBe(true);
+  });
+
   it("wins with the right k, settled, and awards XP once", () => {
     const target = useKMeansStore.getState().elbowK;
     while (useKMeansStore.getState().centroids.length < target) {
@@ -775,6 +1017,11 @@ describe("store", () => {
     expect(xp).toBeGreaterThan(0);
     useKMeansStore.getState().check();
     expect(useProgression.getState().xp).toBe(xp);
+    // Nor counted twice.
+    expect(
+      useProgression.getState().games["k-means-territory-wars"]?.playCount,
+    ).toBe(1);
+    expect(useKMeansStore.getState().won).toBe(true);
   });
 
   it("names Bad k when the player spams flags, and awards nothing", () => {
@@ -798,6 +1045,23 @@ describe("store", () => {
   });
 
   it("credits the code lane for the third star", () => {
+    const api = createKMeansApi();
+    useKMeansStore.getState().setLane("code");
+    api.setK(useKMeansStore.getState().elbowK);
+    api.scatterFlags();
+    api.settle();
+    api.check();
+
+    expect(
+      useProgression.getState().games["k-means-territory-wars"]?.codeLaneCleared,
+    ).toBe(true);
+    expect(
+      useProgression.getState().games["k-means-territory-wars"]?.stars,
+    ).toBe(3);
+  });
+
+  it("credits the lane the clearing call came from, not the visible tab", () => {
+    // "Score this map" sits in the rail, on screen in the code tab too.
     useKMeansStore.getState().setLane("code");
     const target = useKMeansStore.getState().elbowK;
     while (useKMeansStore.getState().centroids.length < target) {
@@ -810,14 +1074,12 @@ describe("store", () => {
         .moveFlag(index, 0.5 + 0.3 * Math.cos(angle), 0.5 + 0.3 * Math.sin(angle));
     });
     useKMeansStore.getState().settle();
-    useKMeansStore.getState().check();
+    expect(useKMeansStore.getState().check().outcome).toBe("win");
 
-    expect(
-      useProgression.getState().games["k-means-territory-wars"]?.codeLaneCleared,
-    ).toBe(true);
-    expect(
-      useProgression.getState().games["k-means-territory-wars"]?.stars,
-    ).toBe(3);
+    const progress = useProgression.getState().games["k-means-territory-wars"];
+    expect(progress?.completed).toBe(true);
+    expect(progress?.codeLaneCleared).toBe(false);
+    expect(progress?.stars).toBe(2);
   });
 
   it("attaches a distinct why-card to every action", () => {
@@ -951,3 +1213,285 @@ describe("why-cards", () => {
     expect(card.body).toMatch(/zero|lowers inertia/i);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Code lane: argument checks and the starter snippet
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("code lane api", () => {
+  beforeEach(() => {
+    useProgression.setState({
+      ...EMPTY_PROGRESSION,
+      hydrated: true,
+      syncError: null,
+      lastGain: null,
+    });
+    useProgression.getState().setAdapter(createMemoryAdapter());
+    useKMeansStore.getState().startRound(1);
+  });
+
+  /** Run a snippet the way the JavaScript lane does. */
+  const runSnippet = (code: string, api = createKMeansApi()) => {
+    const logs: string[] = [];
+    const fn = new Function("api", "log", "checkBudget", code) as (
+      api: unknown,
+      log: (...args: unknown[]) => void,
+      checkBudget: () => void,
+    ) => unknown;
+    fn(api, (...args) => logs.push(args.join(" ")), () => {});
+    return logs;
+  };
+
+  it("names a missing coordinate instead of storing a NaN flag", () => {
+    // `api.setFlag(0, 0.5)` used to store y = NaN: the metric read "—", the
+    // console logged an SVG attribute error, and the flag silently stopped
+    // winning any village.
+    const api = createKMeansApi();
+    const before = useKMeansStore.getState().centroids;
+
+    expect(() =>
+      (api.setFlag as (index: number, x: number) => void)(0, 0.5),
+    ).toThrow(/y must be a number from 0 to 1, got nothing/);
+    expect(() => api.setFlag(0, Number.NaN, 0.5)).toThrow(TypeError);
+    expect(() => api.setFlag(0, 1.2, 0.5)).toThrow(RangeError);
+    expect(() => api.setFlag(5, 0.5, 0.5)).toThrow(/there are 2 flags/);
+    expect(() => api.setFlag(-1, 0.5, 0.5)).toThrow(RangeError);
+
+    expect(useKMeansStore.getState().centroids).toBe(before);
+  });
+
+  it("names a bad k", () => {
+    const api = createKMeansApi();
+    expect(() => api.setK(2.5)).toThrow(TypeError);
+    expect(() => api.setK("3" as unknown as number)).toThrow(TypeError);
+    expect(() => api.setK(Number.NaN)).toThrow(TypeError);
+    expect(() => api.setK(0)).toThrow(/from 1 to 8/);
+    expect(() => api.setK(9)).toThrow(RangeError);
+    expect(useKMeansStore.getState().centroids).toHaveLength(2);
+  });
+
+  it("sets k exactly, both ways", () => {
+    const api = createKMeansApi();
+    api.setK(MAX_K);
+    expect(api.k()).toBe(MAX_K);
+    api.setK(1);
+    expect(api.k()).toBe(1);
+    api.setK(3);
+    expect(api.k()).toBe(3);
+  });
+
+  it("credits the code lane for a board first scored from the rail", () => {
+    const api = createKMeansApi();
+    api.setK(useKMeansStore.getState().elbowK);
+    api.scatterFlags();
+    api.settle();
+    // Scored from the rail first: two stars.
+    useKMeansStore.getState().check();
+    expect(
+      useProgression.getState().games["k-means-territory-wars"]?.stars,
+    ).toBe(2);
+
+    // Then `api.check()` on the same board, from the code lane: ★3, once.
+    api.check();
+    api.check();
+    useKMeansStore.getState().check();
+    const progress = useProgression.getState().games["k-means-territory-wars"];
+    expect(progress?.codeLaneCleared).toBe(true);
+    expect(progress?.stars).toBe(3);
+    expect(progress?.playCount).toBe(2);
+  });
+
+  it("clears round 1 with the starter snippet, and a second run counts nothing twice", () => {
+    const first = runSnippet(STARTER_CODE);
+    expect(first.join("\n")).toMatch(/verdict\s+win/);
+    const progress = useProgression.getState().games["k-means-territory-wars"];
+    expect(progress?.codeLaneCleared).toBe(true);
+    expect(progress?.playCount).toBe(1);
+    const xp = useProgression.getState().xp;
+
+    // The snippet re-scatters the flags and converges to the same board —
+    // which is the same clear, however many times it is reached.
+    const second = runSnippet(STARTER_CODE);
+    expect(second.join("\n")).toMatch(/verdict\s+win/);
+    expect(useKMeansStore.getState().won).toBe(true);
+    runSnippet(STARTER_CODE);
+    expect(
+      useProgression.getState().games["k-means-territory-wars"]?.playCount,
+    ).toBe(1);
+    expect(useProgression.getState().xp).toBe(xp);
+
+    // Nor does reaching that clustering again by hand, from the rail.
+    const { reset, addFlag, moveFlag, settle, check } = useKMeansStore.getState();
+    reset();
+    addFlag();
+    useKMeansStore.getState().centroids.forEach((_, index) => {
+      const angle = (index / 3) * Math.PI * 2 + 1;
+      moveFlag(index, 0.5 + 0.3 * Math.cos(angle), 0.5 + 0.3 * Math.sin(angle));
+    });
+    settle();
+    expect(check().outcome).toBe("win");
+    expect(
+      useProgression.getState().games["k-means-territory-wars"]?.playCount,
+    ).toBe(1);
+  });
+
+  it("counts a different winning map as a new clear", () => {
+    runSnippet(STARTER_CODE);
+    useKMeansStore.getState().newRound();
+    runSnippet(STARTER_CODE.replace("api.setK(3)", "api.setK(4)"));
+    const progress = useProgression.getState().games["k-means-territory-wars"];
+    expect(useKMeansStore.getState().round).toBe(2);
+    expect(useKMeansStore.getState().won).toBe(true);
+    expect(progress?.playCount).toBe(2);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pointer geometry
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * The matrix a browser paints a `viewBox="0 0 100 100"` SVG with, for a box of
+ * `width`×`height` CSS px at (left, top), under the default "xMidYMid meet".
+ */
+function meetMatrix(left: number, top: number, width: number, height: number) {
+  const scale = Math.min(width, height) / 100;
+  const e = left + (width - 100 * scale) / 2;
+  const f = top + (height - 100 * scale) / 2;
+  const matrix: ScreenMatrix = {
+    a: scale,
+    b: 0,
+    c: 0,
+    d: scale,
+    e,
+    f,
+    inverse: () => ({ a: 1 / scale, b: 0, c: 0, d: 1 / scale, e: -e / scale, f: -f / scale }),
+  };
+  return {
+    matrix,
+    toClient: (x: number, y: number) => ({
+      clientX: e + x * scale,
+      clientY: f + y * scale,
+    }),
+  };
+}
+
+describe("pointer geometry", () => {
+  it("maps a pointer through the painted transform, letterboxing included", () => {
+    // 1440×900: the map renders 878 wide and 1329 tall. By bounding box, a
+    // drag to y = 90 landed at y = 76.
+    const { matrix, toClient } = meetMatrix(24, 90, 878, 1329);
+    for (const [x, y] of [
+      [5, 10],
+      [50, 50],
+      [95, 90],
+    ] as const) {
+      const { clientX, clientY } = toClient(x, y);
+      const view = clientToUser(clientX, clientY, matrix);
+      expect(view!.x).toBeCloseTo(x, 9);
+      expect(view!.y).toBeCloseTo(y, 9);
+    }
+  });
+
+  it("grabs the nearest flag, not the one painted last", () => {
+    const flags = [
+      { x: 50, y: 50 },
+      { x: 53, y: 50 },
+    ];
+    expect(flagUnderPointer({ x: 50.4, y: 50 }, flags, 6)).toBe(0);
+    expect(flagUnderPointer({ x: 52.6, y: 50 }, flags, 6)).toBe(1);
+    // Exact tie: the lower index, as with villages.
+    expect(flagUnderPointer({ x: 51.5, y: 50 }, flags, 6)).toBe(0);
+    expect(flagUnderPointer({ x: 70, y: 50 }, flags, 6)).toBeNull();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Visual lane: pointer wiring and honest flag labels
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("visual lane", () => {
+  beforeEach(() => {
+    useKMeansStore.getState().startRound(1);
+  });
+
+  function mountMap(box = { left: 24, top: 90, width: 878, height: 1329 }) {
+    render(createElement(VisualLane));
+    const svg = screen.getByRole("group", { name: "Village map" });
+    const { matrix, toClient } = meetMatrix(box.left, box.top, box.width, box.height);
+    Object.assign(svg, {
+      getScreenCTM: () => matrix,
+      setPointerCapture: () => {},
+      hasPointerCapture: () => false,
+      releasePointerCapture: () => {},
+    });
+    // Map (0–1) → viewBox, matching the lane's d3 scales (PAD = 5).
+    const toView = (x: number, y: number) => ({ x: 5 + x * 90, y: 95 - y * 90 });
+    const press = (type: "pointerDown" | "pointerMove" | "pointerUp", x: number, y: number) => {
+      const v = toView(x, y);
+      const { clientX, clientY } = toClient(v.x, v.y);
+      act(() => {
+        fireEvent[type](svg, { clientX, clientY, isPrimary: true, button: 0, pointerId: 1 });
+      });
+    };
+    return { press };
+  }
+
+  it("drags a flag to exactly where the pointer is on a letterboxed map", () => {
+    const { press } = mountMap();
+    // Flag 1 starts at (0.3, 0.3).
+    press("pointerDown", 0.3, 0.3);
+    press("pointerMove", 0.5, 0.9);
+    press("pointerUp", 0.5, 0.9);
+    const flag = useKMeansStore.getState().centroids[0]!;
+    expect(flag.x).toBeCloseTo(0.5, 6);
+    expect(flag.y).toBeCloseTo(0.9, 6);
+    expect(useKMeansStore.getState().selectedFlag).toBe(0);
+  });
+
+  it("grabs a flag from 22 CSS px away on a phone-sized map, and no further", () => {
+    // 324 CSS px across 100 units: 3.24 px per unit, so 22 px is 6.8 units —
+    // past the 6-unit floor, which alone came to a 39 px target here.
+    const scale = 324 / 100;
+    const inside = 6.5;
+    const outside = 7.1;
+    expect(inside).toBeGreaterThan(MIN_GRAB_RADIUS_UNITS);
+    expect(inside * scale).toBeLessThanOrEqual(GRAB_RADIUS_PX);
+    expect(outside * scale).toBeGreaterThan(GRAB_RADIUS_PX);
+
+    const { press } = mountMap({ left: 18, top: 300, width: 324, height: 324 });
+    // Flag 1 starts at (0.3, 0.3); map units are 90 viewBox units wide.
+    const before = useKMeansStore.getState().centroids;
+    press("pointerDown", 0.3 + outside / 90, 0.3);
+    press("pointerMove", 0.5, 0.5);
+    press("pointerUp", 0.5, 0.5);
+    expect(useKMeansStore.getState().centroids).toBe(before);
+
+    press("pointerDown", 0.3 + inside / 90, 0.3);
+    press("pointerMove", 0.5, 0.5);
+    press("pointerUp", 0.5, 0.5);
+    const flag = useKMeansStore.getState().centroids[0]!;
+    expect(flag.x).toBeCloseTo(0.5, 6);
+    expect(flag.y).toBeCloseTo(0.5, 6);
+  });
+
+  it("ignores a press on empty ground", () => {
+    const { press } = mountMap();
+    const before = useKMeansStore.getState().centroids;
+    press("pointerDown", 0.9, 0.1);
+    press("pointerMove", 0.8, 0.2);
+    press("pointerUp", 0.8, 0.2);
+    expect(useKMeansStore.getState().centroids).toBe(before);
+  });
+
+  it("doesn't label a just-placed flag empty before villages have chosen", () => {
+    render(createElement(VisualLane));
+    act(() => {
+      useKMeansStore.getState().addFlag(0.5, 0.5);
+    });
+    const flag = screen.getByRole("button", { name: /^Flag 3 of 3/ });
+    expect(flag.getAttribute("aria-label")).not.toMatch(/empty/);
+    expect(flag.getAttribute("aria-label")).toMatch(/as of the last assign/);
+  });
+});
+
