@@ -78,8 +78,10 @@ changes nothing about progress.
 gameml/
 ├── CLAUDE.md                 ← you are here
 ├── DESIGN.md                 ← design system + tokens
-├── README.md                 ← setup, env vars, verification, deploying, known limitations
+├── README.md                 ← project overview, live demo, quick start, the games
 ├── docs/
+│   ├── DEVELOPMENT.md        ← setup, env vars, verification, CI, deploying, known limitations
+│   ├── screenshots/          ← the README's images
 │   ├── GameML_Build_Spec.md  ← full product spec (source of truth for games; §9 = deviations)
 │   └── ENGINE_API.md         ← shared engine API reference
 ├── .claude/

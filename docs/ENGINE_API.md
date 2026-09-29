@@ -424,7 +424,8 @@ interface PyodideExecutorOptions {
   Python.
 - **Deploying it.** The wheels must be staged by `scripts/setup-pyodide.mjs`.
   Its `LANE_PACKAGES` must list every top-level package any lane passes in
-  `packages`; dependencies are resolved from the lockfile. See the README.
+  `packages`; dependencies are resolved from the lockfile. See
+  [DEVELOPMENT.md](DEVELOPMENT.md#the-python-lane-and-its-wheels).
 
 ### Limitations — read this before wiring a share feature
 
